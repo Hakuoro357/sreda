@@ -90,17 +90,14 @@ def _grant_free_tier_insert_only(session: Session, tenant_id: str) -> None:
 
     Вызывается ТОЛЬКО из провижн-пути нового юзера (``created=True``) — тенант
     только что создан в той же транзакции, активной подписки быть не может,
-    idempotency-проверка не нужна. plan_id читается из subscription_plans
-    (публичный справочник, identity получил SELECT-грант в 0083). approved_at
-    уже проставлен в INSERT tenants (insert_only_bundle) — UPDATE не требуется.
+    idempotency-проверка не нужна. plan_id/feature_key: на PG — через DEFINER
+    ``sreda_free_plan()`` (R2 Codex: identity без прямого SELECT даже на публичный
+    справочник тарифов); на sqlite — ORM. approved_at уже проставлен в INSERT
+    tenants (insert_only_bundle) — UPDATE не требуется.
     """
     now = datetime.now(timezone.utc)
-    free_plan = (
-        session.query(SubscriptionPlan)
-        .filter(SubscriptionPlan.plan_key == "sreda_free")
-        .one_or_none()
-    )
-    if free_plan is None:
+    plan_id, feature_key = _resolve_free_plan(session)
+    if plan_id is None:
         logger.warning(
             "provision: sreda_free plan не существует — пропускаю grant для "
             "tenant=%s. Проверь migration 0041 applied.", tenant_id,
@@ -109,8 +106,8 @@ def _grant_free_tier_insert_only(session: Session, tenant_id: str) -> None:
     session.add(TenantSubscription(
         id="sub_" + uuid.uuid4().hex[:24],
         tenant_id=tenant_id,
-        plan_id=free_plan.id,
-        feature_key=free_plan.feature_key,
+        plan_id=plan_id,
+        feature_key=feature_key,
         status="active",
         starts_at=now,
         active_until=None,
@@ -121,6 +118,23 @@ def _grant_free_tier_insert_only(session: Session, tenant_id: str) -> None:
         updated_at=now,
     ))
     session.commit()
+
+
+def _resolve_free_plan(session: Session) -> tuple[str | None, str | None]:
+    """(plan_id, feature_key) тарифа sreda_free. PG — DEFINER sreda_free_plan()
+    (identity без SELECT-гранта на subscription_plans); sqlite — ORM."""
+    if session.bind.dialect.name == "postgresql":
+        from sqlalchemy import text
+        row = session.execute(
+            text("SELECT plan_id, feature_key FROM sreda_free_plan()")
+        ).first()
+        return (row[0], row[1]) if row else (None, None)
+    plan = (
+        session.query(SubscriptionPlan)
+        .filter(SubscriptionPlan.plan_key == "sreda_free")
+        .one_or_none()
+    )
+    return (plan.id, plan.feature_key) if plan is not None else (None, None)
 
 
 def provision_new_tenant_bundle(
@@ -376,7 +390,7 @@ def ensure_telegram_user_bundle_by_id(
     # (авто-одобрение) + last_bot_key (#109 маршрутизация уведомлений на бота
     # регистрации) выставляются прямо в INSERT — прежние UPDATE tenants
     # (_auto_approve) и UPDATE users (_stamp) для нового юзера не нужны.
-    provision_new_tenant_bundle(
+    created = provision_new_tenant_bundle(
         session,
         tenant_id=tenant_id,
         display_name=display_name,
@@ -387,8 +401,11 @@ def ensure_telegram_user_bundle_by_id(
         last_bot_key=bot_key,
     )
 
+    # R2 (Codex high MAJOR-4): is_new_user = фактический created. Проигравший
+    # гонку (created=False) → бандл создал параллельный запрос, ID валидны, но
+    # юзер НЕ новый.
     return TelegramOnboardingResult(
-        True, telegram_id, tenant_id, workspace_id, user_id, assistant_id
+        created, telegram_id, tenant_id, workspace_id, user_id, assistant_id
     )
 
 
@@ -705,7 +722,7 @@ def ensure_max_user_bundle(
     # #138 Ф5-5b: INSERT-only провижн под identity. max_chat_id идёт прямо в
     # INSERT (прежний post-commit patch через session.get+UPDATE убран),
     # approved_at — авто-одобрение в INSERT.
-    provision_new_tenant_bundle(
+    created = provision_new_tenant_bundle(
         session,
         tenant_id=tenant_id,
         display_name=display_name,
@@ -716,6 +733,7 @@ def ensure_max_user_bundle(
         max_chat_id=chat_id_str or None,
     )
 
+    # R2 (Codex high MAJOR-4): is_new_user = фактический created (гонку проиграл → не новый).
     return MaxOnboardingResult(
-        True, aid, chat_id_str, tenant_id, workspace_id, user_id, assistant_id
+        created, aid, chat_id_str, tenant_id, workspace_id, user_id, assistant_id
     )

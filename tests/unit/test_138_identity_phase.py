@@ -118,7 +118,7 @@ def _provision(session, **kw):
 def test_insert_only_bundle_creates_approved_tenant(session):
     from sreda.db.models.core import Tenant, TenantFeature, User
 
-    _provision(session)
+    assert _provision(session) is True  # R2: первый вызов реально создал
     t = session.get(Tenant, "tenant_tg_99")
     assert t is not None
     assert t.approved_at is not None, "авто-одобрение в INSERT, не UPDATE'ом после"
@@ -131,12 +131,37 @@ def test_insert_only_bundle_double_call_is_noop(session):
 
     from sreda.db.models.core import User
 
-    _provision(session)
-    _provision(session)  # ретрай/гонка — не падает и не дублирует
+    assert _provision(session) is True
+    # R2 (субагент MINOR): второй вызов возвращает created=False — именно этот флаг
+    # гейтит free-tier грант, иначе гонка выдала бы дубль подписки.
+    assert _provision(session) is False
     n = session.execute(
         select(func.count()).select_from(User).where(User.tenant_id == "tenant_tg_99")
     ).scalar()
     assert n == 1
+
+
+def test_insert_only_bundle_tenant_name_encrypted(tmp_path):
+    """R2 (Codex high MAJOR-5): tenant.name (PII) шифруется — сырой INSERT обошёл бы
+    EncryptedString. Проверяем по СЫРОМУ столбцу, что плейнтекста нет."""
+    from sqlalchemy import create_engine, text
+
+    from sreda.db.base import Base
+    import sreda.db.models  # noqa: F401
+    from sreda.db.repositories.seed import insert_only_bundle
+
+    engine = create_engine(f"sqlite:///{tmp_path}/enc.db", future=True)
+    Base.metadata.create_all(engine)
+    from sqlalchemy.orm import sessionmaker
+    s = sessionmaker(bind=engine)()
+    insert_only_bundle(
+        s, tenant_id="tenant_tg_5", tenant_name="Секрет Имя",
+        workspace_id="ws_5", workspace_name="Дом", user_id="user_tg_5",
+        telegram_account_id="5", assistant_id="as_5", assistant_name="Среда",
+    )
+    raw = s.execute(text("SELECT name FROM tenants WHERE id='tenant_tg_5'")).scalar()
+    s.close()
+    assert "Секрет" not in raw, "tenant.name записан плейнтекстом — EncryptedString обойдён"
 
 
 def test_insert_only_bundle_never_updates_existing(session):

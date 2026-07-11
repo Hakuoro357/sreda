@@ -7,6 +7,17 @@ from sreda.db.models.core import Assistant, Tenant, TenantFeature, User, Workspa
 from sreda.db.repositories.base import Repository
 
 
+def _is_unique_violation(ex: Exception) -> bool:
+    """UNIQUE/PK-конфликт (ожидаемый «уже есть») vs прочие integrity-ошибки
+    (FK/NOT NULL/CHECK — настоящие баги, глушить нельзя). Кросс-диалектно:
+    Postgres — SQLSTATE 23505; SQLite — текст 'UNIQUE constraint failed'."""
+    orig = getattr(ex, "orig", None)
+    sqlstate = getattr(orig, "sqlstate", None)
+    if sqlstate is not None:
+        return sqlstate == "23505"
+    return "unique constraint failed" in str(orig or ex).lower()
+
+
 def insert_only_bundle(
     session: Session,
     *,
@@ -44,56 +55,64 @@ def insert_only_bundle(
     ⚠️ НЕ ``ON CONFLICT DO NOTHING``: в Postgres arbiter-проверка конфликта
     требует SELECT-привилегию, которой у identity-роли НЕТ по замыслу (доказано
     red-suite: identity ON CONFLICT → permission denied). Идемпотентность —
-    только savepoint+IntegrityError, работает под чистым INSERT-грантом.
-    users вставляется ORM-объектом (EncryptedString telegram_account_id +
-    event-листенер хеша), прочие — сырым INSERT; все в своих savepoint'ах.
+    только savepoint + перехват UNIQUE-violation, работает под чистым INSERT-грантом.
+
+    R2 (Codex high MAJOR-5): ``tenants`` и ``users`` вставляются ORM-объектами —
+    их колонки ``name``/``telegram_account_id`` шифруются ``EncryptedString``
+    (PII, 152-ФЗ); сырой SQL обошёл бы bind-процессор и записал плейнтекст.
+    ``workspaces``/``assistants``/``tenant_features`` (plain String) — сырым INSERT.
+    R2 (Codex high MAJOR-4): перехватывается ТОЛЬКО unique-violation; FK/NOT NULL/
+    CHECK пробрасываются (иначе частичный битый бандл под видом «безобидного ретрая»).
     """
     from sqlalchemy.exc import IntegrityError
 
     now = datetime.now(timezone.utc)
 
-    def _insert_ignore(sql: str, params: dict) -> bool:
-        """Plain INSERT в savepoint; True — вставлено, False — конфликт (уже есть)."""
+    def _add_ignore_dup(obj) -> bool:
+        """ORM add+flush в savepoint; True — вставлено, False — UNIQUE-конфликт."""
+        try:
+            with session.begin_nested():
+                session.add(obj)
+                session.flush()
+            return True
+        except IntegrityError as ex:
+            if not _is_unique_violation(ex):
+                raise  # FK/NOT NULL/CHECK — не «ретрай», настоящая ошибка
+            return False
+
+    def _exec_ignore_dup(sql: str, params: dict) -> bool:
         try:
             with session.begin_nested():
                 session.execute(text(sql), params)
             return True
-        except IntegrityError:
+        except IntegrityError as ex:
+            if not _is_unique_violation(ex):
+                raise
             return False
 
-    _insert_ignore(
-        "INSERT INTO tenants (id, name, created_at, approved_at) "
-        "VALUES (:id, :name, :now, :now)",
-        {"id": tenant_id, "name": tenant_name, "now": now},
-    )
-    _insert_ignore(
+    _add_ignore_dup(Tenant(id=tenant_id, name=tenant_name, created_at=now, approved_at=now))
+    _exec_ignore_dup(
         "INSERT INTO workspaces (id, tenant_id, name) VALUES (:id, :t, :name)",
         {"id": workspace_id, "t": tenant_id, "name": workspace_name},
     )
     # users — ORM (шифрование + event-хеш); флаг created определяется ЗДЕСЬ
     # (естественный unique tg_account_hash/PK ловит гонку двух первых сообщений).
-    created = True
-    try:
-        with session.begin_nested():
-            session.add(
-                User(
-                    id=user_id,
-                    tenant_id=tenant_id,
-                    telegram_account_id=telegram_account_id,
-                    max_account_id=max_account_id,
-                    max_chat_id=max_chat_id,
-                    last_bot_key=last_bot_key,
-                )
-            )
-            session.flush()
-    except IntegrityError:
-        created = False  # строка уже есть (ретрай/гонка) — НЕ перезаписываем
-    _insert_ignore(
+    created = _add_ignore_dup(
+        User(
+            id=user_id,
+            tenant_id=tenant_id,
+            telegram_account_id=telegram_account_id,
+            max_account_id=max_account_id,
+            max_chat_id=max_chat_id,
+            last_bot_key=last_bot_key,
+        )
+    )
+    _exec_ignore_dup(
         "INSERT INTO assistants (id, tenant_id, workspace_id, name) "
         "VALUES (:id, :t, :w, :name)",
         {"id": assistant_id, "t": tenant_id, "w": workspace_id, "name": assistant_name},
     )
-    _insert_ignore(
+    _exec_ignore_dup(
         "INSERT INTO tenant_features (id, tenant_id, feature_key, enabled) "
         "VALUES (:id, :t, 'core_assistant', :en)",
         {"id": f"{tenant_id}:core_assistant", "t": tenant_id, "en": True},

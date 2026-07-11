@@ -136,10 +136,21 @@ async def handle_max_update(
         from sreda.services.tenant_lifecycle import is_tenant_active
         from sreda.services.max_auth import resolve_tenant_from_max_account_id
 
+        from sreda.services.identity_resolve import AmbiguousExternalIdentity
+
         try:
             _resolved = resolve_tenant_from_max_account_id(session, str(sender_user_id))
         except RuntimeError:
             _resolved = None
+        except AmbiguousExternalIdentity:
+            # R2 (субагент MINOR): max_account_id матчит >1 юзера. Трактовать как
+            # None НЕЛЬЗЯ — провижн создал бы ТРЕТИЙ дубль. Тихий дроп (как
+            # soft-deleted): не привязывать по догадке, ждать channel-linking/support.
+            logger.warning(
+                "max inbound: ambiguous max_account_id (>1 user) — silent drop, "
+                "no provision (нужна ручная развязка)"
+            )
+            return ""
         if _resolved is not None and not is_tenant_active(session, _resolved[0]):
             logger.info(
                 "max inbound: tenant %s is soft-deleted — silent drop "

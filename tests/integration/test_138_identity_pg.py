@@ -213,7 +213,16 @@ def test_counter_functions_work_under_identity(engines):
     assert isinstance(cap, int) and cap >= 0
 
 
-def test_subscription_plans_readable_for_provision(engines):
-    """Публичный тарифный справочник — единственный SELECT identity (0083)."""
+def test_free_plan_via_definer_not_direct_select(engines):
+    """R2 (Codex high MAJOR-6): identity читает тариф ТОЛЬКО через DEFINER
+    sreda_free_plan() — прямой SELECT на subscription_plans запрещён (роль без
+    SELECT-гранта даже на публичный справочник)."""
     with engines["identity"].connect() as c:
-        c.execute(text("SELECT id, plan_key FROM subscription_plans LIMIT 1")).all()
+        # прямой SELECT — permission denied
+        with pytest.raises(ProgrammingError) as ei:
+            c.execute(text("SELECT id, plan_key FROM subscription_plans LIMIT 1"))
+        assert ei.value.orig.sqlstate == "42501"
+        c.rollback()
+        # DEFINER-функция — работает, возвращает только id+feature_key
+        rows = c.execute(text("SELECT plan_id, feature_key FROM sreda_free_plan()")).all()
+    assert len(rows) <= 1  # 0 если тариф не засеян, 1 если есть

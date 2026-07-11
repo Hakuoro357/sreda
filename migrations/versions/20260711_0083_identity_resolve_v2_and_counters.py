@@ -14,9 +14,10 @@
    - ``sreda_signup_free_tier_active_count()`` — committed-cap (зеркало запроса
      signup_abuse.py: plan_key='sreda_free', active, не grandfathered);
    - ``sreda_signup_recent_attempts_count(channel, hash, cutoff)`` — rate-limit.
-3. GRANT SELECT ON subscription_plans TO sreda_identity — публичный тарифный
-   справочник (NO_RLS, тенантных данных нет): провижну нужен plan_id для INSERT
-   tenant_subscriptions.
+3. DEFINER ``sreda_free_plan()`` → (plan_id, feature_key) для sreda_free
+   (R2 Codex high MAJOR-6 / medium CRIT-1: НЕ GRANT SELECT на весь справочник —
+   держим identity без прямого SELECT даже на публичную таблицу; провижну нужен
+   только plan_id/feature_key одного тарифа для INSERT tenant_subscriptions).
 
 Харденинг всех функций — как у v1 (Ф1-R1): SECURITY DEFINER + SET search_path =
 pg_catalog + полностью квалифицированные имена + REVOKE PUBLIC + EXECUTE только
@@ -96,7 +97,20 @@ $$;
 REVOKE ALL ON FUNCTION sreda_signup_recent_attempts_count(text, text, timestamptz) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION sreda_signup_recent_attempts_count(text, text, timestamptz) TO sreda_identity;
 
-GRANT SELECT ON public.subscription_plans TO sreda_identity;
+CREATE OR REPLACE FUNCTION sreda_free_plan()
+RETURNS TABLE(plan_id text, feature_key text)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+  SELECT sp.id::text, sp.feature_key
+  FROM public.subscription_plans sp
+  WHERE sp.plan_key = 'sreda_free'
+  LIMIT 1
+$$;
+REVOKE ALL ON FUNCTION sreda_free_plan() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION sreda_free_plan() TO sreda_identity;
 """
 
 # Откат: вернуть v1-форму функции (как в 0078), счётчики и грант снять.
@@ -126,7 +140,7 @@ GRANT EXECUTE ON FUNCTION sreda_resolve_external_identity(text, text) TO sreda_i
 
 DROP FUNCTION IF EXISTS sreda_signup_free_tier_active_count();
 DROP FUNCTION IF EXISTS sreda_signup_recent_attempts_count(text, text, timestamptz);
-REVOKE SELECT ON public.subscription_plans FROM sreda_identity;
+DROP FUNCTION IF EXISTS sreda_free_plan();
 """
 
 

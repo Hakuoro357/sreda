@@ -105,25 +105,28 @@ def _resolve_with(session, channel: str, key: str) -> ResolvedIdentity | None:
 
 def _resolve_direct(session, channel: str, key: str) -> ResolvedIdentity | None:
     """SQLite-fallback: прямой lookup (юнит-БД, DEFINER недоступен). ``key`` уже
-    захеширован для telegram вызывающим ``resolve_external_identity``."""
+    захеширован для telegram вызывающим ``resolve_external_identity``.
+
+    R2 (Codex MINOR): INNER JOIN к tenants — как PG-функция. Юзер без своего
+    тенанта (битая фикстура) НЕ резолвится (иначе fail-open с tenant_active=True,
+    расхождение с PG, где inner join вернул бы 0 строк)."""
     from sreda.db.models.core import Tenant, User
 
-    q = session.query(User)
+    q = session.query(User, Tenant).join(Tenant, Tenant.id == User.tenant_id)
     q = (
         q.filter(User.tg_account_hash == key)
         if channel == "telegram"
         else q.filter(User.max_account_id == key)
     )
-    users = q.all()
-    if not users:
+    rows = q.all()
+    if not rows:
         return None
-    if len(users) > 1:
-        raise AmbiguousExternalIdentity(channel, len(users))
-    u = users[0]
-    t = session.get(Tenant, u.tenant_id)
+    if len(rows) > 1:
+        raise AmbiguousExternalIdentity(channel, len(rows))
+    u, t = rows[0]
     return ResolvedIdentity(
         tenant_id=u.tenant_id,
         user_id=u.id,
-        approved_at=t.approved_at if t is not None else None,
-        tenant_deleted_at=t.deleted_at if t is not None else None,
+        approved_at=t.approved_at,
+        tenant_deleted_at=t.deleted_at,
     )
