@@ -306,6 +306,7 @@ def make_llm_composer(
         try:
             response = invoke(
                 runnable, messages, timeout_seconds=s.composer_timeout_sec,
+                provider=s.composer_provider,  # #343: per-provider circuit breaker
             )
         except LLMCallTimeout as exc:
             raise ComposerTimeoutError(str(exc)) from exc

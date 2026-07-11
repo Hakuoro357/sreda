@@ -142,13 +142,21 @@ class _BreakerAttempt:
     could release another call's half-open probe slot. ``token`` identifies the
     single admitted half-open probe; only its owner may close / re-open / release
     that probe slot.
+
+    ``generation`` snapshots the breaker's transition counter at admission
+    (Codex R2 MAJOR): a non-probe outcome mutates state only while the breaker
+    is still in the SAME generation it was admitted in. Without it, a slow call
+    admitted in generation G could — after the breaker opened and a probe
+    re-closed it into generation G+2 — have its late timeout counted against the
+    fresh, probe-verified generation and wrongly re-open it.
     """
 
-    __slots__ = ("is_probe", "token")
+    __slots__ = ("is_probe", "token", "generation")
 
-    def __init__(self, *, is_probe: bool, token: object | None) -> None:
+    def __init__(self, *, is_probe: bool, token: object | None, generation: int) -> None:
         self.is_probe = is_probe
         self.token = token
+        self.generation = generation
 
 
 class _CircuitBreaker:
@@ -184,12 +192,18 @@ class _CircuitBreaker:
         self._opened_at: float | None = None
         # Identity of the single outstanding half-open probe (None = none).
         self._probe_token: object | None = None
+        # Bumped on every state transition (open / close / re-open). A non-probe
+        # attempt only acts while the breaker is still in its admission
+        # generation (Codex R2 MAJOR).
+        self._generation = 0
 
     def allow(self, *, cooldown: float) -> _BreakerAttempt | None:
         """Admit a call. Returns an attempt token, or ``None`` to fast-fail."""
         with self._lock:
             if self._opened_at is None:
-                return _BreakerAttempt(is_probe=False, token=None)  # closed
+                return _BreakerAttempt(
+                    is_probe=False, token=None, generation=self._generation
+                )  # closed
             if self._clock() - self._opened_at < cooldown:
                 return None  # still open → fast-fail
             if self._probe_token is not None:
@@ -197,7 +211,9 @@ class _CircuitBreaker:
             # Cooldown elapsed → half-open: admit exactly one probe.
             token = object()
             self._probe_token = token
-            return _BreakerAttempt(is_probe=True, token=token)
+            return _BreakerAttempt(
+                is_probe=True, token=token, generation=self._generation
+            )
 
     def _owns_probe(self, attempt: _BreakerAttempt) -> bool:
         return (
@@ -206,32 +222,44 @@ class _CircuitBreaker:
             and attempt.token is self._probe_token
         )
 
+    def _is_current_closed_gen(self, attempt: _BreakerAttempt) -> bool:
+        """True iff a non-probe attempt still belongs to the current, closed
+        generation — the only case in which its outcome may mutate state."""
+        return (
+            not attempt.is_probe
+            and self._opened_at is None
+            and attempt.generation == self._generation
+        )
+
     def record_success(self, attempt: _BreakerAttempt) -> None:
         with self._lock:
             if self._owns_probe(attempt):
-                # Probe succeeded → close the breaker.
+                # Probe succeeded → close the breaker (new generation).
                 self._opened_at = None
                 self._probe_token = None
                 self._consecutive_timeouts = 0
-            elif not attempt.is_probe and self._opened_at is None:
-                # Healthy response while closed → reset the timeout streak. A
-                # non-probe success NEVER closes an open breaker (stale-success
-                # guard).
+                self._generation += 1
+            elif self._is_current_closed_gen(attempt):
+                # Healthy response in the current closed generation → reset the
+                # timeout streak. A non-probe success NEVER closes an open
+                # breaker, nor affects a newer generation (stale-outcome guard).
                 self._consecutive_timeouts = 0
             # else: stale / non-owning outcome → ignore.
 
     def record_timeout(self, attempt: _BreakerAttempt, *, open_after: int) -> None:
         with self._lock:
             if self._owns_probe(attempt):
-                # Probe hung → re-open with a fresh cooldown window.
+                # Probe hung → re-open with a fresh cooldown window (new gen).
                 self._opened_at = self._clock()
                 self._probe_token = None
                 self._consecutive_timeouts += 1
-            elif not attempt.is_probe and self._opened_at is None:
+                self._generation += 1
+            elif self._is_current_closed_gen(attempt):
                 self._consecutive_timeouts += 1
                 if self._consecutive_timeouts >= open_after:
                     self._opened_at = self._clock()
-            # else: stale, or a non-probe timeout while already open → ignore.
+                    self._generation += 1
+            # else: stale (older generation / already open) → ignore.
 
     def record_other_error(self, attempt: _BreakerAttempt) -> None:
         """A fast (non-timeout) error or a cancellation. Neutral to the breaker

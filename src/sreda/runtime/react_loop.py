@@ -3800,7 +3800,9 @@ async def _run_post_turn_summary_inner(
                   HumanMessage(_format_history_for_summary(prev_text, chunk))]
         # вызов пересказчика — в отдельном потоке (R1 MAJOR): синхронный invoke не блокирует event loop
         resp = await asyncio.to_thread(
-            invoke_with_per_call_timeout, summary_llm, prompt, timeout_seconds=_SUMMARY_LLM_TIMEOUT_S)
+            invoke_with_per_call_timeout, summary_llm, prompt,
+            timeout_seconds=_SUMMARY_LLM_TIMEOUT_S,
+            provider=_SUMMARY_PROVIDER)  # #343: per-provider circuit breaker
         # Учёт расхода — ДО гейтов (R1 #287 субагент): отброшенная генерация тоже стоила денег
         # (length/content_filter с ненулевым usage — иначе тихий недоучёт ровно в деградации);
         # нулевой usage (live error-кейс 0/0) no-op'ится в самом _record_react_usage.

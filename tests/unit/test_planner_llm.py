@@ -93,7 +93,7 @@ def test_call_planner_returns_typed_result() -> None:
     def fake_factory(*a: Any, **kw: Any) -> Any:
         return fake_runnable
 
-    def fake_invoke(runnable: Any, messages: list, *, timeout_seconds: float):
+    def fake_invoke(runnable: Any, messages: list, *, timeout_seconds: float, provider=None):
         assert runnable is fake_runnable
         assert len(messages) == 1
         return fake_response
@@ -230,7 +230,7 @@ def test_call_planner_passes_timeout_to_invoke() -> None:
     def fake_factory(*a: Any, **kw: Any) -> Any:
         return _FakeChatLLM()
 
-    def fake_invoke(runnable: Any, messages: list, *, timeout_seconds: float):
+    def fake_invoke(runnable: Any, messages: list, *, timeout_seconds: float, provider=None):
         captured["timeout_seconds"] = timeout_seconds
         return _FakeAIMessage("ok")
 
@@ -250,7 +250,7 @@ def test_call_planner_explicit_timeout_overrides_settings() -> None:
     def fake_factory(*a: Any, **kw: Any) -> Any:
         return _FakeChatLLM()
 
-    def fake_invoke(runnable: Any, messages: list, *, timeout_seconds: float):
+    def fake_invoke(runnable: Any, messages: list, *, timeout_seconds: float, provider=None):
         captured["timeout_seconds"] = timeout_seconds
         return _FakeAIMessage("ok")
 

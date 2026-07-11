@@ -21,6 +21,7 @@ the checklist (ПРАВИЛО #7).
 
 from __future__ import annotations
 
+import asyncio
 import math
 import threading
 import time
@@ -28,6 +29,7 @@ import time
 import httpx
 import pytest
 
+import sreda.services.llm as llm_service
 from sreda.config.settings import get_settings
 from sreda.services import llm_bulkhead
 from sreda.services.llm import (
@@ -39,7 +41,7 @@ from sreda.services.llm import (
     ainvoke_with_streaming_timeout,
     invoke_with_per_call_timeout,
 )
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk
 
 
 # ---------------------------------------------------------------------------
@@ -263,12 +265,33 @@ def test_breaker_stale_error_does_not_release_probe_slot():
     clock.advance(31.0)
     probe = br.allow(cooldown=30.0)
     assert probe is not None and probe.is_probe
-    stale = llm_bulkhead._BreakerAttempt(is_probe=False, token=None)
+    stale = llm_bulkhead._BreakerAttempt(is_probe=False, token=None, generation=0)
     br.record_other_error(stale)  # stale, not the probe owner
     assert br.allow(cooldown=30.0) is None  # probe slot still held
     br.record_other_error(probe)  # owner releases the slot (stays open)
     assert br.is_open is True
     assert br.allow(cooldown=30.0) is not None  # new probe admitted
+
+
+def test_breaker_stale_timeout_after_probe_close_does_not_reopen():
+    """Codex R2 MAJOR: a non-probe timeout from a call admitted BEFORE the
+    breaker opened must not count against the fresh generation a probe just
+    verified healthy (generation guard)."""
+    clock = _FakeClock()
+    br = llm_bulkhead._CircuitBreaker(provider="mimo", clock=clock)
+    stale = _admit(br, open_after=1)  # admitted while closed (generation 0)
+    # Open the breaker (open_after=1 → a single fresh timeout opens it).
+    br.record_timeout(_admit(br, open_after=1), open_after=1)
+    assert br.is_open is True
+    # Cooldown → probe → success closes it into a NEW generation.
+    clock.advance(31.0)
+    probe = br.allow(cooldown=30.0)
+    assert probe is not None and probe.is_probe
+    br.record_success(probe)
+    assert br.is_open is False
+    # The stale pre-open timeout finally lands: it must NOT re-open the breaker.
+    br.record_timeout(stale, open_after=1)
+    assert br.is_open is False
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +432,70 @@ def test_streaming_path_enforces_bulkhead(monkeypatch, blocker):
 
     asyncio.run(_run_second())
     blocker.set()
+
+
+def test_streaming_backpressure_bounds_producer(monkeypatch):
+    """Codex R2 MAJOR: a fast producer cannot pile unbounded chunks past a slow
+    consumer — the worker blocks once ``_STREAM_BUFFER_MAXSIZE`` chunks are
+    unconsumed. Without backpressure the gap would grow to N."""
+    monkeypatch.setattr(llm_service, "_STREAM_BUFFER_MAXSIZE", 8)
+    _use_guard_config(monkeypatch, enabled=False, max_concurrent=1, open_after=1, cooldown=1.0)
+
+    n_chunks = 200
+    state = {"produced": 0, "consumed": 0, "max_gap": 0}
+
+    class _FastStream:
+        def stream(self, _messages):
+            for _ in range(n_chunks):
+                state["produced"] += 1
+                gap = state["produced"] - state["consumed"]
+                if gap > state["max_gap"]:
+                    state["max_gap"] = gap
+                yield AIMessageChunk(content="x")
+
+        def invoke(self, _messages):  # pragma: no cover
+            raise AssertionError("streaming only")
+
+    def _on_text(_t):
+        state["consumed"] += 1
+        time.sleep(0.001)  # consumer slower than producer
+
+    asyncio.run(
+        ainvoke_with_streaming_timeout(
+            _FastStream(), [], timeout_seconds=30.0, on_text_update=_on_text
+        )
+    )
+    assert state["consumed"] == n_chunks
+    # Bounded well below N: maxsize + small in-flight margin (unbounded → ~200).
+    assert state["max_gap"] <= 8 * 2, state["max_gap"]
+
+
+def test_streaming_delegated_reinvoke_at_limit_one(monkeypatch):
+    """Codex R2 MAJOR: at max_concurrent=1, an empty stream that needs a
+    delegated re-invoke must not spuriously LLMBulkheadFull — the worker permit
+    is released (awaited) before the delegated call acquires its own."""
+    _use_guard_config(monkeypatch, enabled=True, max_concurrent=1, open_after=1000, cooldown=999.0)
+
+    class _EmptyStreamThenInvoke:
+        def __init__(self) -> None:
+            self.invoked = 0
+
+        def stream(self, _messages):
+            return iter(())  # empty → combined is None → delegated invoke
+
+        def invoke(self, _messages):
+            self.invoked += 1
+            return AIMessage(content="delegated-ok")
+
+    r = _EmptyStreamThenInvoke()
+    result = asyncio.run(
+        ainvoke_with_streaming_timeout(
+            r, [], timeout_seconds=5.0, on_text_update=lambda _t: None, provider="mimo"
+        )
+    )
+    assert r.invoked == 1
+    assert result.content == "delegated-ok"
+    assert llm_bulkhead.get_bulkhead().in_flight == 0
 
 
 def test_guard_disabled_is_legacy_passthrough(monkeypatch, blocker):

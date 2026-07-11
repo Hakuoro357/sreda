@@ -91,7 +91,7 @@ def _log(outcome: str = "completed") -> ExecutionLog:
 
 def _capture_invoke(captured: dict, response: Any = None):
     """Return an invoke() stub that records args and returns response."""
-    def _invoke(runnable: Any, messages: list, *, timeout_seconds: float) -> Any:
+    def _invoke(runnable: Any, messages: list, *, timeout_seconds: float, provider=None) -> Any:
         captured["runnable"] = runnable
         captured["messages"] = messages
         captured["timeout_seconds"] = timeout_seconds

@@ -63,6 +63,14 @@ logger = logging.getLogger(__name__)
 
 _PER_CALL_TIMEOUT_DEFAULT = 60.0
 
+# Max number of stream chunks buffered between the worker thread and the async
+# consumer before the worker blocks (Codex R2 MAJOR). Real producer backpressure:
+# a fast / endless provider cannot pile unbounded chunks into the queue faster
+# than ``on_text_update`` drains them and exhaust memory. Small because chunks
+# are tiny and the consumer normally keeps up; it only bites a pathological
+# fast-producer / slow-consumer case.
+_STREAM_BUFFER_MAXSIZE = 256
+
 
 class LLMCallTimeout(TimeoutError):
     """Raised by ``invoke_with_per_call_timeout`` when LLM exceeds wall-time.
@@ -278,9 +286,15 @@ async def ainvoke_with_streaming_timeout(
     queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
     # Once the consumer exits (timeout / cancel / error) the worker must stop
     # scheduling chunks (Codex R1 MAJOR): a provider streaming endless keepalive
-    # chunks into an abandoned, unbounded queue would exhaust memory even though
-    # the thread count is bounded.
+    # chunks into an abandoned queue would exhaust memory even though the thread
+    # count is bounded.
     abandoned = threading.Event()
+    # Real producer backpressure (Codex R2 MAJOR): the worker must hold a free
+    # buffer slot before scheduling each chunk, and the consumer frees one after
+    # draining it. A fast provider therefore blocks (in its own thread) once
+    # ``_STREAM_BUFFER_MAXSIZE`` chunks are unconsumed instead of piling them up
+    # in the queue. ``abandoned`` breaks the worker out of the acquire wait.
+    buffer_slots = threading.Semaphore(_STREAM_BUFFER_MAXSIZE)
 
     # Exception-safe create+submit in one guarded block (Codex R1 MAJOR): until
     # a future owns the permit, any failure must release both the permit and the
@@ -296,7 +310,13 @@ async def ainvoke_with_streaming_timeout(
         def _worker() -> None:
             try:
                 for chunk in runnable.stream(messages):
+                    # Backpressure: wait for a free buffer slot; bail out if the
+                    # consumer has abandoned the stream.
+                    while not buffer_slots.acquire(timeout=0.1):
+                        if abandoned.is_set():
+                            return
                     if abandoned.is_set():
+                        buffer_slots.release()
                         return
                     loop.call_soon_threadsafe(queue.put_nowait, ("chunk", chunk))
                 if not abandoned.is_set():
@@ -345,6 +365,8 @@ async def ainvoke_with_streaming_timeout(
                 if kind == "done":
                     break
 
+                # A chunk was drained → free one backpressure slot for the worker.
+                buffer_slots.release()
                 chunk = payload
                 combined = chunk if combined is None else combined + chunk
                 if getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None):
@@ -358,6 +380,18 @@ async def ainvoke_with_streaming_timeout(
             # Stop the worker from buffering further chunks, then release it.
             abandoned.set()
             executor.shutdown(wait=False, cancel_futures=True)
+
+        # Reached only on the "done" success path. Wait for the worker thread to
+        # finish so its bulkhead-release done-callback (registered above, before
+        # this await) has run BEFORE any delegated re-invoke acquires its own
+        # permit — otherwise at a full / max_concurrent=1 bulkhead the delegated
+        # call could spuriously fast-fail (Codex R2 MAJOR). The worker has
+        # already emitted "done" and returned, so this is immediate.
+        if worker_future is not None:
+            try:
+                await asyncio.wrap_future(worker_future)
+            except BaseException:  # noqa: BLE001 — worker never propagates; be safe
+                pass
 
         # Stream completed (broke on "done"). Finalize INSIDE the same breaker
         # attempt: a delegated re-invoke here that times out must count as this
