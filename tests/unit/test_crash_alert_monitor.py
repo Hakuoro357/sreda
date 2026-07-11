@@ -164,6 +164,54 @@ class TestScanLogs:
         # третий тик без новых строк — ничего (carry не даёт двойной счёт)
         assert cam.scan_logs(state, str(tmp_path / "*.log")) == {}
 
+    def test_read_oserror_keeps_offset_for_retry(self, tmp_path, monkeypatch):
+        """R1/R2: сбой чтения НЕ двигает офсет — кусок дочитывается следующим тиком."""
+        import builtins
+        log = tmp_path / "flaky.log"
+        log.write_text("", encoding="utf-8")
+        state = self._init_state(log)
+        with log.open("a", encoding="utf-8") as f:
+            f.write("psycopg.errors.ActiveSqlTransaction: после сбоя\n")
+
+        real_open = builtins.open
+        fail_once = {"armed": True}
+
+        def _flaky(file, *a, **kw):  # noqa: ANN001
+            if str(file) == str(log) and fail_once["armed"]:
+                fail_once["armed"] = False
+                raise OSError("transient")
+            return real_open(file, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", _flaky)
+        assert cam.scan_logs(state, str(tmp_path / "*.log")) == {}  # сбой → тихо, офсет цел
+        hits = cam.scan_logs(state, str(tmp_path / "*.log"))
+        assert hits.get("ActiveSqlTransaction") == {"flaky.log": 1}
+
+    def test_full_match_ending_exactly_at_cap_boundary_not_lost(self, tmp_path, monkeypatch):
+        """R2 субагент N1: ПОЛНОЕ имя класса, кончающееся ровно на потолке куска, не теряется."""
+        monkeypatch.setattr(cam, "_MAX_CHUNK_BYTES", 64)
+        log = tmp_path / "edge.log"
+        log.write_text("", encoding="utf-8")
+        state = self._init_state(log)
+        marker = "psycopg.errors.ActiveSqlTransaction"          # 36 символов ASCII
+        with log.open("a", encoding="utf-8") as f:
+            f.write("x" * (64 - len(marker)) + marker + "\nrest line\n")
+        merged: dict[str, int] = {}
+        for _ in range(4):
+            for cls, files in cam.scan_logs(state, str(tmp_path / "*.log")).items():
+                merged[cls] = merged.get(cls, 0) + sum(files.values())
+        assert merged == {"ActiveSqlTransaction": 1}  # найден и не задвоен
+
+    def test_empty_glob_does_not_mark_initialized(self, tmp_path):
+        """R2 субагент N2: пустой глоб на первом тике не «инициализирует» — история не алертится."""
+        state = cam._State()
+        assert cam.scan_logs(state, str(tmp_path / "*.log")) == {}
+        assert state.initialized is False  # файлов не было — init не состоялся
+        log = tmp_path / "late.log"
+        log.write_text("psycopg.errors.ActiveSqlTransaction: историческая\n", encoding="utf-8")
+        assert cam.scan_logs(state, str(tmp_path / "*.log")) == {}  # регистрация EOF, молчим
+        assert state.initialized is True
+
     def test_offset_advances_only_by_read_bytes_with_cap(self, tmp_path, monkeypatch):
         """R1 MAJOR: кусок больше потолка — офсет двигается на прочитанное, остаток не теряется."""
         monkeypatch.setattr(cam, "_MAX_CHUNK_BYTES", 64)
@@ -247,6 +295,56 @@ class TestTiersAndTick:
         assert [(s.channel_type, s.bot_key) for s in slices] == [("max", "sreda")]
 
 
+class TestPendingRetry:
+    def _tick(self, monkeypatch, db_session, state, tmp_path, now):
+        class _Ctx:
+            def __enter__(self):
+                return db_session
+
+            def __exit__(self, *a):  # noqa: ANN002
+                return False
+
+        monkeypatch.setattr(cam, "privileged_session", lambda *_a, **_k: _Ctx())
+        monkeypatch.setattr(cam._State, "save", lambda self: None)
+        return cam.tick_once(state, now=now, log_glob=str(tmp_path / "*.log"))
+
+    def test_undelivered_log_alert_retried_next_tick(self, monkeypatch, db_session, tmp_path):
+        """R2 high MAJOR: сбой отправки лог-алерта → повтор следующим тиком (офсеты уже съедены)."""
+        log = tmp_path / "uvicorn.log"
+        log.write_text("", encoding="utf-8")
+        state = cam._State(initialized=True,
+                           files={str(log): {"off": 0, "sig": "", "sig_len": 0, "carry": "",
+                                             "capped": False}})
+        log.write_text("psycopg.errors.ActiveSqlTransaction: boom\n", encoding="utf-8")
+
+        boom = {"on": True}
+        calls: list[str] = []
+
+        def _spy(severity, title, body, *, dedupe_key=None, **kw):  # noqa: ANN001
+            if boom["on"]:
+                raise RuntimeError("network down")
+            calls.append(dedupe_key)
+
+        monkeypatch.setattr(cam, "send_admin_alert", _spy)
+        sent1 = self._tick(monkeypatch, db_session, state, tmp_path, _NOW)
+        assert sent1 == [] and "crash_alert:log:ActiveSqlTransaction" in state.pending
+        boom["on"] = False  # сеть починилась — новых строк в логе НЕТ, но pending ретраится
+        sent2 = self._tick(monkeypatch, db_session, state, tmp_path,
+                           _NOW + timedelta(minutes=5))
+        assert sent2 == ["crash_alert:log:ActiveSqlTransaction"] == calls
+
+    def test_pending_expires_after_ttl(self, monkeypatch, db_session, tmp_path):
+        state = cam._State(initialized=True)
+        state.pending["crash_alert:log:X"] = {
+            "severity": "P2", "title": "t", "body": "b",
+            "expires": (_NOW - timedelta(minutes=1)).isoformat(),
+        }
+        monkeypatch.setattr(cam, "send_admin_alert",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("не должен слаться")))
+        sent = self._tick(monkeypatch, db_session, state, tmp_path, _NOW)
+        assert sent == [] and state.pending == {}
+
+
 class TestStateAndFlag:
     def test_state_roundtrip_through_real_runtime_config(self, monkeypatch, db_session):
         """R1 субагент: save/load гоняем через НАСТОЯЩИЙ runtime_config (не подменённый)."""
@@ -266,6 +364,29 @@ class TestStateAndFlag:
         assert loaded.initialized is True
         assert loaded.files["/var/log/sreda/x.log"]["off"] == 42
         assert loaded.files["/var/log/sreda/x.log"]["carry"] == "хвост"
+
+    def test_corrupted_file_entry_dropped_on_load(self, monkeypatch, db_session):
+        """R2 субагент N3: битая пер-файловая запись выбрасывается, не слепит монитор навечно."""
+        class _Ctx:
+            def __enter__(self):
+                return db_session
+
+            def __exit__(self, *a):  # noqa: ANN002
+                return False
+
+        monkeypatch.setattr(cam, "privileged_session", lambda *_a, **_k: _Ctx())
+        import json as _json
+        from sreda.services import runtime_config as rc
+        rc.set_config(db_session, cam._RC_STATE_KEY, _json.dumps({
+            "files": {"/var/log/sreda/ok.log": {"off": 7, "sig": "s", "sig_len": 1, "carry": ""},
+                      "/var/log/sreda/bad.log": {"off": None},
+                      "/var/log/sreda/junk.log": "не-словарь"},
+            "initialized": True,
+        }))
+        rc.invalidate_cache()
+        loaded = cam._State.load()
+        assert set(loaded.files) == {"/var/log/sreda/ok.log"}
+        assert loaded.files["/var/log/sreda/ok.log"]["off"] == 7
 
     def test_corrupted_state_starts_fresh(self, monkeypatch, db_session):
         class _Ctx:
