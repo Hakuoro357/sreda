@@ -337,15 +337,18 @@ async def test_status_same_tenant_token_returns_200(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_start_already_linked_returns_409(db_session, monkeypatch):
-    """If tenant already has target channel linked, /start returns 409."""
+async def test_start_already_linked_other_user_returns_409(db_session, monkeypatch):
+    """#341: /start возвращает 409, если target-канал привязан к ДРУГОМУ юзеру
+    тенанта (семья), а не к самому инициатору."""
     from sreda.api.routes import miniapp as mi
 
     _patch_settings(monkeypatch)
 
-    # tenant_tg user already has max_account_id set
-    user = db_session.get(User, "user_tg")
-    user.max_account_id = "200"
+    # ДРУГОЙ юзер в tenant_tg уже имеет MAX-привязку; инициатор (user_tg) — нет.
+    db_session.add(User(
+        id="user_tg_family", tenant_id="tenant_tg",
+        telegram_account_id="101", max_account_id="777",
+    ))
     db_session.commit()
 
     _patch_auth(
@@ -362,3 +365,47 @@ async def test_start_already_linked_returns_409(db_session, monkeypatch):
 
     assert exc.value.status_code == 409
     assert exc.value.detail == "already_linked"
+
+
+@pytest.mark.asyncio
+async def test_start_same_user_relink_allowed_for_refresh(db_session, monkeypatch):
+    """#341 (Codex R-codex R2 MAJOR): инициатор, у которого target-канал уже
+    привязан к НЕМУ САМОМУ, ВПРАВЕ пере-инициировать линк (обновить chat_id) —
+    /start НЕ должен возвращать 409 (иначе legit-путь ре-байнда недостижим)."""
+    from sreda.api.routes import miniapp as mi
+
+    _patch_settings(monkeypatch)
+
+    # Сам инициатор уже имеет MAX-привязку (сценарий обновления chat_id).
+    user = db_session.get(User, "user_tg")
+    user.max_account_id = "200"
+    db_session.commit()
+
+    _patch_auth(
+        monkeypatch,
+        platform="telegram",
+        payload={"telegram_id": "100", "user_id": "user_tg", "tenant_id": "tenant_tg"},
+    )
+
+    # Заглушки для доставки deep-link (не выходим в сеть).
+    class _FakeTgClient:
+        async def send_message(self, *a, **k):
+            return {"ok": True}
+
+    monkeypatch.setattr(mi, "telegram_client_for", lambda *a, **k: _FakeTgClient())
+
+    async def _fake_alert(*a, **k):
+        return None
+
+    monkeypatch.setattr(
+        "sreda.services.admin_alerts.alert_admin_async", _fake_alert
+    )
+
+    result = await mi.channel_link_start(
+        FakeRequest(platform="telegram"),
+        session=db_session,
+    )
+
+    # НЕ 409 — старт прошёл, выдан токен на target=max.
+    assert result["target_channel"] == "max"
+    assert "id" in result

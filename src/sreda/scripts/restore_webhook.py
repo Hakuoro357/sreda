@@ -39,8 +39,15 @@ import sys
 import httpx
 
 from sreda.config.settings import get_settings
+from sreda.services.webhook_security import (
+    is_webhook_deployed,
+    is_webhook_secret_configured,
+    normalized_webhook_secret,
+)
 
 
+# Дефолтный прод-URL (док/совместимость). #341: фактический URL берётся из
+# SREDA_TELEGRAM_WEBHOOK_URL — тот же дискриминатор, что арматирует route-гейт.
 WEBHOOK_URL = "https://bot.sredaspace.ru/webhooks/telegram/sreda"
 TELEGRAM_IP = "62.113.41.104"
 ALLOWED_UPDATES = '["message","edited_message","callback_query"]'
@@ -123,23 +130,41 @@ def main() -> int:
     if not settings.telegram_bot_token:
         print("SREDA_TELEGRAM_BOT_TOKEN is not set", file=sys.stderr)
         return 1
-    if not settings.telegram_webhook_secret_token:
+    # #341 (F1, Codex R-codex R2 MAJOR): webhook-режим требует
+    # SREDA_TELEGRAM_WEBHOOK_URL — тот же дискриминатор, что арматирует
+    # route-гейт running-app. Без него роут остался бы на permissive fallback,
+    # а этот скрипт зарегистрировал бы внешний webhook → fail-open.
+    if not is_webhook_deployed(
+        bot_token=settings.telegram_bot_token,
+        webhook_url=settings.telegram_webhook_url,
+    ):
         print(
-            "SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN is not set; refusing to "
-            "set webhook without it (would accept hostile inbound)",
+            "SREDA_TELEGRAM_WEBHOOK_URL is not set; refusing to set webhook — "
+            "webhook mode requires it so the running app's route gate is armed "
+            "(otherwise route stays permissive fallback, #341)",
+            file=sys.stderr,
+        )
+        return 1
+    # #341: пробельный/пустой secret трактуется как ОТСУТСТВУЮЩИЙ (нормализация).
+    if not is_webhook_secret_configured(settings.telegram_webhook_secret_token):
+        print(
+            "SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN is not set (or whitespace); "
+            "refusing to set webhook without it (would accept hostile inbound)",
             file=sys.stderr,
         )
         return 1
 
     # ------------------------------------------------------------------
-    # Set webhook
+    # Set webhook — URL и secret из того же дискриминатора, что видит route-гейт.
     # ------------------------------------------------------------------
     response = httpx.post(
         f"https://api.telegram.org/bot{settings.telegram_bot_token}/setWebhook",
         data={
-            "url": WEBHOOK_URL,
+            "url": settings.telegram_webhook_url,
             "ip_address": TELEGRAM_IP,
-            "secret_token": settings.telegram_webhook_secret_token,
+            "secret_token": normalized_webhook_secret(
+                settings.telegram_webhook_secret_token
+            ),
             "max_connections": MAX_CONNECTIONS,
             # drop_pending_updates=false — keep updates queued at TG so
             # rollback is non-destructive.

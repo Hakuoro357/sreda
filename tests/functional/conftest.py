@@ -109,6 +109,13 @@ def harness(monkeypatch, tmp_path):
     monkeypatch.setenv("SREDA_PLANNER_ENABLED_TENANTS", TENANT)
     monkeypatch.setenv("SREDA_MESSAGE_QUEUE_ENABLED_TENANTS", "")  # = прод
     monkeypatch.setenv("SREDA_TELEGRAM_BOT_TOKEN", "100:test-token")
+    # #341: харнес бьёт по /webhooks/telegram/* → webhook-режим (роут монтируется
+    # только при bot_token+webhook_url; секрет иначе даёт 401).
+    monkeypatch.setenv(
+        "SREDA_TELEGRAM_WEBHOOK_URL",
+        "https://bot.test.local/webhooks/telegram/sreda",
+    )
+    monkeypatch.setenv("SREDA_TELEGRAM_WEBHOOK_SECRET_TOKEN", "func-wh-secret-341")
     monkeypatch.setenv("SREDA_TG_ACCOUNT_SALT", "f" * 64)
     monkeypatch.delenv("SREDA_ADMIN_TG_CHAT_ID", raising=False)
     # preflight требует сконфигурированный LLM ДО гейта планировщика;
@@ -328,6 +335,9 @@ async def run_turn(harness):
                         "chat": {"id": int(harness.chat_id), "type": "private"},
                         "text": text,
                     }},
+                    headers={
+                        "X-Telegram-Bot-Api-Secret-Token": "func-wh-secret-341",
+                    },
                 )
             assert resp.status_code == 202, resp.text
         finally:

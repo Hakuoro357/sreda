@@ -129,6 +129,10 @@ class Settings(BaseSettings):
     db_pool_pre_ping: bool = True
     telegram_bot_token: str | None = None
     telegram_webhook_secret_token: str | None = None
+    # #341: opt-in дискриминатор webhook-режима TG (аналог max_webhook_url).
+    # Прод-вход TG = long-poll → это поле НЕ задаётся, TG-webhook-гейт инертен.
+    # Задано (webhook-режим) + пустой secret → fail-closed (startup+route).
+    telegram_webhook_url: str | None = None
     telegram_bot_username: str | None = None
     telegram_miniapp_shortname: str | None = None
 

@@ -23,6 +23,10 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, 
 
 from sreda.config.settings import get_settings
 from sreda.services.max_inbound import handle_max_update
+from sreda.services.webhook_security import (
+    is_webhook_deployed,
+    normalized_webhook_secret,
+)
 
 
 router = APIRouter(prefix="/api/max", tags=["max"])
@@ -39,15 +43,30 @@ def _verify_max_secret(
     Per MAX docs: «Если secret указан при создании подписки, он
     передаётся в заголовке X-Max-Bot-Api-Secret каждого Webhook-запроса».
 
-    Если в env нет ``max_webhook_secret_token`` — ничего не проверяем
-    (dev fallback). В prod секрет обязан быть настроен.
+    #341 (F1, CRITICAL): fail-closed. Если secret пуст, но бот РАЗВЁРНУТ
+    (заданы max_bot_token+max_webhook_url) — ОТКЛОНЯЕМ (401), не пускаем
+    неаутентифицированный inbound. Чистый dev без token+url сохраняет
+    permissive dev-fallback (accept). Дискриминатор = связка token+url,
+    НЕ концепт «prod» (такого флага в коде нет).
     """
-    expected = get_settings().max_webhook_secret_token
+    settings = get_settings()
+    # Codex R-codex MAJOR B: нормализуем secret (пробельный → отсутствует) и
+    # ветвимся на ЕДИНЫЙ дискриминатор is_webhook_deployed — как startup/health.
+    expected = normalized_webhook_secret(settings.max_webhook_secret_token)
     if not expected:
+        if is_webhook_deployed(
+            bot_token=settings.max_bot_token,
+            webhook_url=settings.max_webhook_url,
+        ):
+            logger.error(
+                "max webhook rejected: secret не настроен, но бот развёрнут "
+                "(max_bot_token+max_webhook_url заданы) — fail-closed (#341)"
+            )
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
         logger.warning(
             "max webhook accepted без secret check — "
-            "max_webhook_secret_token не настроен; "
-            "это OK для dev, в prod ставит admin alert."
+            "max_webhook_secret_token не настроен и бот не развёрнут "
+            "(нет token+url); dev-fallback."
         )
         return
     if secret_header is None or not hmac.compare_digest(

@@ -329,6 +329,16 @@ def consume_link(
     )
     if existing_target:
         if str(existing_target) == incoming_target:
+            # #341 (Codex R-codex MAJOR D): аутентифицированный ре-линк ТОГО ЖЕ
+            # MAX-аккаунта — единственный легитимный путь обновить established
+            # max_chat_id (inbound/mini-app для установленного значения его не
+            # трогают). Обновляем chat_id, если он изменился.
+            if (
+                target_channel == "max"
+                and target_chat_id
+                and source_user.max_chat_id != str(target_chat_id)
+            ):
+                source_user.max_chat_id = str(target_chat_id)
             session.commit()
             return ConsumeOutcome(
                 success=True,
@@ -405,29 +415,40 @@ def is_account_already_linked(
     *,
     tenant_id: str,
     target_channel: str,
+    exclude_user_id: str | None = None,
 ) -> bool:
     """Check if any user in this tenant already has the target channel linked.
 
     Server-side guard for /start — UI hide is insufficient; the backend
     must enforce to prevent redundant linking attempts.
 
+    #341 (Codex R-codex R2 MAJOR): ``exclude_user_id`` исключает САМОГО
+    инициатора из проверки. Иначе юзер, у которого target-канал уже привязан,
+    не может пере-инициировать линк, чтобы ОБНОВИТЬ свой chat_id (легит.
+    сценарий смены MAX-чата) — единственный путь обновления established
+    max_chat_id (consume_link same-account) оказывался недостижим через UX.
+    Коллизии с ДРУГИМИ юзерами тенанта (семья) по-прежнему блокируются здесь,
+    а consume_link дополнительно отбивает любые cross-account/cross-tenant
+    коллизии на этапе потребления токена.
+
     Args:
         session: SQLAlchemy session.
         tenant_id: The tenant to check.
         target_channel: ``"max"`` or ``"telegram"``.
+        exclude_user_id: если задан — этот юзер НЕ считается «уже привязанным»
+            (разрешаем ему ре-линк для обновления собственной привязки).
 
     Returns:
-        True if at least one user in the tenant has the target account
+        True if at least one OTHER user in the tenant has the target account
         already linked.
     """
     if target_channel not in LINK_CHANNELS:
         raise ValueError(f"unknown target_channel: {target_channel!r}")
     col = User.max_account_id if target_channel == "max" else User.telegram_account_id
-    exists = session.execute(
-        select(User.id)
-        .where(User.tenant_id == tenant_id, col.is_not(None))
-        .limit(1)
-    ).first()
+    stmt = select(User.id).where(User.tenant_id == tenant_id, col.is_not(None))
+    if exclude_user_id is not None:
+        stmt = stmt.where(User.id != exclude_user_id)
+    exists = session.execute(stmt.limit(1)).first()
     return exists is not None
 
 

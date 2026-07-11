@@ -37,6 +37,14 @@ async def _lifespan(app: FastAPI):
     """
     settings = get_settings()
 
+    # #341 (F1, CRITICAL security): fail-closed startup gate. Если любой канал
+    # развёрнут в webhook-режиме (token+url заданы), но webhook-secret пуст —
+    # роняем старт ДО регистрации webhook. Иначе роут принимал бы поддельный
+    # неаутентифицированный inbound (перехват max_chat_id жертвы). Дискриминатор
+    # = связка token+url (та же, что гейтит MAX-регистрацию ниже), НЕ «prod».
+    from sreda.services.webhook_security import assert_webhook_secrets_configured
+    assert_webhook_secrets_configured(settings)
+
     # Issue #68: llm-trace writer task lifecycle. Startup eagerly creates
     # queue + writer + GC tasks так что persist_request_envelope не получит
     # cold-start latency на первом turn'е. Shutdown drains queue с 10s
@@ -68,7 +76,16 @@ async def _lifespan(app: FastAPI):
     # health endpoint показывает degraded если регистрация не удалась.
     # Rollback path: убрать SREDA_MAX_BOT_TOKEN из env → этот блок skip.
     app.state.max_webhook_status = "disabled"
-    if settings.max_bot_token and settings.max_webhook_url:
+    # #341 MAJOR B: единый дискриминатор is_webhook_deployed (не сырая
+    # truthiness). Startup-гейт выше уже гарантировал, что secret задан, если
+    # бот развёрнут — регистрируем нормализованным секретом.
+    from sreda.services.webhook_security import (
+        is_webhook_deployed as _is_webhook_deployed,
+        normalized_webhook_secret as _normalized_webhook_secret,
+    )
+    if _is_webhook_deployed(
+        bot_token=settings.max_bot_token, webhook_url=settings.max_webhook_url
+    ):
         try:
             from sreda.integrations.max import MaxClient
             from sreda.services.admin_alerts import alert_admin_async
@@ -80,7 +97,9 @@ async def _lifespan(app: FastAPI):
             # в `X-Max-Bot-Api-Secret` header каждого webhook'а.
             await max_client.set_webhook(
                 url=settings.max_webhook_url,
-                secret_token=settings.max_webhook_secret_token,
+                secret_token=_normalized_webhook_secret(
+                    settings.max_webhook_secret_token
+                ),
             )
             app.state.max_webhook_status = "ok"
             logger.info(
@@ -139,8 +158,25 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(connect_router)
     app.include_router(miniapp_router)
-    app.include_router(telegram_router)
-    app.include_router(max_router)
+    # #341 (F1, CRITICAL): webhook-ingest роуты монтируются ТОЛЬКО когда канал
+    # реально в webhook-режиме (is_webhook_deployed = bot_token+webhook_url для
+    # ЭТОГО канала). На long-poll (webhook_url пуст) роутер НЕ монтируется →
+    # внешний POST на /webhooks/telegram/* или /api/max/webhook даёт 404, а не
+    # dev-fallback accept поддельного inbound. TG и MAX — независимо. Включение
+    # webhook-режима (задать *_webhook_url) возвращает роут + активный route-гейт.
+    # Long-poll-обработка идёт мимо HTTP (handle_*_update из воркера), health
+    # читает app.state, не роут — внутренние потребители не задеты.
+    from sreda.services.webhook_security import is_webhook_deployed as _iwd
+    if _iwd(
+        bot_token=settings.telegram_bot_token,
+        webhook_url=settings.telegram_webhook_url,
+    ):
+        app.include_router(telegram_router)
+    if _iwd(
+        bot_token=settings.max_bot_token,
+        webhook_url=settings.max_webhook_url,
+    ):
+        app.include_router(max_router)
     app.include_router(approvals_router)
     feature_registry.register_api(app)
     app.state.feature_registry = feature_registry
