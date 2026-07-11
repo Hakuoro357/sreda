@@ -27,6 +27,14 @@ def session():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     sess = sessionmaker(bind=engine)()
+    # sreda_free тариф — в проде всегда есть (миграция 0041); провижн без него
+    # теперь бросает (R2-2 атомарность). Сеем как прод-предпосылку.
+    from sreda.db.models.billing import SubscriptionPlan
+    sess.add(SubscriptionPlan(
+        id="plan_free", plan_key="sreda_free", feature_key="housewife_assistant",
+        title="Free", description="", price_rub=0,
+    ))
+    sess.commit()
     try:
         yield sess
     finally:

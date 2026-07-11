@@ -63,64 +63,56 @@ def insert_only_bundle(
     ``workspaces``/``assistants``/``tenant_features`` (plain String) — сырым INSERT.
     R2 (Codex high MAJOR-4): перехватывается ТОЛЬКО unique-violation; FK/NOT NULL/
     CHECK пробрасываются (иначе частичный битый бандл под видом «безобидного ретрая»).
+
+    R2-2 (Codex high R2 MAJOR): ВЕСЬ бандл — в ОДНОМ savepoint (все 5 INSERT'ов
+    атомарны). Любой UNIQUE-конфликт (гонка/ретрай/legacy-частичный бандл) →
+    откат ВСЕГО бандла → created=False, НЕТ частичных строк (tenant/workspace без
+    user). created определяется по факту вставки users (естественный unique
+    tg_account_hash/max_account_id/PK ловит гонку двух первых сообщений).
     """
     from sqlalchemy.exc import IntegrityError
 
     now = datetime.now(timezone.utc)
 
-    def _add_ignore_dup(obj) -> bool:
-        """ORM add+flush в savepoint; True — вставлено, False — UNIQUE-конфликт."""
-        try:
-            with session.begin_nested():
-                session.add(obj)
-                session.flush()
-            return True
-        except IntegrityError as ex:
-            if not _is_unique_violation(ex):
-                raise  # FK/NOT NULL/CHECK — не «ретрай», настоящая ошибка
-            return False
-
-    def _exec_ignore_dup(sql: str, params: dict) -> bool:
-        try:
-            with session.begin_nested():
-                session.execute(text(sql), params)
-            return True
-        except IntegrityError as ex:
-            if not _is_unique_violation(ex):
-                raise
-            return False
-
-    _add_ignore_dup(Tenant(id=tenant_id, name=tenant_name, created_at=now, approved_at=now))
-    _exec_ignore_dup(
-        "INSERT INTO workspaces (id, tenant_id, name) VALUES (:id, :t, :name)",
-        {"id": workspace_id, "t": tenant_id, "name": workspace_name},
-    )
-    # users — ORM (шифрование + event-хеш); флаг created определяется ЗДЕСЬ
-    # (естественный unique tg_account_hash/PK ловит гонку двух первых сообщений).
-    created = _add_ignore_dup(
-        User(
-            id=user_id,
-            tenant_id=tenant_id,
-            telegram_account_id=telegram_account_id,
-            max_account_id=max_account_id,
-            max_chat_id=max_chat_id,
-            last_bot_key=last_bot_key,
-        )
-    )
-    _exec_ignore_dup(
-        "INSERT INTO assistants (id, tenant_id, workspace_id, name) "
-        "VALUES (:id, :t, :w, :name)",
-        {"id": assistant_id, "t": tenant_id, "w": workspace_id, "name": assistant_name},
-    )
-    _exec_ignore_dup(
-        "INSERT INTO tenant_features (id, tenant_id, feature_key, enabled) "
-        "VALUES (:id, :t, 'core_assistant', :en)",
-        {"id": f"{tenant_id}:core_assistant", "t": tenant_id, "en": True},
-    )
+    created = True
+    try:
+        with session.begin_nested():
+            session.add(Tenant(id=tenant_id, name=tenant_name, created_at=now, approved_at=now))
+            session.execute(
+                text("INSERT INTO workspaces (id, tenant_id, name) VALUES (:id, :t, :name)"),
+                {"id": workspace_id, "t": tenant_id, "name": workspace_name},
+            )
+            session.add(
+                User(
+                    id=user_id,
+                    tenant_id=tenant_id,
+                    telegram_account_id=telegram_account_id,
+                    max_account_id=max_account_id,
+                    max_chat_id=max_chat_id,
+                    last_bot_key=last_bot_key,
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO assistants (id, tenant_id, workspace_id, name) "
+                    "VALUES (:id, :t, :w, :name)"
+                ),
+                {"id": assistant_id, "t": tenant_id, "w": workspace_id, "name": assistant_name},
+            )
+            session.execute(
+                text(
+                    "INSERT INTO tenant_features (id, tenant_id, feature_key, enabled) "
+                    "VALUES (:id, :t, 'core_assistant', :en)"
+                ),
+                {"id": f"{tenant_id}:core_assistant", "t": tenant_id, "en": True},
+            )
+            session.flush()
+    except IntegrityError as ex:
+        if not _is_unique_violation(ex):
+            raise  # FK/NOT NULL/CHECK — не «ретрай», настоящая ошибка
+        created = False  # весь бандл откачен savepoint'ом — частичных строк нет
     # R2 (Codex high CRIT-3): НЕ commit'им здесь — весь identity-этап (гард +
-    # бандл + грант) коммитится ОДИН раз вызывающим (provision_new_tenant_bundle),
-    # иначе advisory-лок анти-абьюза освобождался бы до вставки подписки. flush
-    # уже сделан (_add/_exec_ignore_dup); строки видны в текущей транзакции.
+    # бандл + грант) коммитится ОДИН раз вызывающим (provision_new_tenant_bundle).
     return created
 
 

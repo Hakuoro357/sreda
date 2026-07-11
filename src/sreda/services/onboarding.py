@@ -98,11 +98,13 @@ def _grant_free_tier_insert_only(session: Session, tenant_id: str) -> None:
     now = datetime.now(timezone.utc)
     plan_id, feature_key = _resolve_free_plan(session)
     if plan_id is None:
-        logger.warning(
-            "provision: sreda_free plan не существует — пропускаю grant для "
-            "tenant=%s. Проверь migration 0041 applied.", tenant_id,
+        # R2-2 (Codex high R2 MAJOR): НЕ warning+return (иначе одобренный тенант
+        # без подписки, а повторный вход найдёт existing-юзера и грант не выдаст).
+        # Провижн-ошибка → исключение → provision откатывает ВЕСЬ бандл.
+        raise RuntimeError(
+            f"provision: sreda_free plan отсутствует (tenant={tenant_id}); "
+            "проверь migration 0041 — провижн прерван, бандл откачен"
         )
-        return
     session.add(TenantSubscription(
         id="sub_" + uuid.uuid4().hex[:24],
         tenant_id=tenant_id,

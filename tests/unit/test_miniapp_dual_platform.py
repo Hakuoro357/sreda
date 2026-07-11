@@ -38,6 +38,12 @@ def db_session():
         id="user_max_111", tenant_id="tenant_max_111",
         max_account_id="111", max_chat_id="22",
     ))
+    # sreda_free тариф — прод-предпосылка (0041); провижн без него бросает (R2-2).
+    from sreda.db.models.billing import SubscriptionPlan
+    sess.add(SubscriptionPlan(
+        id="plan_free", plan_key="sreda_free", feature_key="housewife_assistant",
+        title="Free", description="", price_rub=0,
+    ))
     sess.commit()
     try:
         yield sess

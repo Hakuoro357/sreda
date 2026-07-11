@@ -96,10 +96,16 @@ def session(engine):
 def _identity_phase_uses_session(session, monkeypatch):
     """#138 Ф5-5b: identity-фаза (резолв + провижн) открывает отдельную
     privileged_session (после флипа DSN — роль sreda_identity). В юните стабаем
-    её на ту же sqlite-сессию теста, чтобы провижн писал в засеянную БД."""
+    её на ту же sqlite-сессию теста, чтобы провижн писал в засеянную БД.
+    Также сеем sreda_free тариф (прод-предпосылка 0041) — провижн без него
+    бросает (R2-2 атомарность); тесты, что уже сеют, идемпотентны (plan_key unique
+    → второй seed в тесте упал бы, поэтому сеем ТОЛЬКО если ещё нет)."""
     from contextlib import contextmanager
 
     import sreda.db.session as dbs
+
+    if session.query(SubscriptionPlan).filter_by(plan_key="sreda_free").first() is None:
+        _seed_plan(session)
 
     @contextmanager
     def _stub(reason):
@@ -109,6 +115,13 @@ def _identity_phase_uses_session(session, monkeypatch):
 
 
 def _seed_plan(session) -> SubscriptionPlan:
+    # Идемпотентно: autouse-фикстура уже могла засеять sreda_free (провижн без
+    # него теперь бросает, R2-2). plan_key unique → повторный INSERT упал бы.
+    existing = (
+        session.query(SubscriptionPlan).filter_by(plan_key="sreda_free").first()
+    )
+    if existing is not None:
+        return existing
     plan = SubscriptionPlan(
         id=f"plan_{uuid4().hex[:16]}",
         plan_key="sreda_free",
