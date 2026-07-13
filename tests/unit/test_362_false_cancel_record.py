@@ -1,11 +1,12 @@
 """#362 — Ложная отмена на записи данных (регрессия честной-отмены #321 на НЕ-отменяющем сообщении).
 
-Прод (MAX-юзер tenant_max_142322319, диабетик): декларативная запись показателя на ЖИВОЙ
+Прод-инцидент (пользователь ведёт журнал показателей): декларативная запись показателя на ЖИВОЙ
 confirm-паузе единого пути (#285) детерминированно превращалась в «Отменила, ничего не делаю.» +
 показатель ПОТЕРЯН. Причина: `_should_redirect_on_pause` (confirm-ветка) требовал КОМАНДНЫЙ сигнал
 (`_is_new_request_on_pause`), а голая ДЕКЛАРАТИВНАЯ запись («Сахар утром 16 и 2») его не несёт →
 проваливалась в resume→«нет»→`_confirm_declined`→ложная отмена (показатель дискардился: resume
-подменяет user_text на «нет», модель его больше не видит).
+подменяет user_text на «нет», модель его больше не видит). Идентификаторы/детали инцидента — в
+закрытом issue, не в этом (публичном) репозитории.
 
 Фикс (механизм): `react_signals.data_record_signal` (число-измерение) добавлен в confirm-ветку
 `_should_redirect_on_pause` — у confirm-паузы нет свободных СЛОТ-ответов, поэтому содержательная
@@ -161,12 +162,24 @@ def _durable_saver(tmp_path, name):
 
 # ─────────── юнит: data_record_signal ───────────
 def test_data_record_signal():
-    """#362: число-измерение = знак декларативной записи показателя; да/нет/эхо/без числа → False."""
+    """#362: число (цифрой ИЛИ словом) = знак декларативной записи; отказ/эхо/без числа/FP-слова → False."""
     from sreda.runtime.react_signals import data_record_signal as f
+    # запись показателя — цифрами
     for t in (SUGAR, "сахар 16 и 2", "16.2", "давление 120 на 80", "вес 80", "пульс 72"):
-        assert f(t), f"{t!r} должен быть записью показателя"
+        assert f(t), f"{t!r} должен быть записью показателя (цифры)"
+    # R2 (оба Codex MAJOR): голосовые числа СЛОВАМИ
+    for t in ("сахар шестнадцать и два", "давление сто двадцать на восемьдесят",
+              "вес восемьдесят", "пульс семьдесят два"):
+        assert f(t), f"{t!r} должен быть записью показателя (числа словами)"
+    # R2 (оба Codex MAJOR): ведущее ОТРИЦАНИЕ с числовым хвостом = отказ, НЕ запись
+    for t in ("нет, 16", "нет 16", "отмена, задача 5", "не надо 16", "неа"):
+        assert not f(t), f"{t!r} — отказ (ведущее отрицание), НЕ запись"
+    # не запись: эхо/да-нет/без числа/пусто
     for t in ("сахар", "удали", "покажи покупки", "да", "нет", "отмена", "", "какой у меня вес"):
         assert not f(t), f"{t!r} НЕ должен считаться записью показателя"
+    # R2: FP-слова, содержащие СТЕМ числительного, но НЕ числительные (границы слова!)
+    for t in ("семья", "стоп", "стол", "пятница", "пятно", "одинокий", "сорока", "история"):
+        assert not f(t), f"{t!r} — обычное слово, НЕ число (ложный редирект недопустим)"
 
 
 # ─────────── юнит: _should_redirect_on_pause (confirm-ветка) ───────────
@@ -174,11 +187,12 @@ def test_should_redirect_declarative_record_362():
     """#362: декларативная запись показателя на confirm-паузе → redirect (свежий ход), НЕ ложная отмена.
     #321 сохранён: «нет»/«отмена» → НЕ redirect (честная отмена). #316: голое «удали» → НЕ redirect."""
     f = react_loop._should_redirect_on_pause
-    # запись показателя на confirm → redirect (было False → ложная «Отменила»)
-    for t in (SUGAR, "сахар 16 и 2", "16.2", "давление 120 на 80"):
+    # запись показателя на confirm → redirect (было False → ложная «Отменила»); цифрами И словами
+    for t in (SUGAR, "сахар 16 и 2", "16.2", "давление 120 на 80",
+              "сахар шестнадцать и два", "вес восемьдесят"):
         assert f(t, is_confirm_pause=True), f"confirm: запись {t!r} должна redirect (свежий ход)"
-    # честная отмена #321 — НЕ redirect (уходит в resume→honest «Отменила»)
-    for t in ("нет", "отмена", "не надо"):
+    # честная отмена #321 — НЕ redirect (уходит в resume→honest «Отменила»); в т.ч. с числовым хвостом
+    for t in ("нет", "отмена", "не надо", "нет, 16", "отмена, задача 5"):
         assert not f(t, is_confirm_pause=True), f"confirm: {t!r} — честная отмена, НЕ redirect"
     # аффирматив — НЕ redirect (штатный resume «да»)
     for t in ("да", "ага", "подтверждаю"):
@@ -211,10 +225,13 @@ def test_e2e_declarative_record_not_falsely_cancelled_362(install, monkeypatch, 
     r2 = _turn(freddie, thread="e362", text=SUGAR)
     # (а) НЕ ложная отмена
     assert OTMENILA not in str(r2), f"запись показателя НЕ должна давать «Отменила»: {r2!r}"
+    # свежий ход поднял НОВУЮ candidate-паузу под показатель (universal confirm; НЕ молчаливая запись)
+    assert getattr(r2, "awaiting_confirm", False) is True, f"ожидали свежий confirm под показатель: {r2!r}"
+    assert inv.get("add_task", 0) == 0, "до подтверждения запись НЕ исполняется (нет молчаливой мутации)"
 
     # (б) показатель дошёл до записи: подтверждаем свежую паузу → add_task ИСПОЛНЕН с текстом показателя
     r3 = _turn(freddie, thread="e362", text="да")
-    assert inv.get("add_task", 0) >= 1, "показатель должен быть ЗАПИСАН (add_task исполнен), не потерян"
+    assert inv.get("add_task", 0) == 1, "показатель должен быть ЗАПИСАН РОВНО раз (add_task исполнен), не потерян"
     assert inv.get("add_task_title") == SUGAR, \
         f"записан именно показатель: {inv.get('add_task_title')!r}"
     assert OTMENILA not in str(r3), r3
@@ -238,3 +255,72 @@ def test_genuine_decline_still_honest_321(install, monkeypatch, tmp_path):
     r2 = _turn(freddie, thread="d321", text="нет")
     assert OTMENILA in str(r2), f"честная отмена #321 должна остаться: {r2!r}"
     assert inv.get("add_task", 0) == 0, "отказ → мутация НЕ исполнена"
+
+
+@pytest.mark.parametrize("refusal", ["нет, 16", "отмена, задача 5", "не надо"])
+def test_genuine_decline_with_number_tail_still_honest_362(install, monkeypatch, tmp_path, refusal):
+    """#362 R2 (оба Codex MAJOR): ведущее ОТРИЦАНИЕ с числовым/пунктуационным хвостом («нет, 16») —
+    это отказ, а НЕ запись показателя → честная детерминированная «Отменила», мутация НЕ исполнена.
+    Иначе data_record_signal='любое число' съедал бы подтверждённый отказ (регрессия #321)."""
+    saver = _durable_saver(tmp_path, f"ck362n-{abs(hash(refusal))}.db")
+    monkeypatch.setattr(react_loop, "_persist_enabled", lambda: True)
+    monkeypatch.setattr(react_loop, "_get_checkpointer", lambda: saver)
+    inv = install()
+    freddie = _Chat("freddie", responses=[
+        _ai_call("add_task", "c1", title="проверка"),
+        AIMessage(content="галлюцинация про успех"),
+        AIMessage(content="fall"),
+    ])
+    r1 = _turn(freddie, thread=f"n362{abs(hash(refusal))}", text=UNSIGNALLED)
+    assert getattr(r1, "awaiting_confirm", False) is True, r1
+    r2 = _turn(freddie, thread=f"n362{abs(hash(refusal))}", text=refusal)
+    assert OTMENILA in str(r2), f"отказ {refusal!r} → честная отмена: {r2!r}"
+    assert inv.get("add_task", 0) == 0, "отказ → мутация НЕ исполнена"
+
+
+def test_redirect_note_delivered_to_model_362(install, monkeypatch, tmp_path):
+    """#362 R2 (Codex terra CRITICAL + sol MAJOR): на РЕДИРЕКТЕ модель получает директиву «не сообщать
+    об отмене, обработать новый запрос» — иначе withdrawal-ToolMessage «вызов инструмента отменён» +
+    availability-хвост провоцируют паррот «Отменила» (2-й прод-симптом). Бьём реальную доставку в модель."""
+    saver = _durable_saver(tmp_path, "ck362rn.db")
+    monkeypatch.setattr(react_loop, "_persist_enabled", lambda: True)
+    monkeypatch.setattr(react_loop, "_get_checkpointer", lambda: saver)
+    captured: list = []
+
+    class _Cap:
+        def __init__(self, first):
+            self.first, self.n = first, 0
+
+        async def ainvoke(self, _m):
+            return AIMessage(content="chat")
+
+        def bind_tools(self, tools):
+            outer = self
+
+            def _inv(msgs):
+                outer.n += 1
+                captured.append(list(msgs))
+                if outer.n == 1:
+                    return outer.first
+                return AIMessage(content="Записала показатель.")
+            return RunnableLambda(_inv)
+
+    install()
+    freddie = _Cap(_ai_call("add_task", "c1", title="проверка"))
+    r1 = _turn(freddie, thread="rn362", text=UNSIGNALLED)
+    assert getattr(r1, "awaiting_confirm", False) is True, r1
+    n_before = len(captured)
+    _turn(freddie, thread="rn362", text=SUGAR)  # redirect → свежий ход
+    fresh_inputs = captured[n_before:]
+    flat = _flat_msgs(fresh_inputs)
+    assert "вызов инструмента отменён" in flat, "премиса: withdrawal-ToolMessage в истории свежего хода"
+    assert "НЕ отвечай «отменила»" in flat or "обработай ТЕКУЩИЙ запрос" in flat, \
+        "директива «не докладывай отмену, обработай новый запрос» должна дойти до модели на редиректе"
+
+
+def _flat_msgs(caps):
+    out = []
+    for cap in caps:
+        for m in cap:
+            out.append(str(getattr(m, "content", "")))
+    return "\n".join(out)

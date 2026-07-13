@@ -2118,6 +2118,24 @@ def _stale_pause_note(has_pause: bool, redirect_new: bool, tenant_id: str,
     return _stale_pause_directive(gap_seconds)
 
 
+def _redirect_pause_note(redirect_new: bool, tenant_id: str, persist_enabled: bool) -> str:
+    """#362 R2 (Codex terra CRITICAL + sol MAJOR): при РЕДИРЕКТЕ (новый запрос на ЖИВОЙ паузе) в историю
+    дописывается withdrawal-ToolMessage «вызов инструмента отменён…» (закрытие сироты, #316), а
+    availability-хвост велит на ОТМЕНЕ ответить «отменила, ничего не делаю». Слабая модель видит
+    «отменён» и ПАРРОТИТ отмену вместо обработки нового запроса — это 2-й прод-симптом #362 («запиши…
+    16.2» уже редиректился, но всё равно «Отменила»). Директива (через тот же consume-and-clear канал
+    stale_pause_note): withdrawal — служебное СНЯТИЕ незавершённого действия, НЕ отмена-к-докладу; НЕ
+    говорить «отменила», обработать ТЕКУЩИЙ запрос. Гейт: redirect + durable + канареечный тенант (как
+    #stale) → откат единого пути возвращает прежнее поведение (byte-identical). Пусто → без директивы."""
+    if not (redirect_new and persist_enabled and _unified_execute_for(tenant_id)):
+        return ""
+    return (
+        "Служебная заметка (НЕ пересказывай её дословно): предыдущее незавершённое действие снято "
+        "автоматически, потому что пользователь прислал НОВЫЙ запрос. Это служебное закрытие, а НЕ "
+        "отмена, о которой нужно сообщать. НЕ отвечай «отменила»/«ничего не делаю» про это — просто "
+        "обработай ТЕКУЩИЙ запрос пользователя по существу.")
+
+
 # #320.3 (#321 follow-up): объект «X» — ТОЛЬКО из человеческих confirm-вопросов «Я сейчас … «X»…»
 # (bespoke destructive-обёртки). У generic candidate-confirm в «…» стоит ИМЯ ИНСТРУМЕНТА («Я поняла как
 # «add_task»…») — его юзеру не отдаём → генерик-отказ.
@@ -4381,9 +4399,16 @@ async def handle_turn(
                 # (snap.next есть, а payload не читается → не трактуем как ask_human). Читается ТОЛЬКО на
                 # preflight (unified_execute — read-gate в chat — ставится под _preflight; вне него — dead work).
                 _stale_q, _stale_is_confirm, _ = _pending(snap)
-                _stale_note = _stale_pause_note(
-                    bool(_stale_q), _redirect_new, tenant_id, _stale_is_confirm,
-                    _persist_enabled(), _interrupt_age_seconds(snap.created_at))
+                # #362 R2 (Codex terra CRITICAL + sol MAJOR): РЕДИРЕКТ и STALE взаимоисключающи. На
+                # редиректе даём директиву «не докладывай отмену, обработай новый запрос» (иначе
+                # withdrawal-ToolMessage + availability-хвост провоцируют паррот «Отменила» — 2-й
+                # прод-симптом). На STALE — прежняя грациозно-возвратная директива (гейты внутри).
+                if _redirect_new:
+                    _stale_note = _redirect_pause_note(_redirect_new, tenant_id, _persist_enabled())
+                else:
+                    _stale_note = _stale_pause_note(
+                        bool(_stale_q), _redirect_new, tenant_id, _stale_is_confirm,
+                        _persist_enabled(), _interrupt_age_seconds(snap.created_at))
                 # #320.1: ключ/тип брошенной паузы — терминализация ряда НИЖЕ, ПОСЛЕ минтинга нового
                 # turn_key (R1 субагент MINOR: при пустом inbound_message_id новый ключ = f(thread_id) и
                 # может СОВПАСТЬ со старым → abandoned пометил бы done ряд, который start/finish свежего
