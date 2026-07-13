@@ -91,6 +91,10 @@ def safe_traceback(exc: Any, limit: int = 12) -> str:
             causes.append(_san(type(cur).__name__, 60))
             cur = cur.__cause__ if cur.__cause__ is not None else cur.__context__
         tail = (" caused-by=" + ">".join(causes)) if causes else ""
+        # R4 terra: цепочка причин оборвана потолком/циклом (cur остался) → маркер
+        # симметрично кадрам (иначе causes выглядит полной).
+        if causes and cur is not None:
+            tail += "…+truncated"
         return redact_secrets(f"{chain}{tail}")
     except Exception:  # noqa: BLE001 — лог-путь НИКОГДА не роняет вызывающего
         return "<traceback-unavailable>"
