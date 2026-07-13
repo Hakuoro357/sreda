@@ -110,6 +110,13 @@ class Settings(BaseSettings):
     migration_database_url: str | None = Field(default=None)
     maintenance_database_url: str | None = Field(default=None)
     identity_database_url: str | None = Field(default=None)
+    # #138 Р4 (Деплой B / флип): ожидаемая рантайм-роль БД. Пусто (None) →
+    # ассерт пропускается (инертно до флипа — рантайм под owner `sreda`). На
+    # флипе ops проставляет `SREDA_RUNTIME_ROLE_ASSERT=sreda_app` ВМЕСТЕ с
+    # разводкой DSN → старт fail-closed, если процесс не под sreda_app (кривой
+    # env под owner = RLS молча off). Env-гейт, чтобы код можно было выкатить
+    # ДО флипа, не роняя owner-старт. См. assert_runtime_role (db/session.py).
+    runtime_role_assert: str | None = Field(default=None)
     # SQLAlchemy connection-pool sizing (PostgreSQL only; SQLite uses its own
     # pool). Defaults are intentionally SMALL: the background processes
     # (pollers, job-runner) are low-concurrency (~3-4 pooled conns each; the
