@@ -2054,11 +2054,18 @@ def _should_redirect_on_pause(user_text: str, is_confirm_pause: bool) -> bool:
     подтверждение «удали»/«ок удали» (иначе → A0 «нет», #267 fail-closed удаления); classify-конъюнкт
     оставлен защитно (при is_new он всегда "redirect"). ask_human: просто сигнал нового запроса — у
     открытого вопроса нет да/нет-действия, которое можно «переэхнуть», поэтому эхо-гейта нет."""
-    from sreda.runtime.react_signals import bare_command_echo
+    from sreda.runtime.react_signals import bare_command_echo, data_record_signal
     is_new = _is_new_request_on_pause(user_text)
     if is_confirm_pause:
-        return (is_new and not bare_command_echo(user_text)
-                and classify_confirm_reply(user_text) == "redirect")
+        # #362: у confirm-паузы валидны ТОЛЬКО «да»/«нет»; содержательная НЕ-да/нет реплика = свежий
+        # ход, а не отказ. Кроме командного сигнала (`is_new`) редиректим и ДЕКЛАРАТИВНУЮ запись
+        # показателя с числом («Сахар утром 16 и 2») — иначе она проваливалась в resume→ложная
+        # «Отменила» + ПОТЕРЯ показателя (регрессия честной-отмены #321 на не-отменяющем сообщении).
+        # bare_command_echo («удали») по-прежнему НЕ редирект (A0 fail-closed удаления, #316);
+        # `negate` («нет»/«отмена») → classify≠"redirect" → штатная честная отмена (#321) не тронута.
+        return (not bare_command_echo(user_text)
+                and classify_confirm_reply(user_text) == "redirect"
+                and (is_new or data_record_signal(user_text)))
     return is_new
 
 
