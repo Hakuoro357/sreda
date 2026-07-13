@@ -1646,11 +1646,6 @@ def _prev_turn_families(messages: Any) -> tuple[str, ...]:
     return tuple(sorted(fams))
 
 
-# #356 R1 sol/terra: OR-группа неоднозначного кюса - «список X» детерминированно даёт
-# checklists|shopping как АЛЬТЕРНАТИВЫ одного слова; чтение любой из пары покрывает
-# запрос. Прочие комбинации доменов = НЕЗАВИСИМЫЕ запросы («покажи задачи и покупки»)
-# - покрываются по-доменно (AND).
-_CUE_OR_GROUPS: tuple = (frozenset({"checklists", "shopping"}),)
 # Расширение _NOT_EXECUTED_KINDS для гейта: ошибка инструмента - вызов БЫЛ, но чтение
 # НЕ удалось (R1 sol/terra: ошибка не доказывает свежесть, гасить кюс нельзя).
 _NOT_FRESH_KINDS = _NOT_EXECUTED_KINDS | frozenset({"error"})
@@ -1659,19 +1654,21 @@ _NOT_FRESH_KINDS = _NOT_EXECUTED_KINDS | frozenset({"error"})
 def _stale_readback_domains(messages: Any) -> frozenset:
     """#356: детектор МЕХАНИЧЕСКОГО гейта свежести (прод 2026-07-11 23:28: «Что у
     меня в списке кино» → пересказ из истории, tools=[]). Юзер ЯВНО запросил свои
-    данные (read-кюс, детерминированный read_cue_domains), а ход не исполнил
-    успешного ЧТЕНИЯ cue-домена → вернуть непокрытые домены (route отправит в
-    guard за форс-директивой «сначала прочитай»).
+    данные (read-кюсы), а ход не исполнил успешного ЧТЕНИЯ по каждому требованию →
+    вернуть непокрытые домены (route отправит в guard за форс-директивой).
 
-    R1-калибровка (sol/terra/субагент):
+    R1/R2-калибровка (sol/terra/субагент):
     - write-intent ход (write_command_signal) - НЕ read-back: «добавь молоко в
       покупки» несёт shopping-кюс (кюс щедрый, p-014), но форсить чтение на
-      write-ходах = лишний вызов, а на упавшей записи - ложный recovery в чтение;
+      write-ходах = лишний вызов, а на упавшей записи - ложный recovery в чтение.
+      Составное «добавь X и покажи Y» - осознанный residual (decision-log R1/R2);
     - кюс гасит только УСПЕШНОЕ ЧТЕНИЕ (op_class read_*): result_kind из
-      _NOT_FRESH_KINDS (неисполнение/ошибка) свежесть не доказывает; write-вызов
-      на read-фразе - тоже (показ после записи требует чтения);
-    - покрытие ПО-ДОМЕННО (AND), кроме OR-группы «список» (_CUE_OR_GROUPS):
-      «покажи задачи и покупки» требует оба чтения."""
+      _NOT_FRESH_KINDS ИЛИ ToolMessage.status=="error" (R2 sol: ошибка без
+      artifact) свежесть не доказывают; write-вызов на read-фразе - тоже;
+    - покрытие по ГРУППАМ ТРЕБОВАНИЙ (read_cue_groups, R2 все трое): группа =
+      совпавший паттерн = OR его доменов («список X» - альтернативы одного слова),
+      разные группы = AND («покажи список покупок» - {checklists,shopping} И
+      {shopping}: чтение чек-листов покупки НЕ закрывает)."""
     msgs = list(messages or [])
     last_h = -1
     for i in range(len(msgs) - 1, -1, -1):
@@ -1680,17 +1677,20 @@ def _stale_readback_domains(messages: Any) -> frozenset:
             break
     if last_h < 0:
         return frozenset()
-    from sreda.runtime.react_signals import read_cue_domains, write_command_signal
+    from sreda.runtime.react_signals import read_cue_groups, write_command_signal
     _text = str(getattr(msgs[last_h], "content", ""))
     if write_command_signal(_text):
         return frozenset()  # write-intent ход - юрисдикция записи, не гейта
-    cues = set(read_cue_domains(_text)) - {"web"}
-    if not cues:
+    groups = [set(g) - {"web"} for g in read_cue_groups(_text)]
+    groups = [g for g in groups if g]
+    if not groups:
         return frozenset()
     from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST, TOOL_OP_CLASS
     covered: set = set()
     for m in msgs[last_h + 1:]:
         if isinstance(m, ToolMessage) and getattr(m, "name", None):
+            if getattr(m, "status", None) == "error":
+                continue  # R2 sol: ошибка исполнения без artifact - не свежесть
             _art = getattr(m, "artifact", None)
             if isinstance(_art, dict) and _art.get("result_kind") in _NOT_FRESH_KINDS:
                 continue  # неисполнение/ошибка - свежесть не доказана
@@ -1698,12 +1698,13 @@ def _stale_readback_domains(messages: Any) -> frozenset:
             if TOOL_OP_CLASS.get(name) not in ("read_pure", "read_external"):
                 continue  # только ЧТЕНИЕ доказывает свежесть показа
             fam = TOOL_FAMILY_MANIFEST.get(name)
-            if fam in cues:
+            if fam:
                 covered.add(fam)
-                for _g in _CUE_OR_GROUPS:
-                    if fam in _g:
-                        covered |= _g & cues  # альтернативы одного слова
-    return frozenset(cues - covered)
+    stale: set = set()
+    for g in groups:
+        if not (g & covered):  # группа не покрыта ни одним своим доменом
+            stale |= g
+    return frozenset(stale)
 
 
 def _generic_confirm_wrap(inner: Any) -> Any:
@@ -3232,12 +3233,15 @@ def _build_graph(llm: Any, all_tools: list, *,
             if _tail_directives_enabled() or state.get("unified_execute"):
                 _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
                                           budget=_compact_budget(), summary=history_summary)
-                # #298: время ПЕРЕД директивами #247 — директива остаётся ПОСЛЕДНЕЙ инструкцией
-                # хвоста (приоритет последней инструкции, ревью R1 #298 Codex high MAJOR):
-                # итоговый порядок в последнем user: текст → «Сейчас …» → директива.
-                if time_tail_line:
-                    _msgs = _append_time_tail(_msgs, time_tail_line)
                 _tail = [d for d in (nudge, _avail, _sec, _recur, _stale) if d]  # #333: _recur после _sec
+                # #298: время ПЕРЕД директивами #247 — директива остаётся ПОСЛЕДНЕЙ инструкцией
+                # хвоста. #356 R2 (субагент): якорь ОДИН на промпт — когда директива уйдёт
+                # ОТДЕЛЬНЫМ trailing-user (хвост истории = assistant/tool: guard/форс-проход),
+                # время кладёт ТА ветка; сюда — только когда его понесёт последний user истории.
+                _trailing356 = bool(_tail) and not (
+                    _msgs and isinstance(_msgs[-1], HumanMessage))
+                if time_tail_line and not _trailing356:
+                    _msgs = _append_time_tail(_msgs, time_tail_line)
                 if _tail:
                     _directive = "\n\n".join(_tail)
                     # #247 (R1 MAJOR Codex high+medium): директива РОЛЬЮ user — OpenAI-совместимые провайдеры
@@ -3749,15 +3753,16 @@ def _build_graph(llm: Any, all_tools: list, *,
         # же довод, что у refusal-guard; R1 sol M6 отклонён, decision-log). После форса
         # ход выпускается в любом случае (кюс щедрый - насмерть не блокируем, p-014);
         # повторный игнор → WARN-лог (наблюдаемость канарейки).
-        if (eff == "task" and passes < _MAX_TURN_PASSES
-                and _freshness_gate_enabled()
+        if (eff == "task" and _freshness_gate_enabled()
                 and not state.get("wrote_unkeyed")):
             _fresh356 = _stale_readback_domains(state["messages"])
             if _fresh356:
-                if not state.get("freshness_forced"):
+                if not state.get("freshness_forced") and passes < _MAX_TURN_PASSES:
                     return "guard"
-                logger.warning("react_freshness: модель проигнорировала форс чтения "
-                               "(домены: %s) — выпуск с пересказом", sorted(_fresh356))
+                # R2 terra: исчерпанный бюджет проходов тоже НЕ молчит (наблюдаемость)
+                logger.warning("react_freshness: пересказ выпущен без чтения "
+                               "(домены: %s; forced=%s, passes=%s)",
+                               sorted(_fresh356), bool(state.get("freshness_forced")), passes)
         return END
 
     def guard(state: ReactState):
@@ -3771,7 +3776,13 @@ def _build_graph(llm: Any, all_tools: list, *,
         # Добираем ленивые семьи cue-доменов (R1 sol M8: на не-unified путях семья могла
         # быть не загружена - nudge без инструмента жёг бы форс впустую; чтение - безопасно)
         # + транзиентная директива + one-shot флаг (анти-петля; route повторно не вернёт).
-        if _freshness_gate_enabled() and not state.get("freshness_forced"):
+        # R2 все трое: ЗЕРКАЛО route-условий - refusal-путь на preflight OFF (eff=None)
+        # заходит в guard и без них ломал бы byte-identical rollback (freshness-нудж
+        # вместо legacy-recovery); wrote_unkeyed - симметрия анти-дубля.
+        if (_effective_intent(state, preflight_enabled) == "task"
+                and _freshness_gate_enabled()
+                and not state.get("wrote_unkeyed")
+                and not state.get("freshness_forced")):
             _fresh = _stale_readback_domains(state["messages"])
             if _fresh:
                 _fd = ", ".join(sorted(_fresh))

@@ -84,7 +84,9 @@ _READ_CUES: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
                 # M1: обзорные формы «какие/покажи/мои/наши/все (…) списки» ({0,2} слова между)
                 r"|(?:какие|покажи|мои|наши|все)(?:\s+\w+){0,2}\s+списк)",
                 re.IGNORECASE), frozenset({"checklists", "shopping"})),
-    (re.compile(r"\bпокупк", re.IGNORECASE), frozenset({"shopping"})),
+    # #356 R2: + род.падеж «покупОК» («список покупок») - иначе явное «покупки» не
+    # образует свою группу-требование и чтение чек-листов ложно закрывало бы запрос.
+    (re.compile(r"\bпокуп(?:к|ок)", re.IGNORECASE), frozenset({"shopping"})),
     # память: own-data lookup — «помнишь» (2л, не «помню»); явные own-data обороты. #319: «записи»
     # (МНОЖ. число — «запись к врачу» ед.ч. НЕ матчится, это appointment) в запросной рамке + «что я
     # записывал» → recall по теме показывает, а не спрашивает «где сохраняешь?».
@@ -277,6 +279,17 @@ def read_cue_domains(text: str) -> frozenset[str]:
         if pat.search(t):
             out |= doms
     return frozenset(out)
+
+
+def read_cue_groups(text: str) -> tuple[frozenset, ...]:
+    """#356 R2 (sol/terra/субагент): группы ТРЕБОВАНИЙ чтения по СОВПАВШИМ паттернам -
+    каждая группа = OR (любой её домен покрывает требование), разные группы = AND.
+    Различает неоднозначное ОДНО слово («список X» → одна группа {checklists,shopping})
+    от двух явных запросов («покажи чек-листы и покупки» → две группы {checklists} и
+    {shopping}; «покажи список покупок» → группы {checklists,shopping} И {shopping} -
+    покупки остаются самостоятельным требованием). Потребитель - гейт свежести."""
+    t = text or ""
+    return tuple(doms for pat, doms in _READ_CUES if pat.search(t))
 
 
 # ── #316: МАРКЕР явного read-ЗАПРОСА (императив чтения / WH-вопрос про own-data). Отличает «покажи

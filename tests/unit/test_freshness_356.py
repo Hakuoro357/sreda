@@ -163,11 +163,35 @@ def test_stale_independent_domains_and_semantics_356():
 
 
 def test_stale_or_group_single_read_covers_356():
-    """OR-группа: «что в списке кино» даёт checklists|shopping как альтернативы
-    ОДНОГО слова - чтение чек-листов покрывает запрос целиком."""
+    """Группа-требование: «что в списке кино» - альтернативы ОДНОГО слова
+    («список» → checklists|shopping) - чтение чек-листов покрывает запрос."""
     msgs = _turn("что в списке кино",
                  _ai_tc("list_checklist_items"), _tm("list_checklist_items"))
     assert _stale_readback_domains(msgs) == frozenset()
+
+
+def test_stale_explicit_shopping_not_covered_by_checklist_read_356():
+    """R2 terra/sol/субагент: «покажи список покупок» - «покупки» названы ЯВНО
+    (своя группа-требование) - чтение чек-листов покупки НЕ закрывает."""
+    msgs = _turn("покажи список покупок",
+                 _ai_tc("list_checklist_items"), _tm("list_checklist_items"))
+    assert "shopping" in _stale_readback_domains(msgs)
+
+
+def test_stale_two_explicit_groups_and_356():
+    """R2 субагент MINOR-3: «покажи чек-листы и покупки» - два явных требования,
+    чтение одного не схлопывает второе (группы по паттернам, не по объединению)."""
+    msgs = _turn("покажи чек-листы и покупки",
+                 _ai_tc("list_checklist_items"), _tm("list_checklist_items"))
+    assert "shopping" in _stale_readback_domains(msgs)
+
+
+def test_stale_status_error_not_fresh_356():
+    """R2 sol M4: ToolMessage(status="error") БЕЗ artifact - не свежесть."""
+    err = ToolMessage(content="boom", name="list_checklist_items",
+                      tool_call_id="t1", status="error")
+    msgs = _turn("Что у меня в списке кино", _ai_tc("list_checklist_items"), err)
+    assert "checklists" in _stale_readback_domains(msgs)
 
 
 def test_stale_no_cue_no_fire_356():
@@ -257,6 +281,8 @@ class _Chat:
         return self
 
     def invoke(self, messages, **kwargs):
+        self.seen_batches = getattr(self, "seen_batches", [])
+        self.seen_batches.append(messages)
         if self._responses:
             return self._responses.pop(0)
         return AIMessage(content="ок")
@@ -333,14 +359,33 @@ def test_e2e_freshness_gate_forces_read_356(install):
     inv, freddie = install(responses=[
         AIMessage(content="Вот твой список кино: Скорпион, Машина войны."),  # пересказ
         _ai_call("list_checklist_items", "c1", name="кино"),                 # после форса
-        AIMessage(content="Вот свежий список: Скорпион, Машина войны."),
+        AIMessage(content="Список обновлён: Мастодонт."),                    # пост-чтение
     ])
     r = _run(freddie, "f1", "Что у меня в списке кино")
     assert inv.get("list_checklist_items", 0) == 1, \
         "гейт свежести заставил прочитать (промпт модель проигнорила)"
-    assert "свежий" in str(r).lower()
-    # R1 sol M12: выпущен ВТОРОЙ ответ (пост-чтение), пересказ не утёк в финал
-    assert "скорпион" not in str(r).lower() or "свежий" in str(r).lower()
+    # R2 sol/terra: финал = ответ ПОСЛЕ чтения (уникальный маркер), пересказ не утёк
+    assert "мастодонт" in str(r).lower()
+    assert "скорпион" not in str(r).lower()
+
+
+def test_e2e_preflight_off_rollback_untouched_356(install, monkeypatch):
+    """R2 все трое (byte-identical rollback): preflight OFF (eff=None) - гейт
+    свежести молчит И в route, И в guard: refusal-путь получает ЛЕГАСИ-recovery
+    нудж, не freshness-нудж (иначе откат преflight не байт-идентичен)."""
+    inv, freddie = install(responses=[
+        AIMessage(content="Я не умею показывать списки."),   # refusal → guard (легаси)
+        AIMessage(content="Вот, нашла."),
+    ])
+    monkeypatch.setenv("SREDA_REACT_PREFLIGHT_ENABLED", "0")
+    monkeypatch.setenv("SREDA_REACT_UNIFIED_PATH_ENABLED", "0")
+    from sreda.config import settings as settings_mod
+    settings_mod.get_settings.cache_clear()
+    _run(freddie, "f-off", "Что у меня в списке кино")
+    assert len(freddie.seen_batches) >= 2, "refusal-recovery дал второй проход"
+    _all2 = "\n".join(str(getattr(m, "content", "")) for m in freddie.seen_batches[1])
+    assert "запросил СВОИ данные" not in _all2, \
+        "freshness-нудж НЕ должен подменять легаси-recovery на rollback-конфиге"
 
 
 def test_e2e_freshness_gate_kill_switch_356(install, monkeypatch):
