@@ -784,14 +784,21 @@ def test_reminder_worker_does_not_clobber_concurrent_snooze(pg_db, monkeypatch):
         enqueue_with_concurrent_snooze,
     )
 
+    worker_exc: BaseException | None = None
     try:
         asyncio.run(HousewifeReminderWorker().process_pending(now=now))
         # На фикс-коде snooze добивается только после commit тика (release лока).
         assert snooze_done.wait(timeout=20), "snooze-поток не завершился за 20с (deadlock?)"
+    except BaseException as exc:  # noqa: BLE001
+        worker_exc = exc
+        raise
     finally:
+        # Дожидаемся callback-поток ВСЕГДА, в т.ч. при падении worker (Codex sol R3):
+        # проверку liveness делаем здесь же, но не маскируем исходное исключение.
         for t in threads:
             t.join(timeout=20)
-    assert threads and not threads[0].is_alive(), "callback-поток не завершился"
+        if worker_exc is None and (not threads or threads[0].is_alive()):
+            raise AssertionError("callback-поток не завершился (возможен deadlock)")
     assert not snooze_error, f"snooze-поток упал: {snooze_error!r}"
 
     with S() as s:
