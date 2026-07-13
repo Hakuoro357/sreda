@@ -888,10 +888,12 @@ async def _handle_reminder_callback(
     original message to remove the keyboard (so the user can't tap
     twice) and answers the callback with a short toast.
     """
-    from sreda.db.models.housewife import FamilyReminder
     from sreda.services.housewife_reminders import (
+        REMINDER_CALLBACK_BUSY_TEXT,
         SNOOZE_DEFAULT_MINUTES,
         HousewifeReminderService,
+        ReminderLockTimeout,
+        read_reminder_for_callback,
     )
 
     action, _, reminder_id = data.partition(":")
@@ -904,29 +906,28 @@ async def _handle_reminder_callback(
 
     # #344 F5 (Opus-адверсар + Codex sol, cross-process ack/snooze гонка): этот
     # обработчик живёт в UVICORN-процессе, а reminder-fire-цикл — в JOB_RUNNER.
-    # Читаем строку под ``SELECT ... FOR UPDATE`` (PG-only, как воркер) и держим
-    # лок до ``session.commit()`` ниже. Это НЕ просто «прочитать посвежее»:
-    # ``acknowledge``/``snooze`` — read-modify-write, а SQLAlchemy кладёт в UPDATE
-    # только реально изменившиеся поля. Без лока snooze мог прочитать ``pending``
-    # ДО того как воркер закоммитил ``fired``; тогда его UPDATE НЕ содержал бы
-    # ``status`` (pending→pending не dirty) и лёг бы поверх воркерского ``fired``,
-    # оставив рассинхрон ``status='fired'`` + ``next_trigger_at=+10мин`` (snooze
-    # тихо потерян). Под FOR UPDATE обработчик дожидается воркера и перечитывает
-    # СВЕЖЕЕ состояние (``fired``) → ``fired→pending`` становится настоящим
-    # изменением и попадает в UPDATE. Симметрично воркер ждёт наш commit и его
-    # fence перечитывает свежие status/next_trigger. Лок держится только на время
-    # in-memory-мутации (сеть — answer/edit — уже ПОСЛЕ commit).
-    _rem_bind = session.bind
-    _rem_for_update = (
-        {"key_share": False}
-        if _rem_bind is not None and _rem_bind.dialect.name == "postgresql"
-        else None
-    )
-    reminder = (
-        session.get(FamilyReminder, reminder_id, with_for_update=_rem_for_update)
-        if reminder_id
-        else None
-    )
+    # ``read_reminder_for_callback`` читает строку под ``FOR UPDATE`` (PG-only) с
+    # ОГРАНИЧЕННЫМ ``lock_timeout``: держим лок до ``session.commit()`` ниже, но не
+    # стопорим весь event-loop на неограниченное ожидание держателя-воркера. Лок
+    # нужен не «прочитать посвежее»: ``acknowledge``/``snooze`` — read-modify-write,
+    # SQLAlchemy кладёт в UPDATE лишь изменившиеся поля; без лока snooze прочитал бы
+    # ``pending`` ДО воркерского ``fired`` → partial-UPDATE (без ``status``) поверх
+    # ``fired`` → рассинхрон, snooze потерян. Под FOR UPDATE обработчик дожидается
+    # воркера и перечитывает свежий ``fired`` → ``fired→pending`` реально попадает в
+    # UPDATE. Сеть (answer/edit) — уже ПОСЛЕ commit.
+    try:
+        reminder = read_reminder_for_callback(session, reminder_id)
+    except ReminderLockTimeout:
+        # Строку сейчас держит reminder-воркер (fire-цикл). Не блокируем loop
+        # ожиданием — просим повторить; кнопки НЕ трогаем (юзер перетапнет).
+        if callback_id:
+            try:
+                await telegram_client.answer_callback_query(
+                    callback_id, text=REMINDER_CALLBACK_BUSY_TEXT
+                )
+            except TelegramDeliveryError:
+                pass
+        return
     if reminder is None:
         if callback_id:
             try:

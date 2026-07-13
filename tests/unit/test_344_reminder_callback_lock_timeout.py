@@ -1,0 +1,229 @@
+"""#344 F5 — bounded callback row-lock (Opus-адверсар MAJOR#2).
+
+Оба ack/snooze-обработчика (TG ``telegram_bot._handle_reminder_callback`` и MAX
+``max_inbound._handle_max_reminder_callback``) живут в UVICORN event-loop и берут
+строку ``FamilyReminder`` под ``SELECT ... FOR UPDATE`` (см. cross-process гонку в
+``test_344_delivery_contour_pg``). Синхронный ``FOR UPDATE`` — блокирующий
+lock-wait: пока reminder-воркер (job_runner) держит лок строки, весь event-loop
+(все тенанты процесса) стоит. Без границы медленный тик воркера подвешивает loop.
+
+Фикс (``read_reminder_for_callback``): PG-only ``SET LOCAL lock_timeout`` перед
+``FOR UPDATE`` → fail-fast (``ReminderLockTimeout``, sqlstate 55P03) вместо
+неограниченного ожидания; обработчик показывает дружелюбный «попробуйте ещё раз»
+тост (БЕЗ технических деталей) и не трогает напоминание. SQLite (unit) — без
+лока/таймаута, plain read с ``populate_existing`` (свежесть явная).
+
+Эти тесты детерминированны (fakes/mocks), PG не нужен; настоящая сериализация
+покрыта PG-свитом.
+"""
+
+from __future__ import annotations
+
+import re
+from types import SimpleNamespace
+
+import pytest
+from sqlalchemy.exc import OperationalError
+
+from sreda.services.housewife_reminders import (
+    REMINDER_CALLBACK_BUSY_TEXT,
+    REMINDER_CALLBACK_LOCK_TIMEOUT_MS,
+    ReminderLockTimeout,
+    read_reminder_for_callback,
+)
+
+
+# --------------------------------------------------------------------------
+# Fakes
+# --------------------------------------------------------------------------
+
+
+class _FakeOrig(Exception):
+    """DBAPI-error stand-in carrying an sqlstate (psycopg3 ``.sqlstate``)."""
+
+    def __init__(self, sqlstate: str) -> None:
+        super().__init__(sqlstate)
+        self.sqlstate = sqlstate
+
+
+def _op_error(sqlstate: str) -> OperationalError:
+    return OperationalError("SELECT ... FOR UPDATE", {}, _FakeOrig(sqlstate))
+
+
+class _FakeSession:
+    def __init__(self, *, dialect: str, get_result=None, get_exc=None) -> None:
+        self.bind = SimpleNamespace(dialect=SimpleNamespace(name=dialect))
+        self._get_result = get_result
+        self._get_exc = get_exc
+        self.executed: list[str] = []
+        self.rolled_back = False
+        self.get_kwargs: dict | None = None
+        self.get_called = False
+
+    def execute(self, statement, params=None):  # noqa: ANN001
+        self.executed.append(str(statement))
+        return None
+
+    def get(self, entity, ident, **kwargs):  # noqa: ANN001
+        self.get_called = True
+        self.get_kwargs = kwargs
+        if self._get_exc is not None:
+            raise self._get_exc
+        return self._get_result
+
+    def rollback(self) -> None:
+        self.rolled_back = True
+
+
+# --------------------------------------------------------------------------
+# read_reminder_for_callback — lock_timeout mechanism
+# --------------------------------------------------------------------------
+
+
+def test_lock_timeout_raises_reminder_lock_timeout_and_rolls_back():
+    """PG + ``FOR UPDATE`` таймаут (sqlstate 55P03) → ``ReminderLockTimeout``,
+    сессия откачена (не оставляем висящую транзакцию с таймаут-настройкой)."""
+    session = _FakeSession(dialect="postgresql", get_exc=_op_error("55P03"))
+    with pytest.raises(ReminderLockTimeout):
+        read_reminder_for_callback(session, "rem-1")
+    assert session.rolled_back is True
+
+
+def test_non_lock_operational_error_propagates_unchanged():
+    """Другой ``OperationalError`` (напр. serialization 40001) НЕ маскируется под
+    lock-timeout — пробрасывается как есть, обработчик его не глотает."""
+    session = _FakeSession(dialect="postgresql", get_exc=_op_error("40001"))
+    with pytest.raises(OperationalError):
+        read_reminder_for_callback(session, "rem-1")
+    assert session.rolled_back is False
+
+
+def test_pg_sets_lock_timeout_before_for_update():
+    """PG happy-path: перед ``FOR UPDATE`` выставлен ``SET LOCAL lock_timeout``
+    на сконфигурированное значение; читаем с ``with_for_update`` + свежесть."""
+    sentinel = object()
+    session = _FakeSession(dialect="postgresql", get_result=sentinel)
+    out = read_reminder_for_callback(session, "rem-1")
+    assert out is sentinel
+    assert any("lock_timeout" in s.lower() for s in session.executed)
+    assert str(REMINDER_CALLBACK_LOCK_TIMEOUT_MS) in " ".join(session.executed)
+    assert session.get_kwargs is not None
+    assert session.get_kwargs.get("with_for_update") == {"key_share": False}
+    assert session.get_kwargs.get("populate_existing") is True
+
+
+def test_sqlite_plain_read_no_lock_no_timeout():
+    """SQLite (unit): ни ``SET LOCAL``, ни ``FOR UPDATE``; свежий read
+    (``populate_existing``), чтобы freshness-контракт был явным."""
+    sentinel = object()
+    session = _FakeSession(dialect="sqlite", get_result=sentinel)
+    out = read_reminder_for_callback(session, "rem-1")
+    assert out is sentinel
+    assert session.executed == []  # никаких SET LOCAL
+    assert session.get_kwargs is not None
+    assert "with_for_update" not in session.get_kwargs
+    assert session.get_kwargs.get("populate_existing") is True
+
+
+def test_empty_reminder_id_returns_none_without_query():
+    session = _FakeSession(dialect="postgresql")
+    assert read_reminder_for_callback(session, "") is None
+    assert session.get_called is False
+    assert session.executed == []
+
+
+def test_busy_text_has_no_technical_details():
+    """Правило «никаких технических данных юзеру»: retry-текст без латиницы,
+    кодов ошибок, слов lock/timeout/error."""
+    txt = REMINDER_CALLBACK_BUSY_TEXT
+    assert not re.search(r"[A-Za-z]", txt), txt
+    for bad in ("55P03", "lock", "timeout", "error"):
+        assert bad.lower() not in txt.lower()
+
+
+# --------------------------------------------------------------------------
+# Callback handlers — fail-fast retry toast on ReminderLockTimeout
+# --------------------------------------------------------------------------
+
+
+class _FakeTelegramClient:
+    def __init__(self) -> None:
+        self.answered: list[str] = []
+        self.edited: list[str] = []
+
+    async def answer_callback_query(self, callback_id, text=None, **kw):  # noqa: ANN001
+        self.answered.append(str(text))
+        return {"ok": True}
+
+    async def edit_message_text(self, **kw):  # noqa: ANN001
+        self.edited.append("edited")
+        return {"ok": True}
+
+
+class _FakeMaxClient:
+    def __init__(self) -> None:
+        self.notifications: list[str] = []
+        self.replacements: list[str] = []
+
+    async def answer_callback(self, callback_id, *, notification=None, message=None):  # noqa: ANN001
+        if notification is not None:
+            self.notifications.append(str(notification))
+        if message is not None:
+            self.replacements.append(str(message))
+        return {"ok": True}
+
+
+class _ExplodingSession:
+    """commit() must NOT be reached on lock-timeout."""
+
+    def commit(self):
+        raise AssertionError("session.commit() must not run on lock-timeout")
+
+    def rollback(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_tg_callback_lock_timeout_shows_retry_toast(monkeypatch):
+    import sreda.services.housewife_reminders as _hr
+    from sreda.services.telegram_bot import _handle_reminder_callback
+
+    def _raise(*a, **k):
+        raise ReminderLockTimeout
+
+    monkeypatch.setattr(_hr, "read_reminder_for_callback", _raise)
+    fake = _FakeTelegramClient()
+    await _handle_reminder_callback(
+        session=_ExplodingSession(),
+        telegram_client=fake,
+        callback_query={
+            "id": "cb1",
+            "message": {"chat": {"id": "1"}, "message_id": 5, "text": "🔔 X"},
+        },
+        data="rem_snooze:rid-1",
+    )
+    assert fake.answered == [REMINDER_CALLBACK_BUSY_TEXT]
+    assert fake.edited == []  # кнопки не трогаем — юзер перетапнет
+
+
+@pytest.mark.asyncio
+async def test_max_callback_lock_timeout_shows_retry_notification(monkeypatch):
+    import sreda.services.housewife_reminders as _hr
+    from sreda.services.max_inbound import _handle_max_reminder_callback
+
+    def _raise(*a, **k):
+        raise ReminderLockTimeout
+
+    monkeypatch.setattr(_hr, "read_reminder_for_callback", _raise)
+    fake = _FakeMaxClient()
+    await _handle_max_reminder_callback(
+        session=_ExplodingSession(),
+        max_client=fake,
+        callback_id="cb1",
+        data="rem_snooze:rid-1",
+        payload={"message": {"body": {"text": "🔔 X"}}},
+        onboarding=SimpleNamespace(tenant_id="t1"),
+    )
+    assert fake.notifications == [REMINDER_CALLBACK_BUSY_TEXT]
+    # message-replacement НЕ используем (кнопки должны остаться для повтора)
+    assert fake.replacements == []

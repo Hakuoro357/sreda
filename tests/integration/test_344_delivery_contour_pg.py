@@ -695,6 +695,7 @@ def test_reminder_worker_does_not_clobber_concurrent_snooze(pg_db, monkeypatch):
     from sqlalchemy import text as _sql_text
 
     import sreda.workers.housewife_reminder_worker as _hrw
+    from sreda.db.models.core import OutboxMessage
     from sreda.db.models.housewife import FamilyReminder
     from sreda.db.session import get_session_factory
     from sreda.services.housewife_reminders import HousewifeReminderService
@@ -819,5 +820,159 @@ def test_reminder_worker_does_not_clobber_concurrent_snooze(pg_db, monkeypatch):
             f"получили {_ntt!r}"
         )
         # Ровно одна outbox-строка — воркер фаернул один раз, дубля/повторного пинга нет.
+        n_out = s.query(OutboxMessage).filter(OutboxMessage.tenant_id == TENANT).count()
+        assert n_out == 1, f"ожидалась ровно 1 outbox-строка (фаер воркера), получили {n_out}"
+
+
+class _FakeMaxForCallback:
+    """Мини-заглушка MaxClient для реального ``_handle_max_reminder_callback``:
+    ``answer_callback`` идёт ПОСЛЕ ``session.commit()`` (лок уже отпущен)."""
+
+    def __init__(self) -> None:
+        self.replacements: list[str] = []
+        self.notifications: list[str] = []
+
+    async def answer_callback(self, callback_id, *, message=None, notification=None):
+        if message is not None:
+            self.replacements.append(str(message))
+        if notification is not None:
+            self.notifications.append(str(notification))
+        return {"ok": True}
+
+
+def test_max_reminder_worker_does_not_clobber_concurrent_snooze(pg_db, monkeypatch):
+    """#344 F5 (Opus-адверсар MAJOR#1) — ЗЕРКАЛО TG-теста для MAX-канала.
+
+    Наш реальный юзер на MAX жмёт «Готово ✅»/«Отложить ⏰»: MAX-доставка рендерит
+    те же ``rem_done``/``rem_snooze`` кнопки (``_send_now_max`` →
+    ``render_max_inline_keyboard_attachment``), а обработчик
+    ``max_inbound._handle_max_reminder_callback`` живёт в UVICORN — второй
+    конкурентный писатель в ``family_reminders`` (fire-цикл — в JOB_RUNNER).
+    Baseline читал строку plain ``session.get`` без ``FOR UPDATE`` → та же
+    snooze-гонка, что на TG: partial-UPDATE (только ``next_trigger_at``) ложится
+    поверх воркерского ``fired`` → рассинхрон ``status='fired'`` + future
+    ``next_trigger`` → ``due_now`` фильтрует → snooze ТИХО ПОТЕРЯН.
+
+    Фикс (``read_reminder_for_callback`` — общий с TG): ``FOR UPDATE`` re-read под
+    локом до commit → сериализация с воркером, snooze выигрывает корректно.
+
+    Детерминизм — как в TG-тесте: адресный ``pg_blocking_pids(callback_pid)`` без
+    sleep. RED на baseline (без callback-side лока): финально ``status='fired'``."""
+    from datetime import UTC
+
+    from sqlalchemy import text as _sql_text
+
+    import sreda.workers.housewife_reminder_worker as _hrw
+    from sreda.db.models.core import OutboxMessage
+    from sreda.db.models.housewife import FamilyReminder
+    from sreda.db.session import get_session_factory
+    from sreda.services.housewife_reminders import HousewifeReminderService
+    from sreda.services.max_inbound import _handle_max_reminder_callback
+    from sreda.services.onboarding import MaxOnboardingResult
+    from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
+
+    now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    S = get_session_factory()
+    with S() as s:
+        rem = HousewifeReminderService(s).schedule(
+            tenant_id=TENANT, user_id=USER,
+            title="Полить цветы", trigger_at=now - timedelta(minutes=1),
+        )
+        s.commit()
+        rid = rem.id
+
+    onboarding = MaxOnboardingResult(
+        tenant_id=TENANT, user_id=USER, workspace_id=WS, assistant_id=None,
+        max_account_id="40921122", max_chat_id="320955459", is_new_user=False,
+    )
+    snooze_done = threading.Event()
+    callback_ready = threading.Event()
+    snooze_error: list[BaseException] = []
+    callback_pid: list[int] = []
+    threads: list[threading.Thread] = []
+    fake_max = _FakeMaxForCallback()
+    real_enqueue = _hrw.HousewifeReminderWorker._enqueue_outbox_for
+
+    def _callback_blocked_by(worker_pid: int) -> bool:
+        if not callback_pid:
+            return False
+        with S() as probe:
+            blockers = probe.execute(
+                _sql_text("SELECT pg_blocking_pids(:p)"), {"p": callback_pid[0]}
+            ).scalar()
+        return bool(blockers) and worker_pid in blockers
+
+    def enqueue_with_concurrent_snooze(self, session, reminder):
+        worker_pid = session.execute(_sql_text("SELECT pg_backend_pid()")).scalar()
+
+        def run_callback():
+            try:
+                with S() as cs:
+                    callback_pid.append(
+                        cs.execute(_sql_text("SELECT pg_backend_pid()")).scalar()
+                    )
+                    callback_ready.set()
+                    asyncio.run(
+                        _handle_max_reminder_callback(
+                            session=cs,
+                            max_client=fake_max,
+                            callback_id="cb_max_344",
+                            data=f"rem_snooze:{rid}",
+                            payload={"message": {"body": {"text": "🔔 Полить цветы"}}},
+                            onboarding=onboarding,
+                        )
+                    )
+                snooze_done.set()
+            except BaseException as exc:  # noqa: BLE001
+                snooze_error.append(exc)
+                snooze_done.set()
+
+        t = threading.Thread(target=run_callback, daemon=True)
+        threads.append(t)
+        t.start()
+        callback_ready.wait(timeout=10)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if snooze_done.is_set() or _callback_blocked_by(worker_pid):
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError(
+                "MAX snooze за 20с ни закоммитился, ни заблокировался worker-сессией"
+            )
+        return real_enqueue(self, session, reminder)
+
+    monkeypatch.setattr(
+        _hrw.HousewifeReminderWorker, "_enqueue_outbox_for",
+        enqueue_with_concurrent_snooze,
+    )
+
+    worker_exc: BaseException | None = None
+    try:
+        asyncio.run(HousewifeReminderWorker().process_pending(now=now))
+        assert snooze_done.wait(timeout=20), "MAX snooze-поток не завершился за 20с (deadlock?)"
+    except BaseException as exc:  # noqa: BLE001
+        worker_exc = exc
+        raise
+    finally:
+        for t in threads:
+            t.join(timeout=20)
+        if worker_exc is None and (not threads or threads[0].is_alive()):
+            raise AssertionError("MAX callback-поток не завершился (возможен deadlock)")
+    assert not snooze_error, f"MAX snooze-поток упал: {snooze_error!r}"
+
+    with S() as s:
+        row = s.get(FamilyReminder, rid)
+        assert row.status == "pending", (
+            "MAX snooze юзера ПОТЕРЯН: остался status='fired' — нужен FOR UPDATE "
+            "re-read в _handle_max_reminder_callback (зеркало TG-фикса)"
+        )
+        assert row.next_trigger_at is not None, "MAX snooze должен был отложить next_trigger_at"
+        _ntt = row.next_trigger_at
+        if _ntt.tzinfo is None:
+            _ntt = _ntt.replace(tzinfo=timezone.utc)
+        assert _ntt > datetime.now(timezone.utc) + timedelta(minutes=9), (
+            f"next_trigger_at должен быть отложен ~на 10мин (snooze), получили {_ntt!r}"
+        )
         n_out = s.query(OutboxMessage).filter(OutboxMessage.tenant_id == TENANT).count()
         assert n_out == 1, f"ожидалась ровно 1 outbox-строка (фаер воркера), получили {n_out}"

@@ -1794,10 +1794,12 @@ async def _handle_max_reminder_callback(
     Lookup FamilyReminder → acknowledge/snooze → ack с replacement
     message. Cross-tenant defensive check сохранён.
     """
-    from sreda.db.models.housewife import FamilyReminder
     from sreda.services.housewife_reminders import (
+        REMINDER_CALLBACK_BUSY_TEXT,
         SNOOZE_DEFAULT_MINUTES,
         HousewifeReminderService,
+        ReminderLockTimeout,
+        read_reminder_for_callback,
     )
 
     action, _, reminder_id = data.partition(":")
@@ -1849,9 +1851,26 @@ async def _handle_max_reminder_callback(
                     exc_info=True,
                 )
 
-    reminder = (
-        session.get(FamilyReminder, reminder_id) if reminder_id else None
-    )
+    # #344 F5 (Opus-адверсар MAJOR#1) — ЗЕРКАЛО TG-фикса. MAX-доставка рендерит те
+    # же ``rem_done``/``rem_snooze`` кнопки (``_send_now_max`` →
+    # ``render_max_inline_keyboard_attachment``), а этот обработчик живёт в UVICORN —
+    # второй конкурентный писатель в ``family_reminders`` (fire-цикл — в JOB_RUNNER).
+    # Читаем строку под ``FOR UPDATE`` с ограниченным ``lock_timeout`` (общий helper
+    # с TG): без лока snooze тихо терялся бы (partial-UPDATE поверх воркерского
+    # ``fired``), а неограниченный ``FOR UPDATE`` стопорил бы event-loop.
+    try:
+        reminder = read_reminder_for_callback(session, reminder_id)
+    except ReminderLockTimeout:
+        # Строку держит reminder-воркер — не стопорим event-loop ожиданием.
+        # notification (НЕ message-replacement): кнопки остаются → юзер перетапнет.
+        if callback_id:
+            try:
+                await max_client.answer_callback(
+                    str(callback_id), notification=REMINDER_CALLBACK_BUSY_TEXT
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("max reminder cb busy-ack failed", exc_info=True)
+        return
     if reminder is None:
         await _ack_with_replacement("Это напоминание уже выполнено.")
         return

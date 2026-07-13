@@ -102,8 +102,13 @@ class HousewifeReminderWorker:
                         if _bind is not None and _bind.dialect.name == "postgresql"
                         else None
                     )
+                    # populate_existing: форсим свежий SELECT (с FOR UPDATE) даже
+                    # если строка уже в identity-map — иначе get вернул бы кэш БЕЗ
+                    # лока (Opus MINOR: latent identity-map fragility). Здесь сессия
+                    # свежая per-row, но требование свежести делаем явным.
                     reminder = s.get(
-                        FamilyReminder, reminder_id, with_for_update=_for_update
+                        FamilyReminder, reminder_id,
+                        with_for_update=_for_update, populate_existing=True,
                     )
                     if reminder is None:
                         continue  # исчез между сканом и действием
@@ -206,11 +211,14 @@ class HousewifeReminderWorker:
             )
             return
 
-        # Escalation UI: inline keyboard. NB: callback_data format is
-        # TG-style; для MAX inline-button format probe required (планируется
-        # в follow-up). Сейчас MAX outbox row будет отправлена как text-only
-        # т.к. ``OutboxDeliveryWorker._send_now_max`` не понимает TG
-        # inline_keyboard schema.
+        # Escalation UI: inline keyboard (кнопки «Сделал ✅»/«Отложить ⏰»).
+        # ``callback_data`` — TG-style; MAX-доставка КОНВЕРТИРУЕТ их в свои inline-
+        # attachments через ``render_max_inline_keyboard_attachment``
+        # (``OutboxDeliveryWorker._send_now_max`` → ``integrations/max/client.py``),
+        # так что MAX-юзер эти кнопки ВИДИТ и жмёт — обработчик
+        # ``max_inbound._handle_max_reminder_callback`` (обе стороны ack/snooze
+        # берут строку под FOR UPDATE, #344 F5). [Был устаревший коммент «MAX
+        # text-only» — MAX давно рендерит кнопки; поправлено #344 F5.]
         from sreda.services.ui_labels import BUTTON_ACK, BUTTON_SNOOZE
 
         text = f"🔔 {reminder.title}"
