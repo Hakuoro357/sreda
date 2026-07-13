@@ -45,6 +45,15 @@ async def _lifespan(app: FastAPI):
     from sreda.services.webhook_security import assert_webhook_secrets_configured
     assert_webhook_secrets_configured(settings)
 
+    # #138 Р4 (Деплой B / флип DSN): рантайм-роль БД обязана быть ожидаемой,
+    # иначе fail-closed старт. Инертно до флипа: SREDA_RUNTIME_ROLE_ASSERT пуст →
+    # skip (рантайм под owner `sreda`). На флипе ops ставит его в `sreda_app`
+    # ВМЕСТЕ с разводкой DSN → кривой env под owner роняет старт (RLS иначе молча
+    # off). Проверка идёт по фактическому current_user движка, не по строке DSN.
+    if settings.runtime_role_assert:
+        from sreda.db.session import assert_runtime_role
+        assert_runtime_role(settings.runtime_role_assert)
+
     # Issue #68: llm-trace writer task lifecycle. Startup eagerly creates
     # queue + writer + GC tasks так что persist_request_envelope не получит
     # cold-start latency на первом turn'е. Shutdown drains queue с 10s

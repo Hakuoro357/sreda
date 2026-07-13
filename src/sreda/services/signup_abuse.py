@@ -242,13 +242,23 @@ class SignupAbuseGuard:
         # штатным механизмом, а не «бесплатная liability под потолком»). После
         # слияния тарифов 15+1 grandfathered оказываются на plan_sreda_free —
         # без этого фильтра они бы съели места и могли молча закрыть регистрации.
-        active_count = session.execute(text("""
-            SELECT COUNT(*) FROM tenant_subscriptions ts
-            JOIN subscription_plans sp ON ts.plan_id = sp.id
-            WHERE sp.plan_key = 'sreda_free'
-              AND ts.status = 'active'
-              AND ts.grandfathered_at IS NULL
-        """)).scalar()
+        # #138 Ф5-5b: на PG COUNT'ы идут через DEFINER-счётчики (0083) — guard
+        # работает под identity-ролью БЕЗ SELECT-грантов на tenant_subscriptions/
+        # signup_attempts (identity не перечисляет чужое, только агрегат).
+        # SQLite (юниты) — прежние прямые COUNT'ы, семантика зеркальная.
+        is_pg = session.bind.dialect.name == "postgresql"
+        if is_pg:
+            active_count = session.execute(
+                text("SELECT sreda_signup_free_tier_active_count()")
+            ).scalar()
+        else:
+            active_count = session.execute(text("""
+                SELECT COUNT(*) FROM tenant_subscriptions ts
+                JOIN subscription_plans sp ON ts.plan_id = sp.id
+                WHERE sp.plan_key = 'sreda_free'
+                  AND ts.status = 'active'
+                  AND ts.grandfathered_at IS NULL
+            """)).scalar()
         if (active_count or 0) >= self.free_tier_active_max:
             return (False, "free_tier_full")
 
@@ -257,12 +267,18 @@ class SignupAbuseGuard:
         # Bot-agnostic: rate-limit tracks the source identity, not the bot.
         source_id_hash = hmac_signup_source(source_id)
         cutoff = datetime.now(timezone.utc) - timedelta(hours=_RATE_WINDOW_HOURS)
-        recent = session.execute(text("""
-            SELECT COUNT(*) FROM signup_attempts
-            WHERE channel = :c
-              AND source_id_hash = :h
-              AND attempted_at > :cutoff
-        """), {"c": channel, "h": source_id_hash, "cutoff": cutoff}).scalar()
+        if is_pg:
+            recent = session.execute(
+                text("SELECT sreda_signup_recent_attempts_count(:c, :h, :cutoff)"),
+                {"c": channel, "h": source_id_hash, "cutoff": cutoff},
+            ).scalar()
+        else:
+            recent = session.execute(text("""
+                SELECT COUNT(*) FROM signup_attempts
+                WHERE channel = :c
+                  AND source_id_hash = :h
+                  AND attempted_at > :cutoff
+            """), {"c": channel, "h": source_id_hash, "cutoff": cutoff}).scalar()
         if (recent or 0) >= _RATE_LIMIT_MAX:
             return (False, "rate_limited")
 

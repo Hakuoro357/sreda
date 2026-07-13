@@ -104,6 +104,21 @@ def client(monkeypatch, tmp_path):
 
     Base.metadata.create_all(get_engine())
 
+    # sreda_free тариф — прод-предпосылка (0041); lazy-provision без него бросает
+    # (#138 R2-2 атомарность). Сеем в тестовую БД.
+    from sreda.db.models.billing import SubscriptionPlan
+    _seed_sess = get_session_factory()()
+    try:
+        if _seed_sess.query(SubscriptionPlan).filter_by(plan_key="sreda_free").first() is None:
+            _seed_sess.add(SubscriptionPlan(
+                id="plan_free", plan_key="sreda_free",
+                feature_key="housewife_assistant", title="Free", description="",
+                price_rub=0,
+            ))
+            _seed_sess.commit()
+    finally:
+        _seed_sess.close()
+
     with TestClient(create_app()) as c:
         yield c
 
@@ -183,9 +198,11 @@ class TestMiniAppAuth:
         )
         assert resp.status_code == 200
         data = resp.json()
-        # Freshly provisioned — no active skills. #181: EDS Monitor is retired,
-        # so it is NO LONGER surfaced in available_skills (tombstoned).
-        assert data["active_skills"] == []
+        # #138 R2-2: свежий юзер провижнится С free-tier подпиской (sreda_free →
+        # housewife_assistant) — прод-поведение (раньше тест не сеял тариф 0041,
+        # поэтому skills был пуст). Активен ровно free-tier core-скил.
+        assert [s["feature_key"] for s in data["active_skills"]] == ["housewife_assistant"]
+        # #181: EDS Monitor retired — НЕ в available_skills (tombstoned).
         assert not any(
             s["feature_key"] == "eds_monitor" for s in data["available_skills"]
         )

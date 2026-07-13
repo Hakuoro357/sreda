@@ -1041,9 +1041,11 @@ async def handle_telegram_update(
         # — до EntitlementGate/suspended (precedence: deleted > suspended, §13).
         # RuntimeError из резолва (соль не сконфигурена) → трактуем как «не
         # резолвится», НЕ как «удалён» (A16).
+        from sreda.services.identity_resolve import (
+            AmbiguousExternalIdentity,
+            resolve_external_identity,
+        )
         from sreda.services.onboarding import _extract_chat_id
-        from sreda.services.tenant_lifecycle import is_tenant_active
-        from sreda.services.telegram_auth import resolve_tenant_from_telegram_id
 
         _guard_chat_id = _extract_chat_id(payload)
 
@@ -1059,15 +1061,18 @@ async def handle_telegram_update(
             return None
 
         if _guard_chat_id is not None:
+            # #138 Ф5-5c: soft-delete гейт по данным identity-DEFINER (tenant_active
+            # из резолва), НЕ app-SELECT is_tenant_active — иначе после флипа DSN
+            # app-роль без ctx не увидит строку тенанта и дропнет ЖИВОГО юзера.
             try:
-                _resolved = resolve_tenant_from_telegram_id(session, str(_guard_chat_id))
-            except RuntimeError:
+                _resolved = resolve_external_identity("telegram", str(_guard_chat_id))
+            except (RuntimeError, AmbiguousExternalIdentity):
                 _resolved = None
-            if _resolved is not None and not is_tenant_active(session, _resolved[0]):
+            if _resolved is not None and not _resolved.tenant_active:
                 logger.info(
                     "telegram inbound: tenant %s is soft-deleted — silent drop "
                     "(no ensure/welcome/LLM)",
-                    _resolved[0],
+                    _resolved.tenant_id,
                 )
                 return None
 
@@ -1101,133 +1106,144 @@ async def handle_telegram_update(
         # `is_new_user`. Если HTTP-send падает, флаг остаётся False —
         # следующий inbound заретраит. Mark-sent ТОЛЬКО на успешный
         # send, через `mark_welcome_sent`.
-        welcome_just_sent = False
-        if (
-            onboarding.tenant_id
-            and onboarding.user_id
-            and onboarding.chat_id
-            and settings.telegram_bot_token
-        ):
-            from sreda.services.onboarding import (
-                build_post_approve_keyboard_tg,
-                build_post_approve_message,
-                is_welcome_sent,
-                mark_welcome_sent,
-            )
-            if not is_welcome_sent(session, onboarding.tenant_id, onboarding.user_id):
-                try:
-                    _registry = TelegramBotRegistry.from_settings(settings)
-                    client = telegram_client_for(bot_key, _registry)
-                    await client.send_message(
-                        chat_id=onboarding.chat_id,
-                        text=build_post_approve_message(),
-                        reply_markup=build_post_approve_keyboard_tg(),
-                    )
-                    mark_welcome_sent(
-                        session, onboarding.tenant_id, onboarding.user_id,
-                    )
-                    welcome_just_sent = True
-                    logger.info(
-                        "telegram inbound: post-approve welcome sent tenant=%s",
-                        onboarding.tenant_id,
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "telegram post-approve welcome failed for tenant=%s "
-                        "(retry on next inbound)",
-                        onboarding.tenant_id, exc_info=True,
-                    )
+        # #138 Ф5-5c (Codex high R3 CRIT): пост-резолв ХВОСТ входящего —
+        # welcome/persist/entitlement/status — под tenant-контекстом. Внешняя
+        # session коммитится (закрыть pre-ensure read-txn), затем tenant_ctx →
+        # каждая следующая txn на session эмитит set_config(sreda.tenant_id) →
+        # после флипа DSN app-роль видит/пишет свой тенант (иначе find_user→0,
+        # persist tenant_id=NULL, EntitlementGate блок всех). finally сбрасывает.
+        session.commit()
+        _tenant_tok = tenant_ctx.set(onboarding.tenant_id)
+        try:
+            welcome_just_sent = False
+            if (
+                onboarding.tenant_id
+                and onboarding.user_id
+                and onboarding.chat_id
+                and settings.telegram_bot_token
+            ):
+                from sreda.services.onboarding import (
+                    build_post_approve_keyboard_tg,
+                    build_post_approve_message,
+                    is_welcome_sent,
+                    mark_welcome_sent,
+                )
+                if not is_welcome_sent(session, onboarding.tenant_id, onboarding.user_id):
+                    try:
+                        _registry = TelegramBotRegistry.from_settings(settings)
+                        client = telegram_client_for(bot_key, _registry)
+                        await client.send_message(
+                            chat_id=onboarding.chat_id,
+                            text=build_post_approve_message(),
+                            reply_markup=build_post_approve_keyboard_tg(),
+                        )
+                        mark_welcome_sent(
+                            session, onboarding.tenant_id, onboarding.user_id,
+                        )
+                        welcome_just_sent = True
+                        logger.info(
+                            "telegram inbound: post-approve welcome sent tenant=%s",
+                            onboarding.tenant_id,
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "telegram post-approve welcome failed for tenant=%s "
+                            "(retry on next inbound)",
+                            onboarding.tenant_id, exc_info=True,
+                        )
 
-        result = persist_telegram_inbound_event(
-            session, bot_key=bot_key, payload=payload,
-        )
-        # persist_telegram_inbound_event commits internally — ingest is now
-        # durable in the DB and the long-poller may safely advance offset.
+            result = persist_telegram_inbound_event(
+                session, bot_key=bot_key, payload=payload,
+            )
+            # persist_telegram_inbound_event commits internally — ingest is now
+            # durable in the DB and the long-poller may safely advance offset.
 
-        if result.is_duplicate:
-            logger.info(
-                "telegram inbound: duplicate update_id %s for bot %s — no-op",
-                payload.get("update_id"), bot_key,
-            )
-            return result.inbound_message_id
+            if result.is_duplicate:
+                logger.info(
+                    "telegram inbound: duplicate update_id %s for bot %s — no-op",
+                    payload.get("update_id"), bot_key,
+                )
+                return result.inbound_message_id
 
-        # 2026-05-09 fix (Boris feedback): если welcome ТОЛЬКО ЧТО отправлен
-        # этой inbound-message — НЕ передаём её дальше в chat handler.
-        # Иначе юзер получает double-reply на /start: welcome + LLM reply.
-        # Welcome consumes the inbound; следующее сообщение юзера пойдёт
-        # нормально в chat. Применяется ко ВСЕМ inbound types.
-        if welcome_just_sent:
-            logger.info(
-                "telegram inbound: welcome consumed inbound — skip chat "
-                "dispatch tenant=%s inbound_id=%s",
-                onboarding.tenant_id, result.inbound_message_id,
-            )
-            _set_processing_status(
-                session, result.inbound_message_id, "ignored",
-            )
-            return result.inbound_message_id
+            # 2026-05-09 fix (Boris feedback): если welcome ТОЛЬКО ЧТО отправлен
+            # этой inbound-message — НЕ передаём её дальше в chat handler.
+            # Иначе юзер получает double-reply на /start: welcome + LLM reply.
+            # Welcome consumes the inbound; следующее сообщение юзера пойдёт
+            # нормально в chat. Применяется ко ВСЕМ inbound types.
+            if welcome_just_sent:
+                logger.info(
+                    "telegram inbound: welcome consumed inbound — skip chat "
+                    "dispatch tenant=%s inbound_id=%s",
+                    onboarding.tenant_id, result.inbound_message_id,
+                )
+                _set_processing_status(
+                    session, result.inbound_message_id, "ignored",
+                )
+                return result.inbound_message_id
 
-        # Phase 2 (Codex CRITICAL fix 2026-05-07): EntitlementGate enforced
-        # at handler entry — было: gate.check() вызывался в downstream
-        # paths (runtime/voice/tools), но allowed=False не блокировался,
-        # suspended tenants получали полный доступ. Теперь fail-closed
-        # primary point: inbound persisted (audit), gate проверяется,
-        # если blocked → отправляем UPGRADE_COPY и помечаем inbound
-        # как ignored. Allowed tenants проходят далее без изменений.
-        from sreda.services.entitlement_gate import EntitlementGate
-        _gate = EntitlementGate(session).check(onboarding.tenant_id)
-        if not _gate.allowed:
-            logger.info(
-                "telegram inbound: entitlement gate blocked tenant=%s "
-                "reason=%s — drop turn, mark ignored",
-                onboarding.tenant_id, _gate.reason,
-            )
-            if onboarding.chat_id and settings.telegram_bot_token:
-                try:
-                    _registry = TelegramBotRegistry.from_settings(settings)
-                    client = telegram_client_for(bot_key, _registry)
-                    await client.send_message(
-                        chat_id=onboarding.chat_id,
-                        text=UPGRADE_COPY.get(
-                            _gate.reason,
-                            UPGRADE_COPY["no_active_subscription"],
-                        ),
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "entitlement-blocked notify failed", exc_info=True,
-                    )
-            _set_processing_status(
-                session, result.inbound_message_id, "ignored",
-            )
-            return result.inbound_message_id
+            # Phase 2 (Codex CRITICAL fix 2026-05-07): EntitlementGate enforced
+            # at handler entry — было: gate.check() вызывался в downstream
+            # paths (runtime/voice/tools), но allowed=False не блокировался,
+            # suspended tenants получали полный доступ. Теперь fail-closed
+            # primary point: inbound persisted (audit), gate проверяется,
+            # если blocked → отправляем UPGRADE_COPY и помечаем inbound
+            # как ignored. Allowed tenants проходят далее без изменений.
+            from sreda.services.entitlement_gate import EntitlementGate
+            _gate = EntitlementGate(session).check(onboarding.tenant_id)
+            if not _gate.allowed:
+                logger.info(
+                    "telegram inbound: entitlement gate blocked tenant=%s "
+                    "reason=%s — drop turn, mark ignored",
+                    onboarding.tenant_id, _gate.reason,
+                )
+                if onboarding.chat_id and settings.telegram_bot_token:
+                    try:
+                        _registry = TelegramBotRegistry.from_settings(settings)
+                        client = telegram_client_for(bot_key, _registry)
+                        await client.send_message(
+                            chat_id=onboarding.chat_id,
+                            text=UPGRADE_COPY.get(
+                                _gate.reason,
+                                UPGRADE_COPY["no_active_subscription"],
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "entitlement-blocked notify failed", exc_info=True,
+                        )
+                _set_processing_status(
+                    session, result.inbound_message_id, "ignored",
+                )
+                return result.inbound_message_id
 
-        tenant = session.get(Tenant, onboarding.tenant_id)
-        is_approved = tenant is not None and tenant.approved_at is not None
+            tenant = session.get(Tenant, onboarding.tenant_id)
+            is_approved = tenant is not None and tenant.approved_at is not None
 
-        if not is_approved:
-            await _handle_pending_tenant(
-                session, bot_key=bot_key, payload=payload, onboarding=onboarding,
-            )
-            _set_processing_status(
-                session, result.inbound_message_id, "ignored",
-            )
-            return result.inbound_message_id
+            if not is_approved:
+                await _handle_pending_tenant(
+                    session, bot_key=bot_key, payload=payload, onboarding=onboarding,
+                )
+                _set_processing_status(
+                    session, result.inbound_message_id, "ignored",
+                )
+                return result.inbound_message_id
 
-        if not (settings.telegram_bot_token and onboarding.chat_id):
-            # No bot token / chat_id → cannot run an approved turn.
-            # Mark as ignored so the unprocessed_inbound monitor stays
-            # quiet; this is a deliberate skip, not a crash.
-            logger.info(
-                "approved tenant %s — no bot token/chat_id, drop (update_id=%s)",
-                onboarding.tenant_id, payload.get("update_id"),
-            )
-            _set_processing_status(
-                session, result.inbound_message_id, "ignored",
-            )
-            return result.inbound_message_id
+            if not (settings.telegram_bot_token and onboarding.chat_id):
+                # No bot token / chat_id → cannot run an approved turn.
+                # Mark as ignored so the unprocessed_inbound monitor stays
+                # quiet; this is a deliberate skip, not a crash.
+                logger.info(
+                    "approved tenant %s — no bot token/chat_id, drop (update_id=%s)",
+                    onboarding.tenant_id, payload.get("update_id"),
+                )
+                _set_processing_status(
+                    session, result.inbound_message_id, "ignored",
+                )
+                return result.inbound_message_id
 
-        inbound_message_id = result.inbound_message_id
+            inbound_message_id = result.inbound_message_id
+        finally:
+            tenant_ctx.reset(_tenant_tok)
 
     # Per-tenant feature flag: SREDA_MESSAGE_QUEUE_ENABLED_TENANTS lets
     # us route a specific tenant through the new `message_jobs` queue
@@ -1251,6 +1267,11 @@ async def handle_telegram_update(
             external_chat_id=str(onboarding.chat_id),
         )
         enqueued_ok = False
+        # #138 Ф5-5c (Codex high R4 / субагент MINOR): message_jobs — tenant RLS
+        # таблица; enqueue/ре-запрос под tenant_ctx (после флипа DSN app-роль без
+        # ctx: INSERT нарушит WITH CHECK, SELECT вернёт пусто). Путь за флагом
+        # SREDA_MESSAGE_QUEUE_ENABLED_TENANTS (default OFF) + само-лечится на inline.
+        _qtok = tenant_ctx.set(onboarding.tenant_id)
         try:
             with SessionLocal() as session:
                 with session.begin():
@@ -1312,6 +1333,10 @@ async def handle_telegram_update(
                 enqueued_ok = True
             # else: row really isn't there — fall through to inline
             # path as a safety net (zero-message-loss contract).
+        finally:
+            # R5 (Codex medium MINOR): reset в finally — если fallback-ре-запрос
+            # бросит, ctx не утечёт в poller-таск на следующий update.
+            tenant_ctx.reset(_qtok)
         if enqueued_ok:
             return inbound_message_id
         # else: fall through to inline path below as a safety net

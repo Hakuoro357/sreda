@@ -183,10 +183,24 @@ def test_miniapp_deleted_tenant_mutating_endpoint_410_no_mutation(client):
 
 
 @pytest.fixture()
-def db_session():
+def db_session(monkeypatch):
+    # #138 Ф5-5c: резолв/gate/провижн открывают свои privileged/tenant сессии;
+    # стабаем обе на эту sqlite-сессию (soft-delete гейт под ctx видит свой тенант).
+    # ТОЛЬКО для db_session-тестов — client-based тесты идут на app-БД (get_engine).
+    from contextlib import contextmanager
+
+    import sreda.db.session as dbs
+
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     sess = sessionmaker(bind=engine)()
+
+    @contextmanager
+    def _stub(arg):
+        yield sess
+
+    monkeypatch.setattr(dbs, "privileged_session", _stub)
+    monkeypatch.setattr(dbs, "tenant_session", _stub)
     sess.add(Tenant(id="tenant_tg", name="TG Tenant"))
     sess.add(Tenant(id="tenant_max", name="MAX Tenant"))
     sess.add(User(id="user_tg", tenant_id="tenant_tg", telegram_account_id="100"))
