@@ -544,9 +544,20 @@ _DOMAIN_CLASSIFIER_SYSTEM = (
     "- shopping: покупки («купи», «в покупки», «список покупок», добавить товар)\n"
     "- menu: недельное меню; - recipes: рецепты; - household: члены семьи, дни рождения родных;\n"
     "- memory: запомнить/вспомнить заметку, факт о себе, создать категорию/раздел памяти; "
-    "- web: погода, поиск в интернете, актуальные факты.\n"
+    "- web: погода, поиск в интернете, актуальные факты;\n"
+    "- none: чистый смолток без связи с разделами («спасибо», «привет», «как дела?»).\n"
+    "Если сообщение продолжает тему предыдущего хода (комментирует показанное, отмечает или "
+    "дополняет пункт) — верни раздел предыдущего хода, НЕ none.\n"
     "Только одно слово (раздел), без пояснений."
 )
+# «none» (#352 R1 terra): классификатор не ДОЛЖЕН быть вынужден выбрать раздел на смолтоке
+# («спасибо» после показа списка). Парсер строгий: none ∉ _USER_DOMAINS → 0 доменов → low →
+# не применяется (fail-safe без изменения парсера). На легаси-пути смолток до классификатора
+# доменов почти не доходит (intent=chat), а none→low→deny = уточнение, не тихая мутация.
+# Формулировка калибрована ЖИВЫМ прогоном (probe_352_classifier_v2/v3, прод 2026-07-11):
+# короткое «none: не про данные разделов» ОТТЯГИВАЛО инцидент-кейс («я посмотрел машину
+# войны» 3/5); с явным правилом продолжения - 5/5 checklists, смолток 10/10 none, смена
+# темы 5/5 shopping. Правку этой строки перекалибровывать живой пробой (урок g-067).
 
 
 @dataclass(frozen=True)
@@ -556,10 +567,18 @@ class DomainClassResult:
 
 
 def _parse_domains(raw: Any) -> DomainClassResult:
-    """Строгий парс: латиница-токены ∩ _USER_DOMAINS (weather→web). high ровно при одном; иначе low."""
+    """Строгий парс: латиница-токены ∩ _USER_DOMAINS (weather→web). high ровно при одном; иначе low.
+
+    «none» ДОМИНИРУЕТ (#352 R2 sol): болтливый ответ «none — это не checklists» иначе
+    превращался бы в checklists/high, и смолток-защита зависела бы от идеального
+    послушания слабой модели. Любое упоминание none → пусто/low (fail-safe). Легаси-путь
+    не меняется: до #352 слово none в ответах не встречалось (его не было в промпте)."""
     s = ("" if raw is None else str(raw)).lower()
+    toks = re.findall(r"[a-z]+", s)
+    if "none" in toks:
+        return DomainClassResult((), "low")
     found: list[str] = []
-    for w in re.findall(r"[a-z]+", s):
+    for w in toks:
         d = "web" if w == "weather" else w
         if d in _USER_DOMAINS and d not in found:
             found.append(d)
@@ -569,11 +588,23 @@ def _parse_domains(raw: Any) -> DomainClassResult:
 async def classify_domains(
     recent_messages: Iterable[Any], user_text: str, freddie_llm: Any,
     timeout: float = 4.0, raw_sink: list[str] | None = None,
+    prev_turn_domains: tuple[str, ...] | None = None,
 ) -> DomainClassResult:
     """Слой-1 фолбэк ПО ДОМЕНУ (на task-пути). Async, fail-open (пусто+low) при сбое/таймауте/мусоре —
-    тогда привязка идёт по fail-open-политике (read-only/уточнение, Ф3), НЕ по угаданному домену."""
+    тогда привязка идёт по fail-open-политике (read-only/уточнение, Ф3), НЕ по угаданному домену.
+
+    prev_turn_domains (#352): разделы, которыми РЕАЛЬНО работал прошлый ход (факт журнала
+    инструментов, не догадка) — снимает двусмысленность продолжений («я посмотрел <пункт>»
+    после показа списка иначе читается как факт-о-себе → memory). Живой замер на
+    инцидент-кейсе: без строки 7/10 попаданий, со строкой 5/5; на смене темы прилипания
+    к прошлому разделу нет (20/20). Без параметра запрос байт-в-байт прежний."""
     recent = _format_recent(recent_messages)
-    payload = (f"Последние реплики:\n{recent}\n\nТекущее сообщение пользователя:\n{user_text}\n\n"
+    prev_line = ""
+    if prev_turn_domains:
+        _word = "разделом" if len(prev_turn_domains) == 1 else "разделами"
+        prev_line = f"Предыдущий ход работал с {_word}: {', '.join(prev_turn_domains)}\n\n"
+    payload = (f"Последние реплики:\n{recent}\n\n{prev_line}"
+               f"Текущее сообщение пользователя:\n{user_text}\n\n"
                "Одно слово (раздел):")
     try:
         resp = await asyncio.wait_for(
