@@ -449,11 +449,16 @@ def classify_confirm_reply(text: str) -> str:
     affirm — ТОЛЬКО строгий аффирматив (ТОЧНОЕ совпадение, БЕЗ командных глаголов): иначе «удали Y»
     прочлось бы как «да» → удаление НЕ ТОГО (CRITICAL). negate — отмена. Всё прочее (вкл. «удали…»,
     новое намерение) → redirect (Фаза B авто-переключит раздел; A0 безопасно трактует redirect как отказ).
-    Зовётся в handle_turn ДО Command(resume) — в граф идёт только канон «да»/«нет»."""
+    Зовётся в handle_turn ДО Command(resume) — в граф идёт только канон «да»/«нет».
+    #362 R4 (оба Codex MAJOR): точный `_NEGATE` дополнен `confirm_decline_signal` — распространённые формы
+    отказа («не удали»/«не удаляй»/«не согласна»/«ну нет, 16»/«нет, по задаче 5») → negate, чтобы получить
+    честную детерминированную «Отменила» (#321) и НЕ врать в confirm-телеметрии. «нет, сахар 16» (запись
+    после отказа) детектор НЕ считает чистым отказом → остаётся redirect (dual-intent, показатель не теряется)."""
+    from sreda.runtime.react_signals import confirm_decline_signal
     t = (text or "").strip().lower().rstrip("!.?")
     if t in _YES:
         return "affirm"
-    if t in _NEGATE:
+    if t in _NEGATE or confirm_decline_signal(text):
         return "negate"
     return "redirect"
 
@@ -2070,24 +2075,32 @@ def _should_redirect_on_pause(user_text: str, is_confirm_pause: bool) -> bool:
     return is_new
 
 
-def _withdrawal_messages(last_msg) -> list:
+def _withdrawal_messages(last_msg, redirect_new: bool = False) -> list:
     """#316 R2/R3: withdrawal-ToolMessage на КАЖДЫЙ повисший tool_call последнего AIMessage.
 
     Сброс живой паузы на redirect снимает interrupt-write, но закоммиченный AIMessage(tool_calls)
     остаётся БЕЗ пары ToolMessage (узел прервался до коммита результата) → провайдер отвергает «сироту».
     Дописав по одному withdrawal на вызов, закрываем пару → история валидна. `artifact.result_kind=
     "withdrawn"` (Codex high/medium R2 MAJOR): без него дефолт «ok» → отменённый delete_task считался бы
-    ИСПОЛНЕННЫМ в shadow-метрике (ok/observed). Не-AIMessage / без tool_calls → пусто (сироты нет)."""
+    ИСПОЛНЕННЫМ в shadow-метрике (ok/observed). Не-AIMessage / без tool_calls → пусто (сироты нет).
+
+    #362 R4 (Codex sol MAJOR — новый концерн R3): формулировка КОНТЕКСТНА. На РЕДИРЕКТЕ (redirect_new) —
+    анти-репорт-клауза «НЕ сообщать об отмене, обработай новый запрос» ЖИВЁТ в сообщении (переживает все
+    проходы; availability-хвост иначе провоцирует паррот). На STALE (не redirect) — НЕЙТРАЛЬНОЕ закрытие
+    сироты БЕЗ утверждения «сменил запрос»: на протухшем ask_human пользователь МОГ поздно ответить на
+    старый вопрос — решение «поздний ответ vs новый запрос» оставлено stale-директиве (_stale_pause_note),
+    иначе withdrawal затирал бы её. Обе формы держат заблокированные тестами подстроки («вызов инструмента
+    отменён» + «не считать выполненным»)."""
     if not (isinstance(last_msg, AIMessage) and getattr(last_msg, "tool_calls", None)):
         return []
-    # #362 R3 (Codex sol+terra MAJOR): анти-репорт-клауза ЖИВЁТ В САМОМ withdrawal-сообщении (переживает
-    # ВСЕ проходы хода, в отличие от consume-and-clear директивы) — иначе availability-хвост «инструмент
-    # вернул отмену → скажи отменила» + это «отменён» провоцировали паррот ложной «Отменила» на редиректе.
-    # Заблокированные тестами подстроки сохранены («вызов инструмента отменён» + «не считать выполненным»).
+    content = (
+        ("(вызов инструмента отменён: пользователь сменил запрос; не считать выполненным и НЕ сообщать "
+         "об этом как об отмене — служебное закрытие прошлого действия, обработай новый запрос)")
+        if redirect_new else
+        ("(вызов инструмента отменён: не считать выполненным — служебное закрытие незавершённого "
+         "действия)"))
     return [ToolMessage(
-        content=("(вызов инструмента отменён: пользователь сменил запрос; не считать выполненным "
-                 "и НЕ сообщать об этом как об отмене — это служебное закрытие прошлого действия, "
-                 "просто обработай новый запрос)"),
+        content=content,
         name=tc.get("name") or "tool", tool_call_id=tc.get("id") or "",
         artifact={"result_kind": "withdrawn"})
         for tc in last_msg.tool_calls if tc.get("id")]
@@ -4374,7 +4387,9 @@ async def handle_turn(
                         # откат единого пути возвращает и старое поведение legacy-stale (байт-идентично).
                         if _redirect_new or _unified_execute_for(tenant_id):
                             _pmsgs = _pre_vals.get("messages") or []
-                            _redirect_close_msgs = _withdrawal_messages(_pmsgs[-1] if _pmsgs else None)
+                            # #362 R4: redirect → анти-паррот-клауза; stale → нейтральное закрытие сироты
+                            _redirect_close_msgs = _withdrawal_messages(
+                                _pmsgs[-1] if _pmsgs else None, redirect_new=_redirect_new)
                     except Exception:  # noqa: BLE001 — гашение не валит ход
                         logger.warning("react_loop: clear_pending failed", exc_info=True)
                         _redirect_close_msgs = []  # сбой гашения → без withdrawals (пре-существующее поведение)

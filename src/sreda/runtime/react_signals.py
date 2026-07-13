@@ -209,14 +209,20 @@ _NUM_WORD_RE = re.compile(
     r"пятьсот|шестьсот|семьсот|восемьсот|девятьсот|тысяча|тысячи|тысяч|"
     r"целых|десятых|сотых|половина|полтора)$",
     re.IGNORECASE)
-_REFUSAL_LEAD = re.compile(  # ведущее отрицание/отказ
-    r"^\s*(?:нет|неа|не-?а|отмена|отмени(?:ть)?|не\s+надо|не\s+нужно|"
-    r"не\s+согласен\w*|(?:я\s+)?против|отказываюсь|ни\s+за\s+что|ни\s+в\s+коем)\b",
-    re.IGNORECASE)
-# слова-«не-хвост» отказа: сами отрицания/связки/id — их наличие НЕ делает отказ «содержательным».
-_REFUSAL_TAIL_OK = frozenset({
+# ведущие СЛОВА-отказа (одиночные) и ФРАЗЫ-отказа (2 токена). Отрицаемая команда «не удали»/«не удаляй»
+# распознаётся отдельно (_is_ack_verb). «согласна/согласны» + «надо/нужно» — R4 (оба Codex MAJOR).
+_DECLINE_WORDS = frozenset({"нет", "неа", "нея", "отмена", "отмени", "отменить", "отказываюсь", "против"})
+_DECLINE_PHRASE2 = frozenset({  # первые два токена (после «не»)
+    "надо", "нужно", "согласен", "согласна", "согласны", "буду", "хочу", "стоит",
+})
+# ведущие филлеры ПЕРЕД отказом («ну нет», «да нет», «ой нет») — снимаем, чтобы добраться до отказа.
+# «нет»/«отмена» сами НЕ филлеры (они и есть отказ), поэтому берём подмножество _ECHO_FILLER без них.
+_LEAD_FILLERS = frozenset({"ну", "да", "ой", "ок", "окей", "ладно", "вот", "эх", "нее", "не-а", "же", "уж"})
+# хвост-«не-содержательное» после отказа: связки/id/местоимения — не делают отказ новой ЗАПИСЬЮ.
+_DECLINE_TAIL_OK = frozenset({
     "нет", "неа", "не", "отмена", "отмени", "отменить", "надо", "нужно", "согласен", "согласна",
-    "против", "отказываюсь", "ни", "за", "что", "коем", "случае", "я", "это", "этого",
+    "согласны", "против", "отказываюсь", "ни", "за", "что", "коем", "случае", "я", "это", "этого",
+    "по", "с", "этим", "тут", "здесь", "пока", "сейчас",
     "задача", "задачу", "задачи", "задаче", "пункт", "пункта", "пунктом", "номер", "строка", "строку",
 })
 
@@ -225,29 +231,53 @@ def _is_ack_verb(tok: str) -> bool:
     return bool(_CMD_VERBS.fullmatch(tok) or _IMPERF_VERBS.fullmatch(tok))
 
 
-def confirm_reply_is_noise(text: str) -> bool:
-    """#362 R3: реплика на confirm-паузе — НЕ содержательный новый запрос (→ resume/fail-closed, не redirect)?
+def confirm_decline_signal(text: str) -> bool:
+    """#362 R4 (оба Codex MAJOR): реплика на confirm-паузе — это ЯВНЫЙ ОТКАЗ (→ classify «negate»: честная
+    детерминированная «Отменила» #321 + верная confirm-телеметрия)? Формы: exact «нет»/«отмена»; фразы
+    «не надо»/«не нужно»/«не согласен(на/ы)»; отрицаемая команда «не удали»/«не удаляй» (естественно для
+    delete-confirm); «против»/«отказываюсь»/«ни за что»; ведущие филлеры («ну нет», «да нет»). Хвост —
+    ТОЛЬКО пустой/числовой(цифра или слово)/id/связка: «нет, 16», «нет, по задаче 5». СОДЕРЖАТЕЛЬНАЯ
+    запись после отказа («нет, сахар 16») → False (dual-intent → редирект, показатель НЕ теряется).
+    Экзотические формы вне списка → False → редирект (безопасно: destructive fail-closed, модель на
+    свежем ходе не фабрикует успех; честная «Отменила» для них — UX-nicety, не гарантия)."""
+    t = re.sub(r"[^\w\s]", " ", (text or "").lower())
+    toks = t.split()
+    i = 0  # снять ведущие филлеры перед отказом
+    while i < len(toks) and toks[i] in _LEAD_FILLERS:
+        i += 1
+    rest = toks[i:]
+    if not rest:
+        return False
+    is_refusal = False
+    if rest[0] in _DECLINE_WORDS:
+        is_refusal = True
+    elif rest[0] == "не" and len(rest) >= 2 and (rest[1] in _DECLINE_PHRASE2 or _is_ack_verb(rest[1])):
+        is_refusal = True  # «не надо»/«не согласна»/«не удали»/«не удаляй»
+    elif rest[0] == "ни" and "что" in rest[:3]:
+        is_refusal = True  # «ни за что»
+    if not is_refusal:
+        return False
+    # содержательная НОВАЯ запись в хвосте? (не число/id/связка/сам отказ) → dual-intent → НЕ чистый отказ
+    substantive = [w for w in rest
+                   if not w.isdigit() and w not in _DECLINE_TAIL_OK and not _NUM_WORD_RE.match(w)
+                   and not _is_ack_verb(w)]
+    return not substantive
 
-    Гейт ТОЛЬКО для confirm-ветки `_should_redirect_on_pause`. True (НЕ редиректить) для: (a) пусто; (b)
-    эхо-подтверждение — все токены филлеры и/или командные глаголы («ок»/«удали»/«давай удаляй»); (c)
-    ЧИСТЫЙ отказ — ведущее отрицание + только пустой/числовой(цифра или слово)/id-хвост («нет, 16»,
-    «отмена, задача 5»). False (редиректить свежим ходом) для СОДЕРЖАТЕЛЬНОГО: запись показателя любой
-    формы, новый запрос, отказ+содержательная запись («нет, сахар 16» — «сахар» переживает → dual-intent
-    → свежий ход, показатель не теряется). Эхо/filler/чистый-отказ НЕ редиректятся → #267/#316 fail-closed
-    и честная отмена #321 сохранены (не-affirm resume даёт детерминированную «Отменила»)."""
+
+def confirm_reply_is_noise(text: str) -> bool:
+    """#362 R3/R4: реплика на confirm-паузе — эхо-подтверждение/filler (→ resume/fail-closed, НЕ редирект)?
+
+    Гейт для confirm-ветки `_should_redirect_on_pause` вместе с classify. True для: (a) пусто; (b) все
+    токены — филлеры и/или командные глаголы (perfective+imperfective: «ок»/«удали»/«давай удаляй») =
+    эхо-подтверждение → fail-closed «нет» (#316/#267). ОТКАЗ обрабатывается ОТДЕЛЬНО — `confirm_decline_signal`
+    → classify «negate» → resume честной «Отменилой» (не через noise). Содержательная реплика (запись
+    любой формы, новый запрос, dual-intent) → False → редирект свежим ходом (показатель не теряется)."""
     t = re.sub(r"[^\w\s]", " ", (text or "").lower())
     toks = t.split()
     if not toks:  # (a) пусто/только пунктуация
         return True
     non_filler = [w for w in toks if w not in _ECHO_FILLER]
-    if not non_filler or all(_is_ack_verb(w) for w in non_filler):  # (b) эхо-подтверждение
-        return True
-    if _REFUSAL_LEAD.match(text or ""):  # (c) ведущий отказ — содержательный хвост?
-        substantive = [w for w in non_filler
-                       if not w.isdigit() and w not in _REFUSAL_TAIL_OK and not _NUM_WORD_RE.match(w)]
-        if not substantive:  # только пустой/числовой/id-хвост → ЧИСТЫЙ отказ → honest decline (#321)
-            return True
-    return False
+    return not non_filler or all(_is_ack_verb(w) for w in non_filler)  # (b) эхо-подтверждение
 
 
 def declarative_memory_signal(text: str) -> bool:

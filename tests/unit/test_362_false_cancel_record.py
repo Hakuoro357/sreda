@@ -8,10 +8,16 @@ confirm-паузе единого пути (#285) детерминированн
 подменяет user_text на «нет», модель его больше не видит). Идентификаторы/детали инцидента — в
 закрытом issue, не в этом (публичном) репозитории.
 
-Фикс (механизм): `react_signals.data_record_signal` (число-измерение) добавлен в confirm-ветку
-`_should_redirect_on_pause` — у confirm-паузы нет свободных СЛОТ-ответов, поэтому содержательная
-НЕ-да/нет реплика с числом = свежий ход, а не отказ. ask_human-ветка НЕ тронута («865»/«в 18:00» —
-валидные ОТВЕТЫ). Честная отмена #321 («нет»/«отмена» → classify=negate) сохранена.
+Фикс (механизм, ПРОТОКОЛ-СЕМАНТИКА — R3/R4 после ревью): у confirm-паузы валидны ТОЛЬКО «да»/«нет»,
+свободных СЛОТ-ответов НЕТ, поэтому confirm-ветка `_should_redirect_on_pause` редиректит свежим ходом
+ЛЮБОЙ содержательный не-да/нет ответ (запись показателя цифрой/словом/КАЧЕСТВЕННАЯ «температура высокая»;
+новый запрос; dual-intent «нет, сахар 16»), КРОМЕ:
+  • эхо-подтверждения/filler (`react_signals.confirm_reply_is_noise`: «ок»/«удали»/«давай удаляй») →
+    fail-closed «нет» (#316/#267);
+  • явного ОТКАЗА (`react_signals.confirm_decline_signal` → classify «negate»: «нет»/«не удали»/«не
+    согласна»/«нет, 16») → детерминированная честная «Отменила» (#321) + верная confirm-телеметрия.
+ask_human-ветка НЕ тронута («865»/«в 18:00» — валидные ОТВЕТЫ). Анти-паррот ложной «Отменила» на
+редиректе — клауза в САМОМ withdrawal-ToolMessage (persists все проходы, контекстна: redirect vs stale).
 
 Канал-агностично: гейт `_unified_execute_for(tenant)` (unified=`*` на всех) — бьёт и MAX, и TG.
 """
@@ -163,22 +169,34 @@ def _durable_saver(tmp_path, name):
 
 # ─────────── юнит: data_record_signal ───────────
 def test_confirm_reply_is_noise():
-    """#362 R3 (протокол-семантика): на confirm-паузе НЕ-содержательная реплика (эхо/filler/чистый отказ)
-    → noise=True (resume/fail-closed); СОДЕРЖАТЕЛЬНАЯ (запись любой формы/новый запрос/dual-intent) → False."""
+    """#362 R3/R4 (протокол-семантика): noise = ЭХО-подтверждение/filler (отказ вынесен в
+    confirm_decline_signal → classify negate). True → resume/fail-closed; содержательное → False → редирект."""
     from sreda.runtime.react_signals import confirm_reply_is_noise as n
     # noise=True — эхо-подтверждение / filler (→ fail-closed #316/#267)
     for t in ("", "ок", "окей", "конечно", "давай", "ну давай", "удали", "удалите", "ок удали",
               "давай удаляй", "удаляй", "ок удаляй", "да удали", "удали пожалуйста"):
         assert n(t), f"{t!r} — эхо/filler, должно быть noise (не редирект)"
-    # noise=True — ЧИСТЫЙ отказ (ведущее отрицание + пустой/числовой/id-хвост, цифрой И словом)
-    for t in ("нет, 16", "нет 16", "отмена, задача 5", "не надо 16", "отмена, задача пять",
-              "нет, шестнадцать"):
-        assert n(t), f"{t!r} — чистый отказ, должно быть noise (честная отмена #321)"
-    # noise=False — СОДЕРЖАТЕЛЬНОЕ: запись цифрой/словом/КАЧЕСТВЕННАЯ, новый запрос, dual-intent
+    # noise=False — СОДЕРЖАТЕЛЬНОЕ (редирект): запись цифрой/словом/КАЧЕСТВЕННАЯ, новый запрос, dual-intent
     for t in (SUGAR, "сахар 16 и 2", "16.2", "давление сто двадцать на восемьдесят",
               "температура высокая", "сахар низкий", "самочувствие плохое",
               "покажи покупки", "добавь молоко в покупки", "нет, сахар 16"):
         assert not n(t), f"{t!r} — содержательное, должно РЕДИРЕКТИТЬ (не noise)"
+
+
+def test_confirm_decline_signal():
+    """#362 R4 (оба Codex MAJOR): детект явного ОТКАЗА (→ classify negate: честная «Отменила» #321 +
+    верная телеметрия). Распространённые формы True; содержательная запись после отказа → False (редирект)."""
+    from sreda.runtime.react_signals import confirm_decline_signal as d
+    # отказ → True: exact, фразы, отрицаемая команда, ведущий филлер, числовой/id-хвост
+    for t in ("нет", "отмена", "неа", "не надо", "не нужно", "не согласен", "не согласна", "не согласны",
+              "не удали", "не удаляй", "не добавляй", "против", "отказываюсь", "ни за что",
+              "нет, 16", "нет 16", "нет, шестнадцать", "отмена, задача 5", "ну нет, 16", "да нет",
+              "нет, по задаче 5", "не согласна, задача 5"):
+        assert d(t), f"{t!r} — явный отказ, должен быть decline (честная #321)"
+    # НЕ чистый отказ → False (редирект): запись после отказа (dual-intent), запись, новый запрос, да/эхо
+    for t in ("нет, сахар 16", "нет, запиши температуру высокую", SUGAR, "температура высокая",
+              "покажи покупки", "да", "ок", "удали"):
+        assert not d(t), f"{t!r} — НЕ чистый отказ (содержательное/да/эхо) → редирект/иначе"
 
 
 # ─────────── юнит: _should_redirect_on_pause (confirm-ветка) ───────────
@@ -265,11 +283,15 @@ def test_genuine_decline_still_honest_321(install, monkeypatch, tmp_path):
     assert inv.get("add_task", 0) == 0, "отказ → мутация НЕ исполнена"
 
 
-@pytest.mark.parametrize("refusal", ["нет, 16", "отмена, задача 5", "не надо"])
+@pytest.mark.parametrize("refusal", [
+    "нет, 16", "отмена, задача 5", "не надо",          # R2 формы
+    "не удаляй", "не согласна", "ну нет, 16", "нет, по задаче 5",  # R4 (оба Codex MAJOR)
+])
 def test_genuine_decline_with_number_tail_still_honest_362(install, monkeypatch, tmp_path, refusal):
-    """#362 R2 (оба Codex MAJOR): ведущее ОТРИЦАНИЕ с числовым/пунктуационным хвостом («нет, 16») —
-    это отказ, а НЕ запись показателя → честная детерминированная «Отменила», мутация НЕ исполнена.
-    Иначе data_record_signal='любое число' съедал бы подтверждённый отказ (регрессия #321)."""
+    """#362 R2/R4 (оба Codex MAJOR): распространённые формы ОТКАЗА («нет, 16»/«не удаляй»/«не согласна»/
+    «ну нет, 16»/«нет, по задаче 5») → честная детерминированная «Отменила», мутация НЕ исполнена.
+    Протокол-семантика: явный отказ (confirm_decline_signal → classify negate) идёт в resume, не редирект;
+    «нет, сахар 16» (запись после отказа) — dual-intent → редирект (проверено в юнит-тестах)."""
     saver = _durable_saver(tmp_path, f"ck362n-{abs(hash(refusal))}.db")
     monkeypatch.setattr(react_loop, "_persist_enabled", lambda: True)
     monkeypatch.setattr(react_loop, "_get_checkpointer", lambda: saver)
@@ -330,6 +352,24 @@ def test_antiparrot_clause_in_withdrawal_persists_362(install, monkeypatch, tmp_
     for i, cap in enumerate(fresh_inputs[:2]):
         assert "НЕ сообщать об этом как об отмене" in _flat_msgs([cap]), \
             f"анти-паррот-клауза должна дойти до модели на проходе {i + 1} (persist)"
+
+
+def test_withdrawal_context_aware_362():
+    """#362 R4 (Codex sol MAJOR — новый концерн R3): withdrawal-формулировка КОНТЕКСТНА.
+    redirect → анти-паррот «НЕ сообщать об отмене, обработай новый запрос»; stale → НЕЙТРАЛЬНОЕ закрытие
+    сироты БЕЗ «сменил запрос»/«обработай новый запрос» (иначе на протухшем ask_human затирает stale-
+    директиву позднего ответа). Обе формы держат заблокированные тестами #316/#320 подстроки."""
+    ai = _ai_call("delete_task", "c1", id=5)
+    red = react_loop._withdrawal_messages(ai, redirect_new=True)
+    stale = react_loop._withdrawal_messages(ai, redirect_new=False)
+    for out in (red, stale):  # обе: locked-подстроки + result_kind=withdrawn (не «ok»)
+        assert out, "withdrawal на повисший tool_call"
+        assert "вызов инструмента отменён" in str(out[0].content)
+        assert "не считать выполненным" in str(out[0].content)
+        assert (out[0].artifact or {}).get("result_kind") == "withdrawn"
+    assert "НЕ сообщать об" in str(red[0].content) and "обработай новый запрос" in str(red[0].content)
+    assert "сменил запрос" not in str(stale[0].content), "stale НЕ должен утверждать смену запроса"
+    assert "обработай новый запрос" not in str(stale[0].content), "stale не толкает к новому запросу"
 
 
 def _flat_msgs(caps):
