@@ -778,9 +778,15 @@ def extract_pb_tour_display_name_with_llm(
     if not text:
         return None
 
+    # #343: resolve the concrete provider so the internally-built llm carries a
+    # per-provider circuit-breaker key. Stays None for an injected llm (tests) →
+    # bulkhead-only, no breaker (we can't know the injected provider).
+    effective_provider: str | None = None
     if llm is None:
-        from sreda.services.llm import get_chat_llm
+        from sreda.config.settings import get_settings
+        from sreda.services.llm import get_chat_llm, resolve_provider_pair
 
+        effective_provider = resolve_provider_pair(get_settings())[0]
         llm = get_chat_llm(temperature=0.0)
     if llm is None:
         logger.warning("post-tour name extraction: LLM unavailable")
@@ -806,6 +812,7 @@ def extract_pb_tour_display_name_with_llm(
             llm,
             messages,
             timeout_seconds=15.0,
+            provider=effective_provider,  # #343: per-provider circuit breaker
         )
     except Exception:  # noqa: BLE001
         logger.exception("post-tour name extraction: LLM invoke failed")

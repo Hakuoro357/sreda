@@ -24,6 +24,11 @@ import logging
 
 from sreda.config.settings import get_settings
 from sreda.db.session import privileged_session
+from sreda.services.webhook_security import (
+    is_webhook_deployed,
+    is_webhook_secret_configured,
+    normalized_webhook_secret,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -36,8 +41,11 @@ async def check_max_subscription_health() -> None:
     """One-shot subscription verification + cleanup."""
     settings = get_settings()
 
-    # 1. Subscription health (only if MAX enabled).
-    if settings.max_bot_token and settings.max_webhook_url:
+    # 1. Subscription health (only if MAX enabled). Единый дискриминатор
+    # «развёрнут» (#341 MAJOR B) — не сырая truthiness полей.
+    if is_webhook_deployed(
+        bot_token=settings.max_bot_token, webhook_url=settings.max_webhook_url
+    ):
         try:
             await _verify_max_subscription(settings)
         except Exception as exc:  # noqa: BLE001
@@ -75,6 +83,22 @@ async def _verify_max_subscription(settings) -> None:
         )
         return
 
+    # #341 (F1, CRITICAL, Codex R-codex MAJOR A): job-runner НЕ исполняет
+    # FastAPI lifespan → startup-гейт сюда НЕ применяется. Отдельно
+    # ОТКАЗЫВАЕМСЯ перерегистрировать webhook без секрета — иначе этот путь
+    # молча восстановил бы fail-open конфигурацию (set_webhook с secret=None).
+    if not is_webhook_secret_configured(settings.max_webhook_secret_token):
+        logger.error(
+            "max sub health: subscription stale, НО webhook-secret не настроен "
+            "— ОТКАЗ от re-register (иначе fail-open, #341)"
+        )
+        await alert_admin_async(
+            "🔴 MAX subscription stale, но SREDA_MAX_WEBHOOK_SECRET_TOKEN не "
+            "настроен — re-register ОТКЛОНЁН (иначе бот принимал бы "
+            "неаутентифицированный inbound, #341). Настройте секрет."
+        )
+        return
+
     # Stale / missing — re-register
     logger.warning(
         "max sub health: subscription stale (expected=%s, found=%s); "
@@ -84,7 +108,7 @@ async def _verify_max_subscription(settings) -> None:
     try:
         await client.set_webhook(
             url=expected,
-            secret_token=settings.max_webhook_secret_token,
+            secret_token=normalized_webhook_secret(settings.max_webhook_secret_token),
         )
         await alert_admin_async(
             f"🟡 MAX subscription stale, re-registered\n"

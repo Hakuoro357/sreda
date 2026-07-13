@@ -225,7 +225,7 @@ def test_skill_set_priority_rejects_unknown_skill(monkeypatch, tmp_path: Path) -
         session.close()
 
     assert len(telegram.sent_messages) == 1
-    assert "не найден" in telegram.sent_messages[0]["text"]
+    assert "не нашла" in telegram.sent_messages[0]["text"]  # #338 ч.3: текст без англ. ключа (g-075)
 
 
 def test_dispatcher_parses_quiet_command() -> None:

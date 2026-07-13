@@ -272,17 +272,22 @@ def _serve_existing_bundle_reads(
     from sreda.db.session import privileged_session, tenant_session
 
     tid = resolved.tenant_id
-    effective_max_chat_id: str | None = update_max_chat_id
+    effective_max_chat_id: str | None = None
     with tenant_session(tid) as ts:
         user = ts.get(User, resolved.user_id)
         if user is not None:
             if tg_bot_key is not None:
                 _stamp_last_bot_key(ts, user, tg_bot_key)
-            if update_max_chat_id is not None and user.max_chat_id != update_max_chat_id:
+            # #341 (main, security) ⊕ 5c: max_chat_id FIRST-SET-ONLY — ставим ТОЛЬКО
+            # когда в БД NULL/пусто; НЕ перезаписываем установленное (поддельный
+            # payload с чужим chat_id иначе увёл бы уведомления жертвы). Смена
+            # established — только через аутентиф. channel-link consume_link.
+            if update_max_chat_id is not None and not (user.max_chat_id or ""):
                 user.max_chat_id = update_max_chat_id  # UPDATE users own — RLS ok
                 ts.commit()
-            if effective_max_chat_id is None:
-                effective_max_chat_id = user.max_chat_id  # fallback на stored
+            # eff = ПЕРСИСТ-значение (после first-set-only), НЕ payload — #341:
+            # `or payload` эхнул бы chat_id атакующего.
+            effective_max_chat_id = user.max_chat_id
         assistant = (
             ts.query(Assistant)
             .filter(Assistant.tenant_id == tid)
@@ -713,10 +718,15 @@ def ensure_max_user_bundle(
 
     resolved = resolve_external_identity("max", aid)
     if resolved is not None:
+        # merge #341 (main) ⊕ 5c: max_chat_id — FIRST-SET-ONLY (не перезаписываем
+        # установленное; защита от подделки chat_id) + под tenant_session (post-flip
+        # RLS). Семантику first-set-only несёт _serve_existing_bundle_reads.
         workspace_id, assistant_id, eff_chat_id = _serve_existing_bundle_reads(
             resolved, update_max_chat_id=chat_id_str,
         )
         return MaxOnboardingResult(
+            # #341: возвращаем ПЕРСИСТ-значение (eff_chat_id из БД), НЕ payload —
+            # `or chat_id_str` эхнул бы payload атакующего, если персист пуст.
             False, aid, eff_chat_id, resolved.tenant_id, workspace_id,
             resolved.user_id, assistant_id,
         )

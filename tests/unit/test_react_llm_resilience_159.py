@@ -253,7 +253,7 @@ async def test_task_invoke_uses_settings_timeout(db_session, monkeypatch):
     st_mod.get_settings.cache_clear()
     seen: list[float] = []
 
-    def _spy(runnable, messages, *, timeout_seconds=60.0):
+    def _spy(runnable, messages, *, timeout_seconds=60.0, provider=None):
         seen.append(timeout_seconds)
         return AIMessage(content="spy-task-ok")  # без tool_calls → ход завершается
 
@@ -281,7 +281,7 @@ async def test_chat_fact_invoke_uses_settings_timeout(db_session, monkeypatch):
     st_mod.get_settings.cache_clear()
     seen: list[float] = []
 
-    def _spy(runnable, messages, *, timeout_seconds=60.0):
+    def _spy(runnable, messages, *, timeout_seconds=60.0, provider=None):
         seen.append(timeout_seconds)
         return AIMessage(content="spy-chat-ok")  # без tool_calls → ход завершается
 

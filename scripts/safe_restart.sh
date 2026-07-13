@@ -223,11 +223,18 @@ if [ -n "$MAX_TOKEN" ]; then
             sleep 2
 
             log "phase 4b: setWebhook (MAX) — пропущен, добавится когда настроим webhook URL"
-            # TODO: после настройки MAX webhook URL раскомментировать (использует ${MAX_BASE} + $CA_OPT):
-            # curl -sS $CA_OPT -X POST "${MAX_BASE}/subscriptions" \
-            #     -H "Authorization: ${MAX_TOKEN}" \
-            #     -H "Content-Type: application/json" \
-            #     -d "{\"url\":\"https://bot.sredaspace.ru/webhooks/max/sreda\",\"secret\":\"${MAX_SECRET}\",\"update_types\":[\"message_created\",\"message_callback\",\"bot_started\"]}"
+            # TODO: после настройки MAX webhook URL раскомментировать (использует ${MAX_BASE} + $CA_OPT).
+            # #341 (F1, CRITICAL): НЕ регистрировать MAX webhook без секрета — иначе
+            # роут принимал бы неаутентифицированный inbound (fail-open класс). При
+            # раскомментировании ОБЯЗАТЕЛЬНО сохранить guard [ -n "$MAX_SECRET" ] ниже:
+            # if [ -z "$MAX_SECRET" ]; then
+            #     log "  ОТКАЗ: SREDA_MAX_WEBHOOK_SECRET_TOKEN пуст — setWebhook пропущен (fail-open guard #341)"
+            # else
+            #     curl -sS $CA_OPT -X POST "${MAX_BASE}/subscriptions" \
+            #         -H "Authorization: ${MAX_TOKEN}" \
+            #         -H "Content-Type: application/json" \
+            #         -d "{\"url\":\"https://bot.sredaspace.ru/webhooks/max/sreda\",\"secret\":\"${MAX_SECRET}\",\"update_types\":[\"message_created\",\"message_callback\",\"bot_started\"]}"
+            # fi
 
             rm -f "$MAX_CA"
             ;;
@@ -289,6 +296,29 @@ for bot_key in $BOT_KEYS; do
     log "FATAL: поллер для ${bot_key} не активен после рестарта (токен настроен, поллер обязателен)"
     exit 5
 done
+
+# ============ Phase 6: onboarding smoke (отчёт, НЕ гейт) ============
+# Мера B пост-мортема vex-assistant#331 (#334): после рестарта гоняем сквозной
+# онбординг-smoke по каждому тиру (крэш free-тира был невидим канарейке основного
+# бота). ТОЛЬКО ОТЧЁТ — exit-код safe_restart НЕ меняет: деплой ручной, решение
+# принимает оператор по PASS/FAIL ниже. Скрипт сам чистит свой синтетический
+# тенант и не трогает реальные данные (ownership-пруф, см. шапку onboard_smoke.py).
+SMOKE="$(cd "$(dirname "$0")" && pwd)/onboard_smoke.py"
+if [ -f "$SMOKE" ]; then
+    for bot_key in $BOT_KEYS; do
+        log "phase 6 [${bot_key}]: онбординг-smoke"
+        smoke_rc=0
+        sudo -u sreda /opt/sreda/.venv/bin/python "$SMOKE" --bot-key "$bot_key" 2>&1 | tee -a "$LOG" || smoke_rc=$?
+        case "$smoke_rc" in
+            0) log "  ✓ [${bot_key}] онбординг-smoke PASS" ;;
+            1) log "  ✗ [${bot_key}] онбординг-smoke FAIL — онбординг СЛОМАН, разберись прежде чем считать деплой успешным" ;;
+            2) log "  ⚠ [${bot_key}] онбординг-smoke ABORT/остаток — нужно ручное внимание (см. вывод выше)" ;;
+            *) log "  ⚠ [${bot_key}] онбординг-smoke неожиданный код ${smoke_rc}" ;;
+        esac
+    done
+else
+    log "phase 6: ${SMOKE} не найден — онбординг-smoke пропущен"
+fi
 
 log "DONE: safe_restart завершён успешно"
 echo

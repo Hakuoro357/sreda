@@ -81,7 +81,8 @@ POLICY_VERSION_B2 = 2
 
 
 def compute_unified_policy(text, route, classified=None, *, base_web=True,
-                           sticky_memory_write=False):
+                           sticky_memory_write=False,
+                           prev_open_domains=frozenset()):
     """Двухъярусная политика единого пути (execute). Чистая; поведение прода не трогает (проводка — B2b).
 
     text: текст хода. route: RouteResult из route_domains(text). classified: DomainClassResult|None
@@ -107,7 +108,10 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
     if w_sig:
         # ярус (а): домен(ы) резолвит #221 (single→write; compound/нет-домена→∅→кандидат). B1 гейтит
         # САМ факт команды (route.task_signal-мину для write игнорируем — пишем только при B1-сигнале).
-        _ar, aw = compute_allowed_domains(route, classified)
+        # #352: classified сюда НЕ передаём — LLM-домен на едином пути НИКОГДА не открывает write
+        # (легаси-контракт «high → read+write» остаётся на легаси-пути #221); запись по LLM-домену
+        # идёт кандидатом под человеческий confirm (ярус б).
+        _ar, aw = compute_allowed_domains(route, None)
         allowed_write |= set(aw)
         # memory-ИДИОМА (B2 субагент MAJOR): «сохрани в тайне»/«запиши в дневник» → write_cmd=True И
         # route→memory (корни памяти сохран/запиш) → был бы ПРЯМОЙ memory-write в обход confirm.
@@ -131,11 +135,38 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
             allowed_write.add("memory")
             sticky_applied = True
 
+    # R5-переделка (владелец: «не костылями»): ЕДИНЫЙ гейт продолжения - сообщение
+    # юзера НЕ несёт самостоятельной темы: ни доменных слов (route: «покупки»,
+    # «задачи», «напоминания»...), ни read-кюсов. Тогда «В 15» / «завтра в 9» /
+    # «Поставь» / «да» = продолжение открытого хода; ЛЮБОЕ доменное слово
+    # («перескажи напоминания», «что с задачами», «добавь молоко в покупки»,
+    # и даже «напоминание в 15» - осознанный residual: лишний ЧЕЛОВЕЧЕСКИЙ confirm)
+    # = обычный вход со страховкой. Ошибка строго в безопасную сторону. Никаких
+    # списков фраз: только существующие детекторы route_domains/read_cue_domains.
+    continuation: list = []
+    if not route.all_domains and not read_cues and not sticky_applied:
+        # R7 оба Codex: sticky-серия (memory) и открытый слот НЕ складываются -
+        # два прямых write-домена на themeless-ответе неоднозначны → fail-closed:
+        # активная sticky-серия побеждает (юзер в memory-контексте), слот идёт
+        # через человеческий кандидат-confirm.
+        for _d in sorted(prev_open_domains):
+            allowed_write.add(_d)
+            continuation.append(_d)
+
     allowed_read: set[str] = set()
     if base_web:
         allowed_read.add("web")
     allowed_read |= read_cues
     allowed_read |= allowed_write  # что разрешено писать — разрешено и читать (найти объект правки)
+
+    # #352: LLM-фолбэк домена (classify_domains, владелец 2026-07-11 «нахера выкидываешь результат
+    # ллм») — ТОЛЬКО чтение/загрузка раздела, write не расширяет (мутация по LLM-домену = кандидат
+    # под confirm, ярус б). Применяется лишь high (ровно один домен, строгий enum-парс); low
+    # (мусор/несколько/сбой) игнорируется — политика как без классификатора (fail-safe).
+    llm_domains: list = []
+    if classified is not None and classified.confidence == "high":
+        llm_domains = sorted(classified.domains)
+        allowed_read |= set(llm_domains)
 
     return {
         "v": POLICY_VERSION_B2,
@@ -144,5 +175,7 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
         "allowed_write": sorted(allowed_write),   # ярус (а): прямой write без confirm
         "confirm_write": True,                    # ярус (б): write вне allowed_write → кандидат+confirm (B2b)
         "signals": {"write_cmd": w_sig, "declarative": d_sig, "read_cues": sorted(read_cues),
-                    "sticky_memory": sticky_applied},
+                    "sticky_memory": sticky_applied,
+                    "turn_continuation": continuation,   # #338: наблюдаемость наследования
+                    "llm_domains": llm_domains},         # #352: что дал LLM-классификатор
     }

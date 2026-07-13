@@ -403,32 +403,40 @@ def _require_miniapp_auth(
                 user_id = onboarding.user_id
         else:
             tenant_id, user_id = resolved
-            # #138 Ф5-5c: soft-delete гейт + max_chat_id-refresh существующего юзера —
-            # под tenant_session (app+ctx): после флипа DSN эти SELECT/UPDATE на
-            # неском-скоупленной сессии вернули бы 0 (RLS). Под ctx свой тенант виден.
-            # #187 Phase 4a — гейт ДО мутации. Codex R1 MAJOR #4: refresh max_chat_id
-            # если изменился (пересоздание MAX-аккаунта → новый chat_id).
+            # #138 Ф5-5c ⊕ #341 (security): под tenant_session (app+ctx) —
+            # после флипа DSN эти SELECT/UPDATE на нескоупленной сессии вернули бы
+            # 0 (RLS); под ctx свой тенант виден. #187 Phase 4a — гейт soft-delete
+            # ДО мутации (удалён existing MAX-тенант → 410 без записи).
+            # #341 (F1, CRITICAL, Codex R-codex MAJOR D): max_chat_id FIRST-SET-ONLY —
+            # ставим ТОЛЬКО когда сейчас NULL/пусто; established chat_id меняется
+            # ТОЛЬКО через аутентифицированный channel-link (consume_link), иначе
+            # поддельный initData увёл бы уведомления жертвы. read-then-write не
+            # эксплуатируем (значение из HMAC-initData того же юзера), но держим
+            # инвариант единым с онбордингом. Гейт только для уже резолвленного
+            # тенанта; lazy-provision/race-ветки сюда не попадают (тенант только
+            # что создан, всегда активен).
             from sreda.db.models.core import User
+            from sqlalchemy import or_ as _or, update as _update
             from sreda.db.session import tenant_session as _tenant_session
             with _tenant_session(tenant_id) as _ts:
                 _gate_miniapp_tenant_active(_ts, tenant_id)
                 if max_user.max_chat_id:
                     try:
-                        user_row = _ts.get(User, user_id)
-                        if (
-                            user_row is not None
-                            and user_row.max_chat_id != max_user.max_chat_id
-                        ):
-                            logger.info(
-                                "miniapp auth: refreshing max_chat_id user=%s "
-                                "old=%r new=%s",
-                                user_id, user_row.max_chat_id, max_user.max_chat_id,
-                            )
-                            user_row.max_chat_id = max_user.max_chat_id
-                            _ts.commit()
+                        logger.info(
+                            "miniapp auth: first-set max_chat_id (if unset) user=%s",
+                            user_id,
+                        )
+                        _ts.execute(
+                            _update(User)
+                            .where(User.id == user_id)
+                            .where(_or(User.max_chat_id.is_(None), User.max_chat_id == ""))
+                            .values(max_chat_id=max_user.max_chat_id)
+                            .execution_options(synchronize_session=False)
+                        )
+                        _ts.commit()
                     except Exception:  # noqa: BLE001
                         logger.warning(
-                            "miniapp auth: max_chat_id refresh failed user=%s",
+                            "miniapp auth: max_chat_id first-set failed user=%s",
                             user_id, exc_info=True,
                         )
                         _ts.rollback()
@@ -2223,8 +2231,13 @@ async def channel_link_start(
         target_channel = "telegram"
 
     from sreda.services.channel_linking import is_account_already_linked
+    # #341 (Codex R-codex R2 MAJOR D-follow-up): исключаем самого инициатора —
+    # он вправе пере-инициировать линк, чтобы ОБНОВИТЬ свой chat_id (смена
+    # MAX-чата). Коллизии с другими юзерами тенанта блокируются (409); все
+    # cross-account/cross-tenant коллизии добивает consume_link.
     if is_account_already_linked(session, tenant_id=tenant_id,
-                                 target_channel=target_channel):
+                                 target_channel=target_channel,
+                                 exclude_user_id=source_user_id):
         raise HTTPException(409, "already_linked")
 
     # Resolve per-bot username/shortname for the deep-link.

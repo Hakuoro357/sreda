@@ -2061,7 +2061,7 @@ async def _handle_max_link_confirm_cb(
     elif outcome.error == "not_found_or_expired":
         reply_text = "Ссылка истекла или уже использована."
     else:
-        reply_text = f"Не удалось связать: {outcome.error or 'неизвестная ошибка'}"
+        reply_text = "Не удалось связать аккаунты. Попробуй ещё раз или напиши администратору."
 
     if not settings.max_bot_token:
         return

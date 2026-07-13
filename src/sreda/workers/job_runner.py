@@ -179,6 +179,18 @@ async def run_job_loop_async() -> None:
     except Exception:  # noqa: BLE001
         logger.exception("job_runner: overview refresh loop failed to start")
 
+    # #335 (мера D пост-мортема vex#331): алерт на крэши ходов по срезам
+    # (канал, бот) + классы ошибок из логов. Спавн защищён — сбой импорта/
+    # конфига оставляет воркер жить без монитора, а не роняет на старте.
+    crash_alert_task: asyncio.Task | None = None
+    try:
+        from sreda.workers.crash_alert_monitor import run_crash_alert_loop
+        crash_alert_task = asyncio.create_task(
+            run_crash_alert_loop(), name="crash_alert_monitor",
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("job_runner: crash alert monitor failed to start")
+
     try:
         while True:
             try:
@@ -189,7 +201,7 @@ async def run_job_loop_async() -> None:
             if processed == 0:
                 await asyncio.sleep(interval)
     finally:
-        for task in (health_task, svo_task, overview_task):
+        for task in (health_task, svo_task, overview_task, crash_alert_task):
             if task is None:
                 continue
             task.cancel()
