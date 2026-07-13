@@ -138,6 +138,30 @@ def test_queue_dispatch_reason_is_registered_maintenance():
         assert s.execute
 
 
+def test_assert_runtime_role_noop_on_non_postgres(monkeypatch):
+    """#138 Р4: assert_runtime_role — no-op на не-Postgres (unit/sqlite): dialect-
+    guard. Иначе юнит-старт (sqlite) падал бы на current_user≠ожидаемого. На PG
+    энфорс (raise при несовпадении) проверяется живым смоком/PG-сьютом."""
+    from sqlalchemy import create_engine
+
+    eng = create_engine("sqlite:///:memory:")
+    monkeypatch.setattr(dbs, "get_engine", lambda: eng)
+    # Любое expected — на sqlite ассерт молчит (dialect != postgresql).
+    dbs.assert_runtime_role("sreda_app")  # не бросает
+
+
+def test_runtime_role_assert_setting_env(monkeypatch):
+    """#138 Р4 (флип): поле runtime_role_assert по умолчанию None (инертно до
+    флипа) и читается из SREDA_RUNTIME_ROLE_ASSERT. Пустой env → None → lifespan
+    пропускает ассерт (старт под owner не падает)."""
+    from sreda.config.settings import Settings
+
+    monkeypatch.delenv("SREDA_RUNTIME_ROLE_ASSERT", raising=False)
+    assert Settings().runtime_role_assert is None
+    monkeypatch.setenv("SREDA_RUNTIME_ROLE_ASSERT", "sreda_app")
+    assert Settings().runtime_role_assert == "sreda_app"
+
+
 @pytest.mark.pg
 def test_integration_rls_under_app_role_isolates_tenants():
     """Плейсхолдер integration-теста (реальный Postgres под ролью sreda_app): два тенанта,

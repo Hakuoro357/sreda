@@ -27,10 +27,34 @@ def session():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     sess = sessionmaker(bind=engine)()
+    # sreda_free тариф — в проде всегда есть (миграция 0041); провижн без него
+    # теперь бросает (R2-2 атомарность). Сеем как прод-предпосылку.
+    from sreda.db.models.billing import SubscriptionPlan
+    sess.add(SubscriptionPlan(
+        id="plan_free", plan_key="sreda_free", feature_key="housewife_assistant",
+        title="Free", description="", price_rub=0,
+    ))
+    sess.commit()
     try:
         yield sess
     finally:
         sess.close()
+
+
+@pytest.fixture(autouse=True)
+def _identity_phase_uses_session(session, monkeypatch):
+    """#138 Ф5-5b: identity-фаза (резолв+провижн) на отдельной privileged_session;
+    в юните стабаем на sqlite-сессию теста."""
+    from contextlib import contextmanager
+
+    import sreda.db.session as dbs
+
+    @contextmanager
+    def _stub(arg):
+        yield session
+
+    monkeypatch.setattr(dbs, "privileged_session", _stub)
+    monkeypatch.setattr(dbs, "tenant_session", _stub)
 
 
 def test_new_max_user_creates_full_bundle(session):

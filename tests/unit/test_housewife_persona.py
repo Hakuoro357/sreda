@@ -47,6 +47,30 @@ def session():
         sess.close()
 
 
+@pytest.fixture(autouse=True)
+def _identity_phase_uses_session(session, monkeypatch):
+    """#138 Ф5-5c: резолв/провижн/tenant-чтения открывают свои privileged/
+    tenant сессии; в юните стабаем обе на sqlite-сессию теста + сеем sreda_free."""
+    from contextlib import contextmanager
+
+    import sreda.db.session as dbs
+    from sreda.db.models.billing import SubscriptionPlan
+
+    if session.query(SubscriptionPlan).filter_by(plan_key="sreda_free").first() is None:
+        session.add(SubscriptionPlan(
+            id="plan_free", plan_key="sreda_free",
+            feature_key="housewife_assistant", title="Free", description="", price_rub=0,
+        ))
+        session.commit()
+
+    @contextmanager
+    def _stub(arg):
+        yield session
+
+    monkeypatch.setattr(dbs, "privileged_session", _stub)
+    monkeypatch.setattr(dbs, "tenant_session", _stub)
+
+
 def test_normalize_persona_defaults_unknown_values() -> None:
     assert normalize_persona_preset(None) == DEFAULT_PERSONA_PRESET
     assert normalize_persona_preset("") == DEFAULT_PERSONA_PRESET
