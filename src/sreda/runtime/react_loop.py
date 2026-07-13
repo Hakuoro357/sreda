@@ -40,6 +40,7 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.types import Command, interrupt
 
+from sreda.config.log_redaction import safe_traceback as _safe_tb, safe_type_name as _safe_tn  # #366 PII-safe стек (module-level: log_redaction не импортит runtime → цикла нет; lazy-import в except мог упасть и замаскировать исходную ошибку, R2 terra)
 from sreda.runtime import react_trace_persist as _trace  # #192: durable-трейс хода (БД)
 from sreda.services import trace as _tltrace  # #255: timeline-буфер трейса (ContextVar, админ-вьюер)
 from sreda.runtime.react_compaction import (  # #194 компакция (prompt-view) + #232 выжимка истории
@@ -1966,8 +1967,12 @@ def _maybe_alert_degraded_turn(
             dedupe_key=f"degraded:{reason}:{tenant_id}",
             both_channels=True,  # #294: деградации — в оба канала (MAX + TG), не fallback
         )
-    except Exception:  # noqa: BLE001 — алерт НЕ валит ход
-        logger.warning("react_loop: degraded-turn alert failed", exc_info=True)
+    except Exception as _aexc:  # noqa: BLE001 — алерт НЕ валит ход
+        # #366: exc_info=True здесь ОСОБО опасен — alert-body несёт user_text[:160]/
+        # reply_text[:160] (ПД юзера напрямую); при сбое INSERT дедупа они утекали в
+        # traceback. PII-safe стек вместо полного exc.
+        logger.warning("react_loop: degraded-turn alert failed type=%s at=%s",
+                       _safe_tn(_aexc), _safe_tb(_aexc))
 
 
 # #215: лимит web-инструментов на ход ПО ИНТЕНТУ (смягчён — прежний ≤1 душил факты: модель делала
@@ -3635,7 +3640,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # исключение). Парный error-ToolMessage (status="error") ОБЯЗАТЕЛЕН: нет висящего
                 # tool_call → провайдер не отвергнет AIMessage; модель видит сбой ИМЕННО этого
                 # инструмента → честный частичный отчёт named-P. wrote_unkeyed НЕ ставим.
-                logger.warning("react_loop: tool %s failed type=%s", name, type(exc).__name__)
+                logger.warning("react_loop: tool %s failed type=%s at=%s",
+                               name, _safe_tn(exc), _safe_tb(exc))
                 out.append(ToolMessage(
                     content=f"error: инструмент {name} не смог выполниться, повтори запрос.",
                     name=tc["name"], tool_call_id=tc["id"], status="error",
@@ -4943,13 +4949,17 @@ async def handle_turn(
                 _maybe_alert_degraded_turn(
                     tenant_id=tenant_id, user_id=user_id, channel=channel, turn_key=_tk_trace,
                     user_text=user_text, reply_text=str(reply), outcome=_outcome, passes=_passes_fin)
-            except Exception:  # noqa: BLE001 — трейс не валит ход
-                logger.warning("react_loop: trace finish failed", exc_info=True)
+            except Exception as _texc:  # noqa: BLE001 — трейс не валит ход
+                # #366: exc_info=True печатал str(exc) с SQL+ПД (g-039); PII-safe стек.
+                logger.warning("react_loop: trace finish failed type=%s at=%s",
+                               _safe_tn(_texc), _safe_tb(_texc))
         return reply
     except Exception as exc:  # noqa: BLE001 — цикл не должен ронять ход
-        # PII-safe: только тип ошибки + поколение, БЕЗ traceback и str(exc).
-        logger.warning("react_loop: handle_turn failed type=%s gen=%s",
-                       type(exc).__name__, gen)
+        # PII-safe: тип + поколение + СТЕК-кадры (file:line:func) + типы причин, БЕЗ
+        # str(exc) (у SQLAlchemy несёт SQL с ПД — g-039). #366: без стека диагностика
+        # прод-краша слепа (искали причину часами по одному «type=»).
+        logger.warning("react_loop: handle_turn failed type=%s gen=%s at=%s",
+                       _safe_tn(exc), gen, _safe_tb(exc))
         _transient = _is_transient_llm_exc(exc)  # #225: LLM/сеть down ≠ porча стейта
         if _persist_enabled():
             # #193/#225: durable-ключ стабилен → восстановление не через gen-bump. ТРАНЗИЕНТ (LLM/сеть
@@ -4971,8 +4981,10 @@ async def handle_turn(
                     else:
                         _DURABLE_CRASH[_dur] = n
                         _get_checkpointer().clear_pending(_dur)  # хотя бы снять залипшую паузу
-            except Exception:  # noqa: BLE001 — recovery не валит ход
-                logger.warning("react_loop: durable crash-recovery failed", exc_info=True)
+            except Exception as _dexc:  # noqa: BLE001 — recovery не валит ход
+                # #366: exc_info=True печатал str(exc) с SQL+ПД (g-039); PII-safe стек.
+                logger.warning("react_loop: durable crash-recovery failed type=%s at=%s",
+                               _safe_tn(_dexc), _safe_tb(_dexc))
         else:
             _THREAD_GEN[base] = gen + 1
         # #225: на транзиенте при durable беседа ЦЕЛА → не врём «потеряла контекст».
