@@ -83,14 +83,15 @@ class _Chat:
         return RunnableLambda(_inv)
 
 
-class _ChatSugar:
-    """Input-aware Фредди: эмитит add_task(показатель) РОВНО ОДИН раз, когда видит показатель в
+class _ChatRecord:
+    """Input-aware Фредди: эмитит add_task(показатель) РОВНО ОДИН раз, когда видит МАРКЕР показателя в
     ПОСЛЕДНЕЙ human-реплике. Моделирует реальность: current resume-путь подменяет user_text на «нет»
     (модель показатель НЕ видит → не пишет); fixed redirect-путь отдаёт показатель свежим HumanMessage
     (модель видит → пишет). Иначе (нет показателя / уже записан) — финальный ответ."""
 
-    def __init__(self, first):
-        self.first, self.n, self.recorded = first, 0, False
+    def __init__(self, first, record=SUGAR, marker="ахар"):
+        self.first, self.record, self.marker = first, record, marker
+        self.n, self.recorded = 0, False
 
     async def ainvoke(self, _msgs):
         return AIMessage(content="chat")
@@ -107,11 +108,11 @@ class _ChatSugar:
                     break
             if outer.n == 1 and outer.first is not None:
                 return outer.first
-            if "ахар" in last_h and not outer.recorded:
+            if outer.marker in last_h and not outer.recorded:
                 outer.recorded = True
                 return AIMessage(content="", tool_calls=[
-                    {"name": "add_task", "args": {"title": SUGAR}, "id": f"s{outer.n}"}])
-            return AIMessage(content="Записала показатель сахара.")
+                    {"name": "add_task", "args": {"title": outer.record}, "id": f"s{outer.n}"}])
+            return AIMessage(content="Записала показатель.")
         return RunnableLambda(_inv)
 
 
@@ -161,25 +162,23 @@ def _durable_saver(tmp_path, name):
 
 
 # ─────────── юнит: data_record_signal ───────────
-def test_data_record_signal():
-    """#362: число (цифрой ИЛИ словом) = знак декларативной записи; отказ/эхо/без числа/FP-слова → False."""
-    from sreda.runtime.react_signals import data_record_signal as f
-    # запись показателя — цифрами
-    for t in (SUGAR, "сахар 16 и 2", "16.2", "давление 120 на 80", "вес 80", "пульс 72"):
-        assert f(t), f"{t!r} должен быть записью показателя (цифры)"
-    # R2 (оба Codex MAJOR): голосовые числа СЛОВАМИ
-    for t in ("сахар шестнадцать и два", "давление сто двадцать на восемьдесят",
-              "вес восемьдесят", "пульс семьдесят два"):
-        assert f(t), f"{t!r} должен быть записью показателя (числа словами)"
-    # R2 (оба Codex MAJOR): ведущее ОТРИЦАНИЕ с числовым хвостом = отказ, НЕ запись
-    for t in ("нет, 16", "нет 16", "отмена, задача 5", "не надо 16", "неа"):
-        assert not f(t), f"{t!r} — отказ (ведущее отрицание), НЕ запись"
-    # не запись: эхо/да-нет/без числа/пусто
-    for t in ("сахар", "удали", "покажи покупки", "да", "нет", "отмена", "", "какой у меня вес"):
-        assert not f(t), f"{t!r} НЕ должен считаться записью показателя"
-    # R2: FP-слова, содержащие СТЕМ числительного, но НЕ числительные (границы слова!)
-    for t in ("семья", "стоп", "стол", "пятница", "пятно", "одинокий", "сорока", "история"):
-        assert not f(t), f"{t!r} — обычное слово, НЕ число (ложный редирект недопустим)"
+def test_confirm_reply_is_noise():
+    """#362 R3 (протокол-семантика): на confirm-паузе НЕ-содержательная реплика (эхо/filler/чистый отказ)
+    → noise=True (resume/fail-closed); СОДЕРЖАТЕЛЬНАЯ (запись любой формы/новый запрос/dual-intent) → False."""
+    from sreda.runtime.react_signals import confirm_reply_is_noise as n
+    # noise=True — эхо-подтверждение / filler (→ fail-closed #316/#267)
+    for t in ("", "ок", "окей", "конечно", "давай", "ну давай", "удали", "удалите", "ок удали",
+              "давай удаляй", "удаляй", "ок удаляй", "да удали", "удали пожалуйста"):
+        assert n(t), f"{t!r} — эхо/filler, должно быть noise (не редирект)"
+    # noise=True — ЧИСТЫЙ отказ (ведущее отрицание + пустой/числовой/id-хвост, цифрой И словом)
+    for t in ("нет, 16", "нет 16", "отмена, задача 5", "не надо 16", "отмена, задача пять",
+              "нет, шестнадцать"):
+        assert n(t), f"{t!r} — чистый отказ, должно быть noise (честная отмена #321)"
+    # noise=False — СОДЕРЖАТЕЛЬНОЕ: запись цифрой/словом/КАЧЕСТВЕННАЯ, новый запрос, dual-intent
+    for t in (SUGAR, "сахар 16 и 2", "16.2", "давление сто двадцать на восемьдесят",
+              "температура высокая", "сахар низкий", "самочувствие плохое",
+              "покажи покупки", "добавь молоко в покупки", "нет, сахар 16"):
+        assert not n(t), f"{t!r} — содержательное, должно РЕДИРЕКТИТЬ (не noise)"
 
 
 # ─────────── юнит: _should_redirect_on_pause (confirm-ветка) ───────────
@@ -187,12 +186,14 @@ def test_should_redirect_declarative_record_362():
     """#362: декларативная запись показателя на confirm-паузе → redirect (свежий ход), НЕ ложная отмена.
     #321 сохранён: «нет»/«отмена» → НЕ redirect (честная отмена). #316: голое «удали» → НЕ redirect."""
     f = react_loop._should_redirect_on_pause
-    # запись показателя на confirm → redirect (было False → ложная «Отменила»); цифрами И словами
+    # запись показателя на confirm → redirect (было False → ложная «Отменила»); цифрами, словами,
+    # КАЧЕСТВЕННАЯ (R3, оба Codex MAJOR — «температура высокая» без числа тоже терялась), dual-intent
     for t in (SUGAR, "сахар 16 и 2", "16.2", "давление 120 на 80",
-              "сахар шестнадцать и два", "вес восемьдесят"):
+              "сахар шестнадцать и два", "вес восемьдесят",
+              "температура высокая", "сахар низкий", "нет, сахар 16"):
         assert f(t, is_confirm_pause=True), f"confirm: запись {t!r} должна redirect (свежий ход)"
     # честная отмена #321 — НЕ redirect (уходит в resume→honest «Отменила»); в т.ч. с числовым хвостом
-    for t in ("нет", "отмена", "не надо", "нет, 16", "отмена, задача 5"):
+    for t in ("нет", "отмена", "не надо", "нет, 16", "отмена, задача 5", "нет, шестнадцать"):
         assert not f(t, is_confirm_pause=True), f"confirm: {t!r} — честная отмена, НЕ redirect"
     # аффирматив — НЕ redirect (штатный resume «да»)
     for t in ("да", "ага", "подтверждаю"):
@@ -205,35 +206,42 @@ def test_should_redirect_declarative_record_362():
         assert not f(t, is_confirm_pause=False), f"ask_human: {t!r} — валидный ОТВЕТ, НЕ redirect"
 
 
-# ─────────── e2e: ложная отмена убрана + показатель записан (ассерт на состояние данных) ───────────
-def test_e2e_declarative_record_not_falsely_cancelled_362(install, monkeypatch, tmp_path):
+# ─────────── e2e: ложная отмена убрана + показатель дошёл до записи ───────────
+@pytest.mark.parametrize("record,marker", [
+    (SUGAR, "ахар"),                 # числовая запись (прод-инцидент)
+    ("температура высокая", "емператур"),  # R3 (оба Codex MAJOR): КАЧЕСТВЕННАЯ запись без числа
+])
+def test_e2e_declarative_record_not_falsely_cancelled_362(install, monkeypatch, tmp_path, record, marker):
     """#362 e2e (чеклист issue), ДВА ассерта:
-    (а) «Сахар утром 16 и 2» на живой confirm-паузе → ответ НЕ «Отменила» (свежий ход, не ложная отмена);
-    (б) АССЕРТ НА СОСТОЯНИЕ ДАННЫХ — показатель РЕАЛЬНО записан (add_task исполнен с текстом показателя).
+    (а) декларативная запись показателя на живой confirm-паузе → ответ НЕ «Отменила» (свежий ход);
+    (б) СОСТОЯНИЕ ДАННЫХ — показатель дошёл до записи: инструмент add_task ВЫЗВАН с payload показателя
+        (детерминированная идемпотентная запись живёт в сервисе; здесь бьём диспатч+payload+confirm-барьер,
+        не storage-слой).
 
     Без фикса: R2 → «Отменила, ничего не делаю.» + inv пуст (показатель дискарден: resume подменяет
     user_text на «нет», модель показатель не видит) → оба ассерта КРАСНЫЕ."""
-    saver = _durable_saver(tmp_path, "ck362e.db")
+    saver = _durable_saver(tmp_path, f"ck362e-{marker}.db")
     monkeypatch.setattr(react_loop, "_persist_enabled", lambda: True)
     monkeypatch.setattr(react_loop, "_get_checkpointer", lambda: saver)
     inv = install()
-    freddie = _ChatSugar(_ai_call("add_task", "c1", title="проверка"))  # turn1 → candidate-confirm P1
+    thread = f"e362{marker}"
+    freddie = _ChatRecord(_ai_call("add_task", "c1", title="проверка"), record=record, marker=marker)
 
-    r1 = _turn(freddie, thread="e362", text=UNSIGNALLED)
+    r1 = _turn(freddie, thread=thread, text=UNSIGNALLED)
     assert getattr(r1, "awaiting_confirm", False) is True, r1  # живая пауза P1
 
-    r2 = _turn(freddie, thread="e362", text=SUGAR)
+    r2 = _turn(freddie, thread=thread, text=record)
     # (а) НЕ ложная отмена
     assert OTMENILA not in str(r2), f"запись показателя НЕ должна давать «Отменила»: {r2!r}"
     # свежий ход поднял НОВУЮ candidate-паузу под показатель (universal confirm; НЕ молчаливая запись)
     assert getattr(r2, "awaiting_confirm", False) is True, f"ожидали свежий confirm под показатель: {r2!r}"
     assert inv.get("add_task", 0) == 0, "до подтверждения запись НЕ исполняется (нет молчаливой мутации)"
 
-    # (б) показатель дошёл до записи: подтверждаем свежую паузу → add_task ИСПОЛНЕН с текстом показателя
-    r3 = _turn(freddie, thread="e362", text="да")
-    assert inv.get("add_task", 0) == 1, "показатель должен быть ЗАПИСАН РОВНО раз (add_task исполнен), не потерян"
-    assert inv.get("add_task_title") == SUGAR, \
-        f"записан именно показатель: {inv.get('add_task_title')!r}"
+    # (б) показатель дошёл до записи: подтверждаем свежую паузу → add_task ВЫЗВАН с payload показателя
+    r3 = _turn(freddie, thread=thread, text="да")
+    assert inv.get("add_task", 0) == 1, "показатель должен дойти до записи РОВНО раз (add_task вызван), не потерян"
+    assert inv.get("add_task_title") == record, \
+        f"инструмент вызван именно с показателем: {inv.get('add_task_title')!r}"
     assert OTMENILA not in str(r3), r3
 
 
@@ -278,10 +286,11 @@ def test_genuine_decline_with_number_tail_still_honest_362(install, monkeypatch,
     assert inv.get("add_task", 0) == 0, "отказ → мутация НЕ исполнена"
 
 
-def test_redirect_note_delivered_to_model_362(install, monkeypatch, tmp_path):
-    """#362 R2 (Codex terra CRITICAL + sol MAJOR): на РЕДИРЕКТЕ модель получает директиву «не сообщать
-    об отмене, обработать новый запрос» — иначе withdrawal-ToolMessage «вызов инструмента отменён» +
-    availability-хвост провоцируют паррот «Отменила» (2-й прод-симптом). Бьём реальную доставку в модель."""
+def test_antiparrot_clause_in_withdrawal_persists_362(install, monkeypatch, tmp_path):
+    """#362 R3 (Codex sol+terra MAJOR): анти-паррот-клауза ЖИВЁТ В САМОМ withdrawal-ToolMessage → доходит
+    до модели на редиректе И переживает ВСЕ проходы хода (в отличие от consume-and-clear директивы). Без
+    неё «вызов инструмента отменён» + availability-хвост провоцируют паррот «Отменила» (2-й прод-симптом).
+    Проверяем доставку и на pass-1 (с показателем), и на pass-2 (после промежуточного tool-call)."""
     saver = _durable_saver(tmp_path, "ck362rn.db")
     monkeypatch.setattr(react_loop, "_persist_enabled", lambda: True)
     monkeypatch.setattr(react_loop, "_get_checkpointer", lambda: saver)
@@ -301,8 +310,10 @@ def test_redirect_note_delivered_to_model_362(install, monkeypatch, tmp_path):
                 outer.n += 1
                 captured.append(list(msgs))
                 if outer.n == 1:
-                    return outer.first
-                return AIMessage(content="Записала показатель.")
+                    return outer.first          # turn1 → candidate-confirm
+                if outer.n == 2:                 # redirect pass-1 → промежуточный tool-call
+                    return _ai_call("list_reminders", "l1")
+                return AIMessage(content="Готово.")  # redirect pass-2 → финал
             return RunnableLambda(_inv)
 
     install()
@@ -310,12 +321,15 @@ def test_redirect_note_delivered_to_model_362(install, monkeypatch, tmp_path):
     r1 = _turn(freddie, thread="rn362", text=UNSIGNALLED)
     assert getattr(r1, "awaiting_confirm", False) is True, r1
     n_before = len(captured)
-    _turn(freddie, thread="rn362", text=SUGAR)  # redirect → свежий ход
+    _turn(freddie, thread="rn362", text=SUGAR)  # redirect → свежий ход (2 прохода модели)
     fresh_inputs = captured[n_before:]
-    flat = _flat_msgs(fresh_inputs)
-    assert "вызов инструмента отменён" in flat, "премиса: withdrawal-ToolMessage в истории свежего хода"
-    assert "НЕ отвечай «отменила»" in flat or "обработай ТЕКУЩИЙ запрос" in flat, \
-        "директива «не докладывай отмену, обработай новый запрос» должна дойти до модели на редиректе"
+    assert len(fresh_inputs) >= 2, "ожидали ≥2 прохода модели на редиректе (иначе persist-проверка пуста)"
+    flat_all = _flat_msgs(fresh_inputs)
+    assert "вызов инструмента отменён" in flat_all, "премиса: withdrawal-ToolMessage в истории свежего хода"
+    # клауза ПЕРСИСТИТ: доходит на КАЖДОМ проходе (withdrawal остаётся в истории, не consume-and-clear)
+    for i, cap in enumerate(fresh_inputs[:2]):
+        assert "НЕ сообщать об этом как об отмене" in _flat_msgs([cap]), \
+            f"анти-паррот-клауза должна дойти до модели на проходе {i + 1} (persist)"
 
 
 def _flat_msgs(caps):

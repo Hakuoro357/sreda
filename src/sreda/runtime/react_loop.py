@@ -2054,18 +2054,19 @@ def _should_redirect_on_pause(user_text: str, is_confirm_pause: bool) -> bool:
     подтверждение «удали»/«ок удали» (иначе → A0 «нет», #267 fail-closed удаления); classify-конъюнкт
     оставлен защитно (при is_new он всегда "redirect"). ask_human: просто сигнал нового запроса — у
     открытого вопроса нет да/нет-действия, которое можно «переэхнуть», поэтому эхо-гейта нет."""
-    from sreda.runtime.react_signals import bare_command_echo, data_record_signal
+    from sreda.runtime.react_signals import confirm_reply_is_noise
     is_new = _is_new_request_on_pause(user_text)
     if is_confirm_pause:
-        # #362: у confirm-паузы валидны ТОЛЬКО «да»/«нет»; содержательная НЕ-да/нет реплика = свежий
-        # ход, а не отказ. Кроме командного сигнала (`is_new`) редиректим и ДЕКЛАРАТИВНУЮ запись
-        # показателя с числом («Сахар утром 16 и 2») — иначе она проваливалась в resume→ложная
-        # «Отменила» + ПОТЕРЯ показателя (регрессия честной-отмены #321 на не-отменяющем сообщении).
-        # bare_command_echo («удали») по-прежнему НЕ редирект (A0 fail-closed удаления, #316);
-        # `negate` («нет»/«отмена») → classify≠"redirect" → штатная честная отмена (#321) не тронута.
-        return (not bare_command_echo(user_text)
-                and classify_confirm_reply(user_text) == "redirect"
-                and (is_new or data_record_signal(user_text)))
+        # #362 R3 (Codex sol+terra, конвергентно R1→R2): у confirm-паузы валидны ТОЛЬКО «да»/«нет» —
+        # свободных СЛОТ-ответов нет, поэтому редиректим ЛЮБОЙ СОДЕРЖАТЕЛЬНЫЙ не-да/нет ответ (запись
+        # показателя любой формы — цифрой/словом/качественная «температура высокая»; новый запрос;
+        # отказ+запись «нет, сахар 16»), КРОМЕ эхо-подтверждения/filler/чистого отказа
+        # (`confirm_reply_is_noise`). Иначе такая реплика проваливалась в resume→ложная «Отменила» +
+        # ПОТЕРЯ (регрессия честной-отмены #321 на НЕ-отменяющем сообщении). classify=="redirect"
+        # исключает точные «да»/«нет» → штатный resume; чистый отказ («нет»/«нет, 16») → noise → resume →
+        # детерминированная честная «Отменила» (#321). Эхо «удали»/«удаляй» → noise → fail-closed (#316/#267).
+        return (classify_confirm_reply(user_text) == "redirect"
+                and not confirm_reply_is_noise(user_text))
     return is_new
 
 
@@ -2079,8 +2080,14 @@ def _withdrawal_messages(last_msg) -> list:
     ИСПОЛНЕННЫМ в shadow-метрике (ok/observed). Не-AIMessage / без tool_calls → пусто (сироты нет)."""
     if not (isinstance(last_msg, AIMessage) and getattr(last_msg, "tool_calls", None)):
         return []
+    # #362 R3 (Codex sol+terra MAJOR): анти-репорт-клауза ЖИВЁТ В САМОМ withdrawal-сообщении (переживает
+    # ВСЕ проходы хода, в отличие от consume-and-clear директивы) — иначе availability-хвост «инструмент
+    # вернул отмену → скажи отменила» + это «отменён» провоцировали паррот ложной «Отменила» на редиректе.
+    # Заблокированные тестами подстроки сохранены («вызов инструмента отменён» + «не считать выполненным»).
     return [ToolMessage(
-        content="(вызов инструмента отменён: пользователь сменил запрос; не считать выполненным)",
+        content=("(вызов инструмента отменён: пользователь сменил запрос; не считать выполненным "
+                 "и НЕ сообщать об этом как об отмене — это служебное закрытие прошлого действия, "
+                 "просто обработай новый запрос)"),
         name=tc.get("name") or "tool", tool_call_id=tc.get("id") or "",
         artifact={"result_kind": "withdrawn"})
         for tc in last_msg.tool_calls if tc.get("id")]
@@ -2116,24 +2123,6 @@ def _stale_pause_note(has_pause: bool, redirect_new: bool, tenant_id: str,
             and not is_confirm and _unified_execute_for(tenant_id)):
         return ""
     return _stale_pause_directive(gap_seconds)
-
-
-def _redirect_pause_note(redirect_new: bool, tenant_id: str, persist_enabled: bool) -> str:
-    """#362 R2 (Codex terra CRITICAL + sol MAJOR): при РЕДИРЕКТЕ (новый запрос на ЖИВОЙ паузе) в историю
-    дописывается withdrawal-ToolMessage «вызов инструмента отменён…» (закрытие сироты, #316), а
-    availability-хвост велит на ОТМЕНЕ ответить «отменила, ничего не делаю». Слабая модель видит
-    «отменён» и ПАРРОТИТ отмену вместо обработки нового запроса — это 2-й прод-симптом #362 («запиши…
-    16.2» уже редиректился, но всё равно «Отменила»). Директива (через тот же consume-and-clear канал
-    stale_pause_note): withdrawal — служебное СНЯТИЕ незавершённого действия, НЕ отмена-к-докладу; НЕ
-    говорить «отменила», обработать ТЕКУЩИЙ запрос. Гейт: redirect + durable + канареечный тенант (как
-    #stale) → откат единого пути возвращает прежнее поведение (byte-identical). Пусто → без директивы."""
-    if not (redirect_new and persist_enabled and _unified_execute_for(tenant_id)):
-        return ""
-    return (
-        "Служебная заметка (НЕ пересказывай её дословно): предыдущее незавершённое действие снято "
-        "автоматически, потому что пользователь прислал НОВЫЙ запрос. Это служебное закрытие, а НЕ "
-        "отмена, о которой нужно сообщать. НЕ отвечай «отменила»/«ничего не делаю» про это — просто "
-        "обработай ТЕКУЩИЙ запрос пользователя по существу.")
 
 
 # #320.3 (#321 follow-up): объект «X» — ТОЛЬКО из человеческих confirm-вопросов «Я сейчас … «X»…»
@@ -4399,16 +4388,13 @@ async def handle_turn(
                 # (snap.next есть, а payload не читается → не трактуем как ask_human). Читается ТОЛЬКО на
                 # preflight (unified_execute — read-gate в chat — ставится под _preflight; вне него — dead work).
                 _stale_q, _stale_is_confirm, _ = _pending(snap)
-                # #362 R2 (Codex terra CRITICAL + sol MAJOR): РЕДИРЕКТ и STALE взаимоисключающи. На
-                # редиректе даём директиву «не докладывай отмену, обработай новый запрос» (иначе
-                # withdrawal-ToolMessage + availability-хвост провоцируют паррот «Отменила» — 2-й
-                # прод-симптом). На STALE — прежняя грациозно-возвратная директива (гейты внутри).
-                if _redirect_new:
-                    _stale_note = _redirect_pause_note(_redirect_new, tenant_id, _persist_enabled())
-                else:
-                    _stale_note = _stale_pause_note(
-                        bool(_stale_q), _redirect_new, tenant_id, _stale_is_confirm,
-                        _persist_enabled(), _interrupt_age_seconds(snap.created_at))
+                # #362 R3: анти-паррот отмены на редиректе перенесён В САМ withdrawal-ToolMessage
+                # (_withdrawal_messages: persists ВСЕ проходы + не конфликтует top-level с availability —
+                # Codex sol/terra R2). Здесь — только прежняя STALE-директива (гейты внутри _stale_pause_note;
+                # на redirect она возвращает "").
+                _stale_note = _stale_pause_note(
+                    bool(_stale_q), _redirect_new, tenant_id, _stale_is_confirm,
+                    _persist_enabled(), _interrupt_age_seconds(snap.created_at))
                 # #320.1: ключ/тип брошенной паузы — терминализация ряда НИЖЕ, ПОСЛЕ минтинга нового
                 # turn_key (R1 субагент MINOR: при пустом inbound_message_id новый ключ = f(thread_id) и
                 # может СОВПАСТЬ со старым → abandoned пометил бы done ряд, который start/finish свежего
