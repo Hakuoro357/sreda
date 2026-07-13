@@ -281,11 +281,17 @@ def read_cue_domains(text: str) -> frozenset[str]:
     return frozenset(out)
 
 
-# #356 R3 (sol): «список <домен>» - слово «список» лишь обёртка, домен задаёт
-# квалификатор. Без этого «покажи список задач» оставлял непокрытую группу
-# {checklists,shopping} после честного чтения задач → ложный форс-проход.
-_LIST_QUALIFIER_RE = re.compile(
-    r"списк\w*\s+(задач|дел\b|покупок|покупк|напоминани)", re.IGNORECASE)
+# #356 R3/R4 (sol/terra/субагент): «список <домен>» - слово «список» лишь обёртка,
+# домен задаёт квалификатор. Без этого «покажи список задач» оставлял непокрытую
+# группу {checklists,shopping} после честного чтения задач → ложный форс-проход.
+# R4: токен «списо?к\w*» - беглая гласная («спис-О-к»: голый «списк\w*» НЕ матчил
+# номинатив «список», и квалификатор молчал на доминирующей форме «мой список задач»);
+# квалификация PER-SPAN: каждое вхождение «списка» проверяется отдельно -
+# «список задач и список кино» даёт требования {tasks} И {checklists,shopping},
+# первый квалификатор не схлопывает чужой неквалифицированный список.
+_LIST_TOKEN_RE = re.compile(r"списо?к\w*", re.IGNORECASE)
+_LIST_QUALIFIER_TAIL_RE = re.compile(
+    r"\s+(задач|дел\b|покупок|покупк|напоминани)", re.IGNORECASE)
 _LIST_QUALIFIER_DOMAIN = {
     "задач": "tasks", "дел": "checklists", "покупок": "shopping",
     "покупк": "shopping", "напоминани": "reminders"}
@@ -293,21 +299,34 @@ _LIST_AMBIGUOUS = frozenset({"checklists", "shopping"})
 
 
 def read_cue_groups(text: str) -> tuple[frozenset, ...]:
-    """#356 R2/R3 (sol/terra/субагент): группы ТРЕБОВАНИЙ чтения по СОВПАВШИМ
+    """#356 R2-R4 (sol/terra/субагент): группы ТРЕБОВАНИЙ чтения по СОВПАВШИМ
     паттернам - каждая группа = OR (любой её домен покрывает требование), разные
     группы = AND. Различает неоднозначное ОДНО слово («список кино» → одна группа
     {checklists,shopping}) от двух явных запросов («покажи чек-листы и покупки» →
-    {checklists} И {shopping}). Квалифицированный список («список задач/покупок/
-    дел/напоминаний») схлопывается в домен квалификатора: «покажи список задач» -
-    чтение задач закрывает запрос целиком; «покажи список покупок» - требуются
-    именно покупки (чтение чек-листов не закрывает). Потребитель - гейт свежести."""
+    {checklists} И {shopping}). Квалифицированный список («мой список задач») даёт
+    домен квалификатора; неквалифицированный рядом («…и список кино») сохраняет
+    неоднозначную группу отдельным требованием. Потребитель - гейт свежести."""
     t = text or ""
     groups = [doms for pat, doms in _READ_CUES if pat.search(t)]
-    m = _LIST_QUALIFIER_RE.search(t)
-    if m:
-        _qd = _LIST_QUALIFIER_DOMAIN[m.group(1).lower().rstrip()]
-        groups = [frozenset({_qd}) if g == _LIST_AMBIGUOUS else g for g in groups]
-    return tuple(groups)
+    if _LIST_AMBIGUOUS not in groups:
+        return tuple(groups)
+    qualified: list = []
+    ambiguous_present = False
+    for m in _LIST_TOKEN_RE.finditer(t):
+        qm = _LIST_QUALIFIER_TAIL_RE.match(t, m.end())
+        if qm:
+            qualified.append(frozenset({_LIST_QUALIFIER_DOMAIN[qm.group(1).lower()]}))
+        else:
+            ambiguous_present = True
+    out: list = []
+    for g in groups:
+        if g == _LIST_AMBIGUOUS:
+            if ambiguous_present or not qualified:
+                out.append(g)
+            out.extend(qualified)
+        else:
+            out.append(g)
+    return tuple(out)
 
 
 # ── #316: МАРКЕР явного read-ЗАПРОСА (императив чтения / WH-вопрос про own-data). Отличает «покажи

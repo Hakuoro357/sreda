@@ -204,14 +204,35 @@ def test_stale_error_content_with_ok_kind_not_fresh_356():
 
 
 def test_stale_qualified_list_single_read_covers_356():
-    """R3 sol M2: «покажи список задач» - «список» лишь обёртка, домен задаёт
-    квалификатор: чтение задач закрывает запрос ЦЕЛИКОМ (нет ложного форса
-    checklists/shopping)."""
-    msgs = _turn("покажи список задач", _ai_tc("list_tasks"), _tm("list_tasks"))
+    """R3 sol M2 + R4 субагент (беглая гласная!): «мой список задач» - НОМИНАТИВ
+    «список» образует неоднозначную группу, и квалификатор обязан её схлопнуть:
+    чтение задач закрывает запрос ЦЕЛИКОМ (нет ложного форса checklists/shopping).
+    (R3-фраза «покажи список задач» группу вовсе не образует - тест был пустым.)"""
+    msgs = _turn("покажи мой список задач", _ai_tc("list_tasks"), _tm("list_tasks"))
     assert _stale_readback_domains(msgs) == frozenset()
-    msgs2 = _turn("покажи список напоминаний",
+    msgs2 = _turn("мой список напоминаний",
                   _ai_tc("list_reminders"), _tm("list_reminders"))
     assert _stale_readback_domains(msgs2) == frozenset()
+    # склонённая форма
+    msgs3 = _turn("что в списке задач", _ai_tc("list_tasks"), _tm("list_tasks"))
+    assert _stale_readback_domains(msgs3) == frozenset()
+
+
+def test_stale_two_lists_per_span_qualification_356():
+    """R4 sol/terra: «список задач и список кино» - квалификатор схлопывает ТОЛЬКО
+    своё вхождение; чтение задач НЕ закрывает неквалифицированный «список кино»
+    (оба порядка)."""
+    for phrase in ("покажи мой список задач и список кино",
+                   "покажи список кино и мой список задач"):
+        msgs = _turn(phrase, _ai_tc("list_tasks"), _tm("list_tasks"))
+        stale = _stale_readback_domains(msgs)
+        assert stale & {"checklists", "shopping"}, (phrase, stale)
+        # а чтение чек-листов ПОВЕРХ задач закрывает всё
+        msgs2 = _turn(phrase,
+                      _ai_tc("list_tasks"), _tm("list_tasks"),
+                      _ai_tc("list_checklist_items", "t2"),
+                      _tm("list_checklist_items", cid="t2"))
+        assert _stale_readback_domains(msgs2) == frozenset(), phrase
 
 
 def test_stale_no_cue_no_fire_356():
