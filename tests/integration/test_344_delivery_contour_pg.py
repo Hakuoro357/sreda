@@ -680,13 +680,16 @@ def test_reminder_worker_does_not_clobber_concurrent_snooze(pg_db, monkeypatch):
     Тест гоняет РЕАЛЬНЫЙ ``_handle_reminder_callback`` (покрывает callback-side
     лок) конкурентно с ``process_pending``. Snooze инъектируется из
     ``_enqueue_outbox_for`` (между fence и ``mark_fired``) в отдельном
-    потоке/соединении. Детерминизм БЕЗ sleep (Codex terra): ждём, пока snooze либо
-    закоммитится (baseline — лока нет), либо ЗАБЛОКИРУЕТСЯ на локе строки
-    (``pg_locks.NOT granted`` — fixed), и лишь тогда пускаем воркер в ``mark_fired``.
+    потоке/соединении. Детерминизм БЕЗ sleep (Codex sol+terra R2): двигаем воркер
+    в ``mark_fired`` только когда snooze ЛИБО закоммитился (baseline — лока нет),
+    ЛИБО заблокирован ИМЕННО нашей worker-сессией на строке — проверяем адресно
+    ``worker_pid = ANY(pg_blocking_pids(callback_pid))``, а не глобальный
+    ``pg_locks`` кластера (тот ловил бы посторонние ожидания → false-GREEN).
 
     RED на baseline (ни воркер, ни обработчик не лочат): snooze коммитится в окне
     fence→mark_fired → ``mark_fired`` перетирает → финально ``status='fired'``,
-    ``next_trigger_at=None``."""
+    ``next_trigger_at=None``. RED и при одном локе: без callback-side лока его
+    partial-UPDATE (только ``next_trigger_at``) оставит ``status='fired'``."""
     from datetime import UTC
 
     from sqlalchemy import text as _sql_text
@@ -709,27 +712,42 @@ def test_reminder_worker_does_not_clobber_concurrent_snooze(pg_db, monkeypatch):
         rid = rem.id
 
     snooze_done = threading.Event()
+    callback_ready = threading.Event()
     snooze_error: list[BaseException] = []
+    callback_pid: list[int] = []
+    threads: list[threading.Thread] = []
     fake_tg = _FakeTelegramForCallback()
     real_enqueue = _hrw.HousewifeReminderWorker._enqueue_outbox_for
 
-    def _someone_waiting_on_row_lock() -> bool:
-        # Изолированная тест-БД, одна строка → незагранённый лок = snooze ждёт
-        # наш FOR UPDATE (детерминированная замена sleep, Codex terra).
+    def _callback_blocked_by(worker_pid: int) -> bool:
+        # Адресно: заблокирован ли backend callback'а ИМЕННО worker-сессией на
+        # строке (pg_blocking_pids — рекомендация PG для конкретной блокировки).
+        if not callback_pid:
+            return False
         with S() as probe:
-            return bool(
-                probe.execute(
-                    _sql_text("SELECT count(*) FROM pg_locks WHERE NOT granted")
-                ).scalar()
-            )
+            blockers = probe.execute(
+                _sql_text("SELECT pg_blocking_pids(:p)"), {"p": callback_pid[0]}
+            ).scalar()
+        return bool(blockers) and worker_pid in blockers
 
     def enqueue_with_concurrent_snooze(self, session, reminder):
+        # PID worker-сессии, которая ДЕРЖИТ FOR UPDATE-лок строки (тот же коннект,
+        # что и s.get выше — транзакция ещё открыта).
+        worker_pid = session.execute(_sql_text("SELECT pg_backend_pid()")).scalar()
+
         # Реальный обработчик кнопки «Отложить» из uvicorn-процесса (своя сессия/
         # соединение, свой event loop). Отдельный поток — иначе его блокирующийся
         # под FOR UPDATE reread заклинил бы сам воркер.
         def run_callback():
             try:
                 with S() as cs:
+                    # PID коннекта callback'а фиксируем ДО блокирующего get: старт
+                    # транзакции пиннит коннект, дальше _handle_reminder_callback
+                    # ходит тем же коннектом (тот же PID).
+                    callback_pid.append(
+                        cs.execute(_sql_text("SELECT pg_backend_pid()")).scalar()
+                    )
+                    callback_ready.set()
                     asyncio.run(
                         _handle_reminder_callback(
                             session=cs,
@@ -744,17 +762,19 @@ def test_reminder_worker_does_not_clobber_concurrent_snooze(pg_db, monkeypatch):
                 snooze_done.set()
 
         t = threading.Thread(target=run_callback, daemon=True)
+        threads.append(t)
         t.start()
-        # Ждём, пока snooze закоммитится (baseline) ИЛИ заблокируется на нашем локе
-        # (fixed) — только тогда двигаемся к mark_fired. Без фиксированного sleep.
+        callback_ready.wait(timeout=10)  # PID callback известен
+        # Двигаем воркер в mark_fired только когда snooze ЛИБО закоммитился
+        # (baseline), ЛИБО адресно заблокирован нашей worker-сессией (fixed).
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            if snooze_done.is_set() or _someone_waiting_on_row_lock():
+            if snooze_done.is_set() or _callback_blocked_by(worker_pid):
                 break
             time.sleep(0.05)
         else:
             raise AssertionError(
-                "snooze за 20с ни закоммитился, ни заблокировался на локе — "
+                "snooze за 20с ни закоммитился, ни заблокировался worker-сессией — "
                 "тест не смог смоделировать гонку"
             )
         return real_enqueue(self, session, reminder)
@@ -764,9 +784,14 @@ def test_reminder_worker_does_not_clobber_concurrent_snooze(pg_db, monkeypatch):
         enqueue_with_concurrent_snooze,
     )
 
-    asyncio.run(HousewifeReminderWorker().process_pending(now=now))
-    # На фикс-коде snooze добивается только после commit тика (release лока).
-    assert snooze_done.wait(timeout=20), "snooze-поток не завершился за 20с (возможен deadlock)"
+    try:
+        asyncio.run(HousewifeReminderWorker().process_pending(now=now))
+        # На фикс-коде snooze добивается только после commit тика (release лока).
+        assert snooze_done.wait(timeout=20), "snooze-поток не завершился за 20с (deadlock?)"
+    finally:
+        for t in threads:
+            t.join(timeout=20)
+    assert threads and not threads[0].is_alive(), "callback-поток не завершился"
     assert not snooze_error, f"snooze-поток упал: {snooze_error!r}"
 
     with S() as s:
