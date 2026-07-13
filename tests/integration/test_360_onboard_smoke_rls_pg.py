@@ -70,7 +70,10 @@ def owner():
             {"i": PLAN_ID})
     yield eng
     for tid, chat in ((TID, CHAT), (TID_E2E, CHAT_E2E)):
-        _wipe(eng, tid, chat)
+        try:
+            _wipe(eng, tid, chat)
+        except RuntimeError:  # хеш не кеширован (тесты чата не бежали) → и сеять было некому
+            pass
     with eng.begin() as c:
         c.execute(text("DELETE FROM subscription_plans WHERE id = :i"), {"i": PLAN_ID})
     eng.dispose()
@@ -115,9 +118,16 @@ def blind_env(monkeypatch):
     _clear_engine_caches()
 
 
+_HASH_CACHE: dict[int, str] = {}
+
+
 def _signup_hash(chat: int) -> str:
-    from sreda.services.signup_abuse import hmac_signup_source
-    return hmac_signup_source(str(chat))
+    """hmac требует SREDA_TG_ACCOUNT_SALT из function-scoped conftest-фикстуры — к moment'у
+    module-teardown env уже снят. Кешируем при первом вычислении (внутри тестов)."""
+    if chat not in _HASH_CACHE:
+        from sreda.services.signup_abuse import hmac_signup_source
+        _HASH_CACHE[chat] = hmac_signup_source(str(chat))
+    return _HASH_CACHE[chat]
 
 
 def _wipe(owner_eng, tid: str, chat: int) -> None:
