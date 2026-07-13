@@ -902,7 +902,31 @@ async def _handle_reminder_callback(
     message_id = message.get("message_id") if isinstance(message, dict) else None
     original_text = (message.get("text") or "") if isinstance(message, dict) else ""
 
-    reminder = session.get(FamilyReminder, reminder_id) if reminder_id else None
+    # #344 F5 (Opus-адверсар + Codex sol, cross-process ack/snooze гонка): этот
+    # обработчик живёт в UVICORN-процессе, а reminder-fire-цикл — в JOB_RUNNER.
+    # Читаем строку под ``SELECT ... FOR UPDATE`` (PG-only, как воркер) и держим
+    # лок до ``session.commit()`` ниже. Это НЕ просто «прочитать посвежее»:
+    # ``acknowledge``/``snooze`` — read-modify-write, а SQLAlchemy кладёт в UPDATE
+    # только реально изменившиеся поля. Без лока snooze мог прочитать ``pending``
+    # ДО того как воркер закоммитил ``fired``; тогда его UPDATE НЕ содержал бы
+    # ``status`` (pending→pending не dirty) и лёг бы поверх воркерского ``fired``,
+    # оставив рассинхрон ``status='fired'`` + ``next_trigger_at=+10мин`` (snooze
+    # тихо потерян). Под FOR UPDATE обработчик дожидается воркера и перечитывает
+    # СВЕЖЕЕ состояние (``fired``) → ``fired→pending`` становится настоящим
+    # изменением и попадает в UPDATE. Симметрично воркер ждёт наш commit и его
+    # fence перечитывает свежие status/next_trigger. Лок держится только на время
+    # in-memory-мутации (сеть — answer/edit — уже ПОСЛЕ commit).
+    _rem_bind = session.bind
+    _rem_for_update = (
+        {"key_share": False}
+        if _rem_bind is not None and _rem_bind.dialect.name == "postgresql"
+        else None
+    )
+    reminder = (
+        session.get(FamilyReminder, reminder_id, with_for_update=_rem_for_update)
+        if reminder_id
+        else None
+    )
     if reminder is None:
         if callback_id:
             try:

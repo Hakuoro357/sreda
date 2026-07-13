@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -624,3 +625,167 @@ def test_reminder_delivery_dedup_holds_under_two_workers(pg_db):
     with S() as s:
         n = s.query(OutboxMessage).filter(OutboxMessage.tenant_id == TENANT).count()
     assert n == 1, f"reminder delivery-dedup нарушен: {n} outbox-строк (ожидалась 1)"
+
+
+class _FakeTelegramForCallback:
+    """Мини-заглушка TelegramClient для реального ``_handle_reminder_callback``:
+    сетевые вызовы идут ПОСЛЕ ``session.commit()`` — важно, что лок к тому моменту
+    уже отпущен, поэтому здесь просто фиксируем факт вызова."""
+
+    def __init__(self) -> None:
+        self.answered: list[str] = []
+        self.edited: list[str] = []
+
+    async def answer_callback_query(self, callback_id, text=None, **kw):
+        self.answered.append(str(text))
+        return {"ok": True}
+
+    async def edit_message_text(self, chat_id, message_id, text, reply_markup=None, **kw):
+        self.edited.append(str(text))
+        return {"ok": True}
+
+
+def _snooze_callback_query(rid: str) -> dict:
+    return {
+        "id": "cb_344",
+        "message": {
+            "chat": {"id": "424242"},
+            "message_id": 55,
+            "text": "🔔 Полить цветы",
+        },
+    }
+
+
+def test_reminder_worker_does_not_clobber_concurrent_snooze(pg_db, monkeypatch):
+    """#344 F5 (Opus-адверсар + Codex sol, MAJOR cross-process ack/snooze гонка).
+
+    Кнопки «Сделал ✅»/«Отложить ⏰» обрабатываются в UVICORN-процессе
+    (``telegram_bot._handle_reminder_callback``), а reminder-fire-цикл крутится в
+    ОТДЕЛЬНОМ JOB_RUNNER — второй конкурентный писатель в ``family_reminders`` уже
+    при ОДНОМ воркере. Обе стороны читали строку plain ``s.get`` (без ``FOR
+    UPDATE``). Гонка НЕ закрывается локом ТОЛЬКО у воркера: ``snooze`` — это
+    read-modify-write, а SQLAlchemy кладёт в UPDATE лишь реально изменившиеся
+    поля. ``snooze`` не меняет ``status`` (``pending``→``pending`` не dirty).
+    Поэтому даже если воркер под локом закоммитит ``fired``, слепой (без re-read)
+    UPDATE обработчика поставит только ``next_trigger_at=+10мин`` и оставит
+    рассинхрон ``status='fired'`` + ``next_trigger_at`` в будущем → snooze тихо
+    потерян (напоминание не вернётся: ``due_now`` фильтрует ``status='pending'``).
+
+    Фикс (обе стороны берут ``SELECT ... FOR UPDATE`` и держат лок до commit):
+    воркер и обработчик СЕРИАЛИЗУЮТСЯ на строке. Обработчик, дождавшись воркера,
+    перечитывает СВЕЖЕЕ состояние (``fired``) → ``fired→pending`` становится
+    настоящим изменением и попадает в UPDATE → финально ``status='pending'`` с
+    отложенным ``next_trigger_at``.
+
+    Тест гоняет РЕАЛЬНЫЙ ``_handle_reminder_callback`` (покрывает callback-side
+    лок) конкурентно с ``process_pending``. Snooze инъектируется из
+    ``_enqueue_outbox_for`` (между fence и ``mark_fired``) в отдельном
+    потоке/соединении. Детерминизм БЕЗ sleep (Codex terra): ждём, пока snooze либо
+    закоммитится (baseline — лока нет), либо ЗАБЛОКИРУЕТСЯ на локе строки
+    (``pg_locks.NOT granted`` — fixed), и лишь тогда пускаем воркер в ``mark_fired``.
+
+    RED на baseline (ни воркер, ни обработчик не лочат): snooze коммитится в окне
+    fence→mark_fired → ``mark_fired`` перетирает → финально ``status='fired'``,
+    ``next_trigger_at=None``."""
+    from datetime import UTC
+
+    from sqlalchemy import text as _sql_text
+
+    import sreda.workers.housewife_reminder_worker as _hrw
+    from sreda.db.models.housewife import FamilyReminder
+    from sreda.db.session import get_session_factory
+    from sreda.services.housewife_reminders import HousewifeReminderService
+    from sreda.services.telegram_bot import _handle_reminder_callback
+    from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
+
+    now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    S = get_session_factory()
+    with S() as s:
+        rem = HousewifeReminderService(s).schedule(
+            tenant_id=TENANT, user_id=USER,
+            title="Полить цветы", trigger_at=now - timedelta(minutes=1),
+        )
+        s.commit()
+        rid = rem.id
+
+    snooze_done = threading.Event()
+    snooze_error: list[BaseException] = []
+    fake_tg = _FakeTelegramForCallback()
+    real_enqueue = _hrw.HousewifeReminderWorker._enqueue_outbox_for
+
+    def _someone_waiting_on_row_lock() -> bool:
+        # Изолированная тест-БД, одна строка → незагранённый лок = snooze ждёт
+        # наш FOR UPDATE (детерминированная замена sleep, Codex terra).
+        with S() as probe:
+            return bool(
+                probe.execute(
+                    _sql_text("SELECT count(*) FROM pg_locks WHERE NOT granted")
+                ).scalar()
+            )
+
+    def enqueue_with_concurrent_snooze(self, session, reminder):
+        # Реальный обработчик кнопки «Отложить» из uvicorn-процесса (своя сессия/
+        # соединение, свой event loop). Отдельный поток — иначе его блокирующийся
+        # под FOR UPDATE reread заклинил бы сам воркер.
+        def run_callback():
+            try:
+                with S() as cs:
+                    asyncio.run(
+                        _handle_reminder_callback(
+                            session=cs,
+                            telegram_client=fake_tg,
+                            callback_query=_snooze_callback_query(rid),
+                            data=f"rem_snooze:{rid}",
+                        )
+                    )
+                snooze_done.set()
+            except BaseException as exc:  # noqa: BLE001
+                snooze_error.append(exc)
+                snooze_done.set()
+
+        t = threading.Thread(target=run_callback, daemon=True)
+        t.start()
+        # Ждём, пока snooze закоммитится (baseline) ИЛИ заблокируется на нашем локе
+        # (fixed) — только тогда двигаемся к mark_fired. Без фиксированного sleep.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if snooze_done.is_set() or _someone_waiting_on_row_lock():
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError(
+                "snooze за 20с ни закоммитился, ни заблокировался на локе — "
+                "тест не смог смоделировать гонку"
+            )
+        return real_enqueue(self, session, reminder)
+
+    monkeypatch.setattr(
+        _hrw.HousewifeReminderWorker, "_enqueue_outbox_for",
+        enqueue_with_concurrent_snooze,
+    )
+
+    asyncio.run(HousewifeReminderWorker().process_pending(now=now))
+    # На фикс-коде snooze добивается только после commit тика (release лока).
+    assert snooze_done.wait(timeout=20), "snooze-поток не завершился за 20с (возможен deadlock)"
+    assert not snooze_error, f"snooze-поток упал: {snooze_error!r}"
+
+    with S() as s:
+        row = s.get(FamilyReminder, rid)
+        assert row.status == "pending", (
+            "snooze юзера ПОТЕРЯН: остался status='fired' — воркер/обработчик слепо "
+            "перетёрли snooze (нужен FOR UPDATE re-read с ОБЕИХ сторон)"
+        )
+        # Обработчик зовёт snooze без now-override → next_trigger = реальное now+10мин
+        # (не инъектированный now воркера). Достаточно проверить, что он отложен в
+        # будущее (snooze применён), а не обнулён mark_fired'ом.
+        assert row.next_trigger_at is not None, "snooze должен был отложить next_trigger_at"
+        _ntt = row.next_trigger_at
+        if _ntt.tzinfo is None:
+            _ntt = _ntt.replace(tzinfo=timezone.utc)
+        assert _ntt > datetime.now(timezone.utc) + timedelta(minutes=9), (
+            "next_trigger_at должен быть отложен ~на 10мин в будущее (snooze), "
+            f"получили {_ntt!r}"
+        )
+        # Ровно одна outbox-строка — воркер фаернул один раз, дубля/повторного пинга нет.
+        n_out = s.query(OutboxMessage).filter(OutboxMessage.tenant_id == TENANT).count()
+        assert n_out == 1, f"ожидалась ровно 1 outbox-строка (фаер воркера), получили {n_out}"

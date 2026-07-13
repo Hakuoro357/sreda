@@ -82,7 +82,29 @@ class HousewifeReminderWorker:
         for reminder_id, tenant_id in due_ids:
             try:
                 with tenant_session(tenant_id) as s:
-                    reminder = s.get(FamilyReminder, reminder_id)
+                    # #344 F5 (Opus-адверсар, cross-process ack/snooze гонка):
+                    # кнопки «Сделал ✅»/«Отложить ⏰» обрабатываются в ДРУГОМ
+                    # процессе (uvicorn, telegram_bot._handle_reminder_callback), а
+                    # этот воркер — в job_runner → второй конкурентный писатель в
+                    # family_reminders уже при ОДНОМ воркере. Читали строку plain
+                    # ``s.get`` без лока: fence видел pending, затем конкурентный
+                    # ack/snooze коммитил новое состояние, а слепой ``mark_fired``
+                    # ниже перетирал его (ack/snooze ТИХО ТЕРЯЛСЯ → повторный пинг /
+                    # закрытие отложенного). Берём строку под ``SELECT ... FOR UPDATE``
+                    # и держим лок до commit тика: конкурентный ack/snooze-UPDATE
+                    # сериализуется — либо коммитится ДО (fence перечитает свежие
+                    # status/next_trigger_at и пропустит), либо ПОСЛЕ нашего commit
+                    # (его правка ложится поверх и выигрывает). PG-only (как due_now);
+                    # SQLite (unit, 1 воркер) — без лока, поведение то же.
+                    _bind = s.bind
+                    _for_update = (
+                        {"key_share": False}
+                        if _bind is not None and _bind.dialect.name == "postgresql"
+                        else None
+                    )
+                    reminder = s.get(
+                        FamilyReminder, reminder_id, with_for_update=_for_update
+                    )
                     if reminder is None:
                         continue  # исчез между сканом и действием
                     # #187 soft-delete — fencing-recheck (дверь #10): тенант мог
