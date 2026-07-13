@@ -824,6 +824,58 @@ def test_reminder_worker_does_not_clobber_concurrent_snooze(pg_db, monkeypatch):
         assert n_out == 1, f"ожидалась ровно 1 outbox-строка (фаер воркера), получили {n_out}"
 
 
+def test_callback_lock_timeout_fails_fast_under_real_contention(pg_db, monkeypatch):
+    """#344 F5 (Opus MAJOR#2, Codex sol R1 MINOR) — механизм ``lock_timeout`` под
+    РЕАЛЬНЫМ PG. Пока строка залочена ``FOR UPDATE`` в другой транзакции,
+    ``read_reminder_for_callback`` НЕ ждёт бесконечно (не стопорит event-loop): за
+    ``lock_timeout`` бросает ``ReminderLockTimeout`` (bounded), откатывает сессию —
+    и после релиза лока ТА ЖЕ сессия снова успешно читает строку (reuse)."""
+    from datetime import UTC
+
+    import sreda.services.housewife_reminders as _hr
+    from sreda.db.models.housewife import FamilyReminder
+    from sreda.db.session import get_session_factory
+    from sreda.services.housewife_reminders import (
+        HousewifeReminderService,
+        ReminderLockTimeout,
+        read_reminder_for_callback,
+    )
+
+    # Короткий таймаут — быстрый тест (helper читает константу модуля в момент вызова).
+    monkeypatch.setattr(_hr, "REMINDER_CALLBACK_LOCK_TIMEOUT_MS", 300)
+
+    now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    S = get_session_factory()
+    with S() as s:
+        rem = HousewifeReminderService(s).schedule(
+            tenant_id=TENANT, user_id=USER, title="X",
+            trigger_at=now - timedelta(minutes=1),
+        )
+        s.commit()
+        rid = rem.id
+
+    holder = S()
+    try:
+        # Держим строку FOR UPDATE в отдельной транзакции (транзакция НЕ закрыта).
+        locked = holder.get(FamilyReminder, rid, with_for_update={"key_share": False})
+        assert locked is not None
+
+        with S() as cb:
+            t0 = time.monotonic()
+            with pytest.raises(ReminderLockTimeout):
+                read_reminder_for_callback(cb, rid)
+            elapsed = time.monotonic() - t0
+            assert elapsed < 5, f"lock-wait не ограничен таймаутом: {elapsed:.2f}s"
+            # helper откатил cb-транзакцию → сессия переиспользуема. Снимаем лок и
+            # читаем той же cb-сессией снова — успех (после rollback state здоров).
+            holder.rollback()
+            row = read_reminder_for_callback(cb, rid)
+            assert row is not None and row.id == rid
+            cb.commit()
+    finally:
+        holder.close()
+
+
 class _FakeMaxForCallback:
     """Мини-заглушка MaxClient для реального ``_handle_max_reminder_callback``:
     ``answer_callback`` идёт ПОСЛЕ ``session.commit()`` (лок уже отпущен)."""

@@ -163,13 +163,13 @@ class _FakeTelegramClient:
 class _FakeMaxClient:
     def __init__(self) -> None:
         self.notifications: list[str] = []
-        self.replacements: list[str] = []
+        self.messages: list[dict] = []
 
     async def answer_callback(self, callback_id, *, notification=None, message=None):  # noqa: ANN001
         if notification is not None:
             self.notifications.append(str(notification))
         if message is not None:
-            self.replacements.append(str(message))
+            self.messages.append(message)
         return {"ok": True}
 
 
@@ -207,7 +207,9 @@ async def test_tg_callback_lock_timeout_shows_retry_toast(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_max_callback_lock_timeout_shows_retry_notification(monkeypatch):
+async def test_max_callback_lock_timeout_shows_visible_retry_with_buttons(monkeypatch):
+    """MAX глушит notification в DM (probe хендлера) → retry должен быть ВИДИМЫМ
+    message-replacement, СОХРАНЯЯ rem_done/rem_snooze кнопки (Codex sol+terra R1)."""
     import sreda.services.housewife_reminders as _hr
     from sreda.services.max_inbound import _handle_max_reminder_callback
 
@@ -221,9 +223,16 @@ async def test_max_callback_lock_timeout_shows_retry_notification(monkeypatch):
         max_client=fake,
         callback_id="cb1",
         data="rem_snooze:rid-1",
-        payload={"message": {"body": {"text": "🔔 X"}}},
+        payload={"message": {"body": {"text": "🔔 Полить цветы"}}},
         onboarding=SimpleNamespace(tenant_id="t1"),
     )
-    assert fake.notifications == [REMINDER_CALLBACK_BUSY_TEXT]
-    # message-replacement НЕ используем (кнопки должны остаться для повтора)
-    assert fake.replacements == []
+    # notification НЕ используем (в MAX DM невидим); используем видимый message.
+    assert fake.notifications == []
+    assert len(fake.messages) == 1
+    msg = fake.messages[0]
+    assert REMINDER_CALLBACK_BUSY_TEXT in msg["text"]
+    # Кнопки сохранены → юзер перетапнет (attachments не пустые, callback rem_*).
+    attachments = msg.get("attachments")
+    assert attachments, "retry-сообщение должно сохранить кнопки для повтора"
+    _blob = str(attachments)
+    assert "rem_done:rid-1" in _blob and "rem_snooze:rid-1" in _blob
