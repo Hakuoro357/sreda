@@ -125,6 +125,35 @@ def test_safe_traceback_hostile_metadata_placeholdered_366():
     assert "?" in tb           # плейсхолдеры на месте вырезанного
 
 
+def test_safe_traceback_ascii_text_pii_placeholdered_366():
+    """R3 sol/terra MAJOR: произвольный ASCII-ТЕКСТ (пробелы/SQL - класс ПД g-039)
+    в co_filename режется ЦЕЛИКОМ (structural allowlist), не частично."""
+    src = "def bad():\n raise RuntimeError('x')\n"
+    ns: dict = {}
+    exec(compile(src, "SELECT text FROM t WHERE msg='my movie list'", "exec"), ns)  # noqa: S102
+    try:
+        ns["bad"]()
+    except RuntimeError as exc:
+        tb = safe_traceback(exc)
+    assert "my movie list" not in tb
+    assert "SELECT" not in tb and "WHERE" not in tb
+    assert "?:" in tb  # компонент co_filename заменён целиком
+
+
+def test_safe_traceback_truncation_marker_366():
+    """R3 sol/terra MINOR: обход прерван потолком → явный маркер, лог не выглядит
+    полным без точки сбоя."""
+    def _deep(n):
+        if n <= 0:
+            raise RuntimeError("boom")
+        _deep(n - 1)
+    try:
+        _deep(700)  # > _MAX_TRAVERSE(500)
+    except RuntimeError as exc:
+        tb = safe_traceback(exc, limit=8)
+    assert "truncated" in tb
+
+
 def test_safe_type_name_366():
     """R2 sol MAJOR: имя типа для call-sites санитизировано; обычные - как есть."""
     assert safe_type_name(ValueError("x")) == "ValueError"

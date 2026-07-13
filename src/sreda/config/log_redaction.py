@@ -14,18 +14,24 @@ import re
 from typing import Any
 
 
-# #366 R2 (sol/terra): СТРОГИЙ ASCII-allowlist компонентов кадра/типа. co_filename/
-# co_name/имя класса у dynamically-compiled кода могут нести не-ASCII/ПД/разделители;
-# _CTRL_RE (только управляющие) недостаточно. Оставляем лишь безопасные для имён
-# Python-символы; всё прочее → «?». Пустой результат → плейсхолдер.
-_ALLOWED_RE = re.compile(r"[^A-Za-z0-9_./:<>-]")
+# #366 R3 (sol/terra): STRUCTURAL allowlist компонента кадра/типа. Символьный
+# allowlist пропускал произвольный ASCII → показываем компонент ТОЛЬКО если это
+# валидное имя (Python-идентификатор/имя-файла/builtin-обёртка `<module>`); всё
+# прочее - пробелы, кириллица, SQL, текст сообщения (класс ПД g-039) - целиком → «?».
+# Наши кадры (react_loop.py:handle_turn, AttributeError) проходят; реальный текстовый
+# ПД (со спецсимволами/пробелами) режется целиком. Остаток (идентификатороподобное
+# имя в СТОРОННЕМ dynamic-коде) - теоретический: в src/sreda нет compile/exec/type()
+# с user-данными в именах (проверено грепом), кадры из статических .py.
+_SAFE_NAME_RE = re.compile(r"\A<?[A-Za-z_][A-Za-z0-9_.-]*>?\Z")
 _MAX_TRAVERSE = 500  # жёсткий потолок обхода traceback (защита от аномалий, R2)
 
 
 def _san(part: str, cap: int) -> str:
-    """Санитайз компонента: ASCII-allowlist + обрезка. Пусто → '?'."""
-    out = _ALLOWED_RE.sub("?", str(part))[:cap]
-    return out or "?"
+    """STRUCTURAL: валидное имя → как есть (с обрезкой); иначе → '?' целиком."""
+    p = str(part)
+    if _SAFE_NAME_RE.match(p):
+        return p[:cap]
+    return "?"
 
 
 def safe_type_name(exc: Any) -> str:
@@ -71,6 +77,10 @@ def safe_traceback(exc: Any, limit: int = 12) -> str:
             raw.append(f"{_san(base, 60)}:{int(tb.tb_lineno)}:{_san(code.co_name, 40)}")
             tb = tb.tb_next
         chain = " <- ".join(raw)
+        # R3 (sol/terra MINOR): обход прерван потолком/циклом, а не концом стека →
+        # явный маркер (иначе лог выглядит полным без точки сбоя).
+        if tb is not None:
+            chain = (chain + " …+truncated") if chain else "…+truncated"
         # цепочка причин ТОЛЬКО по типам (__cause__ явное, иначе __context__); без
         # сообщений. is not None (не `or` — у exc кастомный __bool__, R1 sol/terra).
         causes: list[str] = []
