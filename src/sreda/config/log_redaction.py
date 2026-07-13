@@ -14,9 +14,28 @@ import re
 from typing import Any
 
 
-# #366: управляющие символы в co_filename/co_name (dynamically-compiled кадры,
-# Codex R1 MINOR) — вырезаем, чтобы кадр не ломал строку лога и не нёс мусор.
-_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+# #366 R2 (sol/terra): СТРОГИЙ ASCII-allowlist компонентов кадра/типа. co_filename/
+# co_name/имя класса у dynamically-compiled кода могут нести не-ASCII/ПД/разделители;
+# _CTRL_RE (только управляющие) недостаточно. Оставляем лишь безопасные для имён
+# Python-символы; всё прочее → «?». Пустой результат → плейсхолдер.
+_ALLOWED_RE = re.compile(r"[^A-Za-z0-9_./:<>-]")
+_MAX_TRAVERSE = 500  # жёсткий потолок обхода traceback (защита от аномалий, R2)
+
+
+def _san(part: str, cap: int) -> str:
+    """Санитайз компонента: ASCII-allowlist + обрезка. Пусто → '?'."""
+    out = _ALLOWED_RE.sub("?", str(part))[:cap]
+    return out or "?"
+
+
+def safe_type_name(exc: Any) -> str:
+    """#366 R2 (sol): PII-safe имя типа исключения для call-sites (`type=%s`).
+    Имена классов - обычно Python-идентификаторы, но dynamically-created класс мог
+    бы нести произвольное имя → строгий allowlist. Fail-safe."""
+    try:
+        return _san(type(exc).__name__, 60)
+    except Exception:  # noqa: BLE001
+        return "?"
 
 
 def safe_traceback(exc: Any, limit: int = 12) -> str:
@@ -33,28 +52,33 @@ def safe_traceback(exc: Any, limit: int = 12) -> str:
     `extract_tb`/`linecache` (не читаем исходники с диска на пути краха, R1 sol).
     Весь тело в try/except → НИКОГДА не роняет вызывающего (это лог-путь страховки;
     исключение отсюда замаскировало бы исходную ошибку хода, R1 все трое)."""
+    from collections import deque
     try:
         if exc is None:
             return ""
         limit = max(1, min(int(limit), 50))
-        # кадры: последние `limit`, прямой обход без чтения исходников
-        raw: list[str] = []
+        # кадры: ТОЛЬКО последние `limit` (deque maxlen - не аллоцируем весь глубокий
+        # traceback, R2); жёсткий потолок обхода + tb-id guard (аномальный/цикличный tb).
+        raw: deque = deque(maxlen=limit)
         tb = getattr(exc, "__traceback__", None)
-        while tb is not None:
+        seen_tb: set = set()
+        steps = 0
+        while tb is not None and steps < _MAX_TRAVERSE and id(tb) not in seen_tb:
+            seen_tb.add(id(tb))
+            steps += 1
             code = tb.tb_frame.f_code
             base = code.co_filename.rsplit("/", 1)[-1].rsplit(chr(92), 1)[-1]
-            raw.append(_CTRL_RE.sub("?", f"{base}:{tb.tb_lineno}:{code.co_name}")[:120])
+            raw.append(f"{_san(base, 60)}:{int(tb.tb_lineno)}:{_san(code.co_name, 40)}")
             tb = tb.tb_next
-        chain = " <- ".join(raw[-limit:])
+        chain = " <- ".join(raw)
         # цепочка причин ТОЛЬКО по типам (__cause__ явное, иначе __context__); без
-        # сообщений. is not None (не `or` — у exc может быть кастомный __bool__, R1
-        # sol/terra). Защита от циклов (seen).
+        # сообщений. is not None (не `or` — у exc кастомный __bool__, R1 sol/terra).
         causes: list[str] = []
         seen = {id(exc)}
         cur = exc.__cause__ if exc.__cause__ is not None else exc.__context__
         while cur is not None and id(cur) not in seen and len(causes) < limit:
             seen.add(id(cur))
-            causes.append(_CTRL_RE.sub("?", type(cur).__name__)[:60])
+            causes.append(_san(type(cur).__name__, 60))
             cur = cur.__cause__ if cur.__cause__ is not None else cur.__context__
         tail = (" caused-by=" + ">".join(causes)) if causes else ""
         return redact_secrets(f"{chain}{tail}")
