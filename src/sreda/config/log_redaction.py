@@ -11,6 +11,55 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Any
+
+
+# #366: управляющие символы в co_filename/co_name (dynamically-compiled кадры,
+# Codex R1 MINOR) — вырезаем, чтобы кадр не ломал строку лога и не нёс мусор.
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def safe_traceback(exc: Any, limit: int = 12) -> str:
+    """#366: PII-safe стек прод-краша - цепочка кадров `file:line:func` + типы
+    причин, БЕЗ `str(exc)` и значений.
+
+    Зачем не `exc_info=True`: у SQLAlchemy/psycopg `str(exc)` несёт SQL с
+    параметрами (текст сообщения пользователя = PII, урок g-039), и финальная
+    строка traceback его печатает. Глобальный SecretRedactingFilter НЕ спасает —
+    он вырезает только bot-токены, не SQL/ПД. Кадры стека PII НЕ содержат (только
+    позиции в коде) → место падения видно безопасно.
+
+    Обход traceback-объектов НАПРЯМУЮ (co_filename/co_name/tb_lineno) - без
+    `extract_tb`/`linecache` (не читаем исходники с диска на пути краха, R1 sol).
+    Весь тело в try/except → НИКОГДА не роняет вызывающего (это лог-путь страховки;
+    исключение отсюда замаскировало бы исходную ошибку хода, R1 все трое)."""
+    try:
+        if exc is None:
+            return ""
+        limit = max(1, min(int(limit), 50))
+        # кадры: последние `limit`, прямой обход без чтения исходников
+        raw: list[str] = []
+        tb = getattr(exc, "__traceback__", None)
+        while tb is not None:
+            code = tb.tb_frame.f_code
+            base = code.co_filename.rsplit("/", 1)[-1].rsplit(chr(92), 1)[-1]
+            raw.append(_CTRL_RE.sub("?", f"{base}:{tb.tb_lineno}:{code.co_name}")[:120])
+            tb = tb.tb_next
+        chain = " <- ".join(raw[-limit:])
+        # цепочка причин ТОЛЬКО по типам (__cause__ явное, иначе __context__); без
+        # сообщений. is not None (не `or` — у exc может быть кастомный __bool__, R1
+        # sol/terra). Защита от циклов (seen).
+        causes: list[str] = []
+        seen = {id(exc)}
+        cur = exc.__cause__ if exc.__cause__ is not None else exc.__context__
+        while cur is not None and id(cur) not in seen and len(causes) < limit:
+            seen.add(id(cur))
+            causes.append(_CTRL_RE.sub("?", type(cur).__name__)[:60])
+            cur = cur.__cause__ if cur.__cause__ is not None else cur.__context__
+        tail = (" caused-by=" + ">".join(causes)) if causes else ""
+        return redact_secrets(f"{chain}{tail}")
+    except Exception:  # noqa: BLE001 — лог-путь НИКОГДА не роняет вызывающего
+        return "<traceback-unavailable>"
 
 # Telegram bot-токен: URL-форма bot<id>:<secret> И сырая <id>:<secret>
 # (Codex R1: конфиг-ошибки/env могут логировать токен без префикса).

@@ -20,6 +20,7 @@ import logging
 from datetime import datetime, timezone
 
 logger = logging.getLogger("sreda.react_trace")
+from sreda.config.log_redaction import safe_traceback  # #366 PII-safe стек
 
 
 def trace_enabled() -> bool:
@@ -60,7 +61,7 @@ def persist_trace_start(*, tenant_id: str, user_id: str | None, thread_id: str, 
         finally:
             sess.close()
     except Exception as exc:  # noqa: BLE001 — трейс не валит ход
-        logger.warning("react_trace: start failed type=%s", type(exc).__name__)
+        logger.warning("react_trace: start failed type=%s at=%s", type(exc).__name__, safe_traceback(exc))
 
 
 def persist_trace_pause(*, tenant_id: str, user_id: str | None, turn_key: str) -> None:
@@ -87,7 +88,7 @@ def persist_trace_pause(*, tenant_id: str, user_id: str | None, turn_key: str) -
         finally:
             sess.close()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("react_trace: pause failed type=%s", type(exc).__name__)
+        logger.warning("react_trace: pause failed type=%s at=%s", type(exc).__name__, safe_traceback(exc))
 
 
 def persist_trace_abandoned(*, tenant_id: str, user_id: str | None, turn_key: str,
@@ -126,7 +127,7 @@ def persist_trace_abandoned(*, tenant_id: str, user_id: str | None, turn_key: st
         finally:
             sess.close()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("react_trace: abandoned failed type=%s", type(exc).__name__)
+        logger.warning("react_trace: abandoned failed type=%s at=%s", type(exc).__name__, safe_traceback(exc))
 
 
 def persist_trace_finish(*, tenant_id: str, user_id: str | None, thread_id: str, channel: str,
@@ -182,7 +183,7 @@ def persist_trace_finish(*, tenant_id: str, user_id: str | None, thread_id: str,
         finally:
             sess.close()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("react_trace: finish failed type=%s", type(exc).__name__)
+        logger.warning("react_trace: finish failed type=%s at=%s", type(exc).__name__, safe_traceback(exc))
 
 
 def collect_tool_calls(messages: list, *, tenant_id: str) -> list[dict]:
