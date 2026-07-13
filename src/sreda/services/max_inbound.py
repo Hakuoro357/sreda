@@ -1818,6 +1818,15 @@ async def _handle_max_reminder_callback(
             txt = body.get("text")
             if isinstance(txt, str):
                 original_text = txt.lstrip(_CLEANUP_PREFIX).strip()
+                # #344 F5 (Codex sol+terra R2 MINOR): lock-timeout replacement
+                # осаждает retry-строку в теле («🔔 X\nСекунду, попробуйте ещё раз»).
+                # На следующем tap она бы дублировалась (timeout→timeout) или
+                # протекла в финальный ✅/⏰-текст (timeout→success). Снимаем её с
+                # хвоста (while — на случай накопления от нескольких таймаутов).
+                while original_text.endswith(REMINDER_CALLBACK_BUSY_TEXT):
+                    original_text = original_text[
+                        : -len(REMINDER_CALLBACK_BUSY_TEXT)
+                    ].rstrip("\n \t")
 
     async def _ack_with_replacement(new_text: str) -> None:
         """Send /answers с message field — replaces original message body

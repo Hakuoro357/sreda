@@ -236,3 +236,76 @@ async def test_max_callback_lock_timeout_shows_visible_retry_with_buttons(monkey
     assert attachments, "retry-сообщение должно сохранить кнопки для повтора"
     _blob = str(attachments)
     assert "rem_done:rid-1" in _blob and "rem_snooze:rid-1" in _blob
+
+
+@pytest.mark.asyncio
+async def test_max_retry_text_does_not_accumulate_on_repeated_timeout(monkeypatch):
+    """timeout→timeout: тело уже несёт retry-строку от прошлого таймаута; новый
+    replacement НЕ должен дублировать её (Codex sol+terra R2 MINOR)."""
+    import sreda.services.housewife_reminders as _hr
+    from sreda.services.max_inbound import _handle_max_reminder_callback
+
+    def _raise(*a, **k):
+        raise ReminderLockTimeout
+
+    monkeypatch.setattr(_hr, "read_reminder_for_callback", _raise)
+    fake = _FakeMaxClient()
+    # Тело, как его оставил ПРЕДЫДУЩИЙ lock-timeout replacement.
+    prior_body = f"🔔 Полить цветы\n{REMINDER_CALLBACK_BUSY_TEXT}"
+    await _handle_max_reminder_callback(
+        session=_ExplodingSession(),
+        max_client=fake,
+        callback_id="cb1",
+        data="rem_snooze:rid-1",
+        payload={"message": {"body": {"text": prior_body}}},
+        onboarding=SimpleNamespace(tenant_id="t1"),
+    )
+    text = fake.messages[0]["text"]
+    assert text.count(REMINDER_CALLBACK_BUSY_TEXT) == 1, text
+    assert "Полить цветы" in text  # заголовок сохранён, не потерян
+
+
+@pytest.mark.asyncio
+async def test_max_retry_text_does_not_leak_into_success_reply(monkeypatch):
+    """timeout→success: тело несёт retry-строку от прошлого таймаута; финальный
+    ✅-текст успешного ack НЕ должен её содержать (Codex sol+terra R2 MINOR)."""
+    import sreda.services.housewife_reminders as _hr
+    from sreda.services.max_inbound import _handle_max_reminder_callback
+
+    reminder = SimpleNamespace(id="rid-1", tenant_id="t1")
+    monkeypatch.setattr(
+        _hr, "read_reminder_for_callback", lambda *a, **k: reminder
+    )
+
+    class _FakeService:
+        def __init__(self, session):  # noqa: ANN001
+            pass
+
+        def acknowledge(self, rem):  # noqa: ANN001
+            pass
+
+        def snooze(self, rem, minutes=0):  # noqa: ANN001
+            pass
+
+    monkeypatch.setattr(_hr, "HousewifeReminderService", _FakeService)
+
+    class _CommitSession:
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+    fake = _FakeMaxClient()
+    prior_body = f"🔔 Полить цветы\n{REMINDER_CALLBACK_BUSY_TEXT}"
+    await _handle_max_reminder_callback(
+        session=_CommitSession(),
+        max_client=fake,
+        callback_id="cb1",
+        data="rem_done:rid-1",
+        payload={"message": {"body": {"text": prior_body}}},
+        onboarding=SimpleNamespace(tenant_id="t1"),
+    )
+    text = fake.messages[0]["text"]
+    assert REMINDER_CALLBACK_BUSY_TEXT not in text, text
+    assert "✅" in text and "Полить цветы" in text
