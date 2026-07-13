@@ -281,15 +281,33 @@ def read_cue_domains(text: str) -> frozenset[str]:
     return frozenset(out)
 
 
+# #356 R3 (sol): «список <домен>» - слово «список» лишь обёртка, домен задаёт
+# квалификатор. Без этого «покажи список задач» оставлял непокрытую группу
+# {checklists,shopping} после честного чтения задач → ложный форс-проход.
+_LIST_QUALIFIER_RE = re.compile(
+    r"списк\w*\s+(задач|дел\b|покупок|покупк|напоминани)", re.IGNORECASE)
+_LIST_QUALIFIER_DOMAIN = {
+    "задач": "tasks", "дел": "checklists", "покупок": "shopping",
+    "покупк": "shopping", "напоминани": "reminders"}
+_LIST_AMBIGUOUS = frozenset({"checklists", "shopping"})
+
+
 def read_cue_groups(text: str) -> tuple[frozenset, ...]:
-    """#356 R2 (sol/terra/субагент): группы ТРЕБОВАНИЙ чтения по СОВПАВШИМ паттернам -
-    каждая группа = OR (любой её домен покрывает требование), разные группы = AND.
-    Различает неоднозначное ОДНО слово («список X» → одна группа {checklists,shopping})
-    от двух явных запросов («покажи чек-листы и покупки» → две группы {checklists} и
-    {shopping}; «покажи список покупок» → группы {checklists,shopping} И {shopping} -
-    покупки остаются самостоятельным требованием). Потребитель - гейт свежести."""
+    """#356 R2/R3 (sol/terra/субагент): группы ТРЕБОВАНИЙ чтения по СОВПАВШИМ
+    паттернам - каждая группа = OR (любой её домен покрывает требование), разные
+    группы = AND. Различает неоднозначное ОДНО слово («список кино» → одна группа
+    {checklists,shopping}) от двух явных запросов («покажи чек-листы и покупки» →
+    {checklists} И {shopping}). Квалифицированный список («список задач/покупок/
+    дел/напоминаний») схлопывается в домен квалификатора: «покажи список задач» -
+    чтение задач закрывает запрос целиком; «покажи список покупок» - требуются
+    именно покупки (чтение чек-листов не закрывает). Потребитель - гейт свежести."""
     t = text or ""
-    return tuple(doms for pat, doms in _READ_CUES if pat.search(t))
+    groups = [doms for pat, doms in _READ_CUES if pat.search(t)]
+    m = _LIST_QUALIFIER_RE.search(t)
+    if m:
+        _qd = _LIST_QUALIFIER_DOMAIN[m.group(1).lower().rstrip()]
+        groups = [frozenset({_qd}) if g == _LIST_AMBIGUOUS else g for g in groups]
+    return tuple(groups)
 
 
 # ── #316: МАРКЕР явного read-ЗАПРОСА (императив чтения / WH-вопрос про own-data). Отличает «покажи

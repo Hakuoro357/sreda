@@ -194,6 +194,26 @@ def test_stale_status_error_not_fresh_356():
     assert "checklists" in _stale_readback_domains(msgs)
 
 
+def test_stale_error_content_with_ok_kind_not_fresh_356():
+    """R3 terra: семантическая ошибка контрактной строкой «error: …» при
+    result_kind=ok - не свежесть."""
+    err = ToolMessage(content="error: internal", name="list_checklist_items",
+                      tool_call_id="t1", artifact={"result_kind": "ok"})
+    msgs = _turn("Что у меня в списке кино", _ai_tc("list_checklist_items"), err)
+    assert "checklists" in _stale_readback_domains(msgs)
+
+
+def test_stale_qualified_list_single_read_covers_356():
+    """R3 sol M2: «покажи список задач» - «список» лишь обёртка, домен задаёт
+    квалификатор: чтение задач закрывает запрос ЦЕЛИКОМ (нет ложного форса
+    checklists/shopping)."""
+    msgs = _turn("покажи список задач", _ai_tc("list_tasks"), _tm("list_tasks"))
+    assert _stale_readback_domains(msgs) == frozenset()
+    msgs2 = _turn("покажи список напоминаний",
+                  _ai_tc("list_reminders"), _tm("list_reminders"))
+    assert _stale_readback_domains(msgs2) == frozenset()
+
+
 def test_stale_no_cue_no_fire_356():
     assert _stale_readback_domains(_turn("спасибо")) == frozenset()
     assert _stale_readback_domains(_turn("я посмотрел машину войны")) == frozenset()
@@ -285,6 +305,12 @@ class _Chat:
         self.seen_batches.append(messages)
         if self._responses:
             return self._responses.pop(0)
+        if getattr(self, "echo_tool_result", False):
+            # R3 sol: финал строится ИЗ последнего ToolMessage - маркер свежести
+            # физически приходит из инструмента, не из скрипта теста
+            _tools = [m for m in messages if isinstance(m, ToolMessage)]
+            if _tools:
+                return AIMessage(content=f"Вот свежий список: {_tools[-1].content}")
         return AIMessage(content="ок")
 
     async def ainvoke(self, messages, **kwargs):
@@ -300,6 +326,8 @@ class _Chat:
 def _clean_tool(name, inv):
     def _f(**kwargs):
         inv[name] = inv.get(name, 0) + 1
+        if name.startswith("list") and "__fresh_payload__" in inv:
+            return str(inv["__fresh_payload__"])  # R3 sol: fresh-маркер ИЗ инструмента
         return f"{name}-ok"
     return StructuredTool.from_function(func=_f, name=name, description=name)
 
@@ -359,13 +387,14 @@ def test_e2e_freshness_gate_forces_read_356(install):
     inv, freddie = install(responses=[
         AIMessage(content="Вот твой список кино: Скорпион, Машина войны."),  # пересказ
         _ai_call("list_checklist_items", "c1", name="кино"),                 # после форса
-        AIMessage(content="Список обновлён: Мастодонт."),                    # пост-чтение
     ])
+    freddie.echo_tool_result = True  # финал = эхо ToolMessage (R3 sol: маркер ИЗ инструмента)
+    inv["__fresh_payload__"] = "Мастодонт-9000"
     r = _run(freddie, "f1", "Что у меня в списке кино")
     assert inv.get("list_checklist_items", 0) == 1, \
         "гейт свежести заставил прочитать (промпт модель проигнорила)"
-    # R2 sol/terra: финал = ответ ПОСЛЕ чтения (уникальный маркер), пересказ не утёк
-    assert "мастодонт" in str(r).lower()
+    # R2/R3 sol/terra: маркер в финале пришёл ФИЗИЧЕСКИ из результата инструмента
+    assert "мастодонт-9000" in str(r).lower()
     assert "скорпион" not in str(r).lower()
 
 

@@ -602,6 +602,10 @@ class Settings(BaseSettings):
     # residual'ы - откат должен быть env'ом, g-065). Гейт дополнительно требует
     # eff=="task" → при preflight OFF (rollback-путь) не исполняется вовсе
     # (байт-идентичность отката не тронута).
+    # КОНТРАКТ ФЛАГА (R3 terra): выключает ТОЛЬКО механику (route/guard форс-проход).
+    # Промпт-канон _DATA_DISCIPLINE флагом НЕ гейтится: текст промпта - отдельный слой,
+    # его откат = деплой (как у любой промпт-правки); флаговать промпт = рвать кеш на
+    # переключении и плодить матрицу промпт-вариантов.
     react_freshness_gate_enabled: bool = Field(
         default=True, validation_alias="SREDA_REACT_FRESHNESS_GATE"
     )

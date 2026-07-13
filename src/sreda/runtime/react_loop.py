@@ -1694,6 +1694,8 @@ def _stale_readback_domains(messages: Any) -> frozenset:
             _art = getattr(m, "artifact", None)
             if isinstance(_art, dict) and _art.get("result_kind") in _NOT_FRESH_KINDS:
                 continue  # неисполнение/ошибка - свежесть не доказана
+            if str(getattr(m, "content", "")).lstrip().lower().startswith("error"):
+                continue  # R3 terra: контрактный «error: …» строкой при ok-kind - не свежесть
             name = _TOOL_NAME_ALIASES.get(m.name, m.name)
             if TOOL_OP_CLASS.get(name) not in ("read_pure", "read_external"):
                 continue  # только ЧТЕНИЕ доказывает свежесть показа
