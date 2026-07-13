@@ -254,7 +254,30 @@ def db_session():
         sess.close()
 
 
-def test_inbound_does_not_overwrite_existing_max_chat_id(db_session) -> None:
+@pytest.fixture()
+def _identity_uses_db(db_session, monkeypatch):
+    """#138 Ф5-5c: ``ensure_max_user_bundle`` детектит existing-юзера через
+    ``resolve_external_identity`` → ``privileged_session`` (identity-роль после
+    флипа DSN), а ``_serve_existing_bundle_reads`` читает/пишет под
+    ``tenant_session``. В юните обе сессии стабятся на ту же sqlite-БД, где засеян
+    юзер (иначе резолв пуст → provision-путь вместо existing → RuntimeError на
+    отсутствии плана). НЕ autouse: в этом файле есть TestClient/lifespan-тесты,
+    которым подмена сессий не нужна и вредна — подключаем точечно."""
+    from contextlib import contextmanager
+
+    import sreda.db.session as dbs
+
+    @contextmanager
+    def _stub(arg):
+        yield db_session
+
+    monkeypatch.setattr(dbs, "privileged_session", _stub)
+    monkeypatch.setattr(dbs, "tenant_session", _stub)
+
+
+def test_inbound_does_not_overwrite_existing_max_chat_id(
+    db_session, _identity_uses_db
+) -> None:
     """Атака: юзер с non-NULL max_chat_id; inbound с ДРУГИМ chat_id НЕ меняет
     users.max_chat_id (иначе перехват уведомлений жертвы)."""
     from sreda.services.onboarding import ensure_max_user_bundle
@@ -281,7 +304,9 @@ def test_inbound_does_not_overwrite_existing_max_chat_id(db_session) -> None:
     )
 
 
-def test_ensure_result_max_chat_id_reflects_persisted_not_payload(db_session) -> None:
+def test_ensure_result_max_chat_id_reflects_persisted_not_payload(
+    db_session, _identity_uses_db
+) -> None:
     """#341 (R1 MAJOR): возвращаемый MaxOnboardingResult.max_chat_id — это
     ПЕРСИСТ-значение (safe), не payload chat_id. Иначе немедленный welcome
     (max_inbound.py, recipient=onboarding.max_chat_id) ушёл бы в чат из
@@ -322,7 +347,9 @@ def test_ensure_result_max_chat_id_reflects_persisted_not_payload(db_session) ->
     assert res2.max_chat_id == "70000300"
 
 
-def test_inbound_populates_null_max_chat_id_but_not_overwrites(db_session) -> None:
+def test_inbound_populates_null_max_chat_id_but_not_overwrites(
+    db_session, _identity_uses_db
+) -> None:
     """NULL→value первичная установка РАЗРЕШЕНА; повторный inbound с ДРУГИМ
     chat_id уже НЕ перезаписывает."""
     from sreda.services.onboarding import ensure_max_user_bundle
@@ -618,7 +645,7 @@ def test_telegram_webhook_whitespace_secret_treated_as_absent(
 
 
 @pytest.mark.parametrize("stored", [None, ""])
-def test_inbound_first_set_when_stored_absent(db_session, stored) -> None:
+def test_inbound_first_set_when_stored_absent(db_session, _identity_uses_db, stored) -> None:
     """И None, И '' трактуются как «не задано» → inbound ПРОСТАВЛЯЕТ chat_id
     (первичная установка). Established (непустое) значение — отдельно, не тут."""
     from sreda.services.onboarding import ensure_max_user_bundle

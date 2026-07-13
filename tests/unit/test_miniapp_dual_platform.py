@@ -38,11 +38,35 @@ def db_session():
         id="user_max_111", tenant_id="tenant_max_111",
         max_account_id="111", max_chat_id="22",
     ))
+    # sreda_free тариф — прод-предпосылка (0041); провижн без него бросает (R2-2).
+    from sreda.db.models.billing import SubscriptionPlan
+    sess.add(SubscriptionPlan(
+        id="plan_free", plan_key="sreda_free", feature_key="housewife_assistant",
+        title="Free", description="", price_rub=0,
+    ))
     sess.commit()
     try:
         yield sess
     finally:
         sess.close()
+
+
+@pytest.fixture(autouse=True)
+def _identity_resolve_uses_db(db_session, monkeypatch):
+    """#138 Ф5-5b: резолв личности идёт под ОТДЕЛЬНОЙ identity-сессией
+    (privileged_session), а не под сессией вызывающего — после флипа DSN это
+    identity-роль. В юнит-тесте стабаем эту сессию на ту же sqlite-БД, где
+    засеяны данные, чтобы _resolve_direct видел их (диалект sqlite → ORM-путь)."""
+    from contextlib import contextmanager
+
+    import sreda.db.session as dbs
+
+    @contextmanager
+    def _stub(arg):
+        yield db_session
+
+    monkeypatch.setattr(dbs, "privileged_session", _stub)
+    monkeypatch.setattr(dbs, "tenant_session", _stub)
 
 
 def _make_request(*, platform: str | None = "max", auth: str = "tma fake_init_data"):

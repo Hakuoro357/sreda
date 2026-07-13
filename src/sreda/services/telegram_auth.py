@@ -257,9 +257,13 @@ def resolve_tenant_from_telegram_id(
     """
     # 152-ФЗ обезличивание Часть 1: lookup идёт через hash, не через
     # plaintext (см. services.tg_account_hash + миграция 0027).
-    from sreda.services.onboarding import find_user_by_chat_id
+    # #138 Ф5-5b: резолв идёт через DEFINER-функцию под identity-ролью
+    # (privileged_session открывается внутри), а не прямым SELECT users —
+    # переданный ``session`` (app-роль) для резолва не используется. Инертно
+    # до флипа DSN. tg_account_hash unique → неоднозначности не бывает.
+    from sreda.services.identity_resolve import resolve_external_identity
 
-    user = find_user_by_chat_id(session, telegram_id)
-    if user is None:
+    resolved = resolve_external_identity("telegram", telegram_id)
+    if resolved is None:
         return None
-    return user.tenant_id, user.id
+    return resolved.tenant_id, resolved.user_id
