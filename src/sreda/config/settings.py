@@ -603,6 +603,19 @@ class Settings(BaseSettings):
     react_preflight_enabled: bool = Field(
         default=False, validation_alias="SREDA_REACT_PREFLIGHT_ENABLED"
     )
+    # #356: механический гейт свежести own-data (read-кюс без успешного чтения → один
+    # форс-проход «сначала прочитай»). Default ON = фикс живого инцидента активен с
+    # деплоя; OFF = kill-switch БЕЗ деплоя (R1 субагент: у greedy-кюса осознанные
+    # residual'ы - откат должен быть env'ом, g-065). Гейт дополнительно требует
+    # eff=="task" → при preflight OFF (rollback-путь) не исполняется вовсе
+    # (байт-идентичность отката не тронута).
+    # КОНТРАКТ ФЛАГА (R3 terra): выключает ТОЛЬКО механику (route/guard форс-проход).
+    # Промпт-канон _DATA_DISCIPLINE флагом НЕ гейтится: текст промпта - отдельный слой,
+    # его откат = деплой (как у любой промпт-правки); флаговать промпт = рвать кеш на
+    # переключении и плодить матрицу промпт-вариантов.
+    react_freshness_gate_enabled: bool = Field(
+        default=True, validation_alias="SREDA_REACT_FRESHNESS_GATE"
+    )
     # #197: провайдер рассуждающей модели для chat/fact-пути (eval #173 → deepseek-v4-flash). Строится
     # через get_chat_llm(provider=...). Недоступен/мисконфиг → fail-open в task (Фредди), scope web-only.
     react_preflight_chat_provider: str = Field(
