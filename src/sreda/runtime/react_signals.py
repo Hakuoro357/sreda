@@ -94,7 +94,10 @@ _READ_CUES: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
                 r"|(?:покажи|мои|наши|все|какие)(?:\s+\w+){0,2}\s+записи)", re.IGNORECASE),
      frozenset({"memory"})),
     (re.compile(r"\bменю\b", re.IGNORECASE), frozenset({"menu"})),
-    (re.compile(r"\bрецепт(?!\s+(?:счастья|успеха|жизни))", re.IGNORECASE), frozenset({"recipes"})),
+    # #356 R1 субагент: атомарная группа (?>…) - без неё «рецептЫ счастья» обходил
+    # идиому-стоп бэктрекингом (\w* отступал, lookahead смотрел после «рецепт»).
+    (re.compile(r"\b(?>рецепт\w*)(?!\s+(?:счастья|успеха|жизни))", re.IGNORECASE),
+     frozenset({"recipes"})),
 )
 
 
