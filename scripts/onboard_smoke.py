@@ -21,6 +21,25 @@
 Синтетический id всё же выбран вне обычных диапазонов Telegram (~-9e9: за 32-битными basic-группами и
 до супергрупп -1e12) как доп. подушка, но это НЕ несущий слой.
 
+RLS (#138, после флипа DSN рантайм = роль sreda_app; vex#360). Голая app-сессия без tenant-контекста
+под RLS видит 0 строк → верификация «ослепла» (ложный ABORT) и чистка не находила тенант (течь по
+2 synthetic-тенанта на каждый рестарт). Двери скрипта разведены:
+  - ВЕРИФИКАЦИЯ онбординга (тенант создан? подписка? трейс хода?) — ``tenant_session(tenant_id)``:
+    тот же взгляд, что у настоящего юзера (app-роль + контекст); заодно ловит класс
+    «провижн записал, а app не видит».
+  - Слои безопасности и чистка (ownership-пруф по update_id, маркер, cleanup) —
+    ``privileged_session("monitor")`` (maintenance-роль, видит все тенанты): слепой safety-слой
+    опаснее зрячего — «не вижу строк» НЕ означает «строк нет».
+  - Полу-флип (app-DSN под RLS, maintenance-DSN НЕ разведён) → maintenance-фолбэк на app-движок
+    СЛЕП: верификация видела бы тенант, а чистка «не существует» → ложный PASS + течь. Гейтится
+    fail-closed проверкой ``_maintenance_sighted()`` (зрячесть на tenants) — иначе ABORT.
+  - До флипа / при break-glass откате на owner-DSN maintenance-движок фолбэкает на общий —
+    поведение прежнее (owner обходит RLS, зрячесть проходит по владению таблицей).
+  - Чистка — ОДНА maintenance-транзакция: строка tenants берётся FOR UPDATE (PG), ownership-пруф
+    перечитывается под замком (FK-INSERT нового inbound берёт KEY SHARE на строку родителя →
+    блокируется до конца транзакции — окно proof→delete закрыто), сбои отдельных таблиц
+    изолируются savepoint'ами, финальный DELETE guard'ится ТОЧНЫМ маркер-именем.
+
 - admin-алерт (react_loop → send_admin_alert + сама egress-граница _post_*_sync) застаблен: smoke гонит
   крэш-класс, иначе зашлёт реальную тревогу оператору на каждом деплое.
 - signup_attempts (rate-limit 3/24ч, без tenant_id) чистятся по (channel='telegram', хеш источника) с
@@ -101,20 +120,65 @@ def _is_pg(eng) -> bool:  # noqa: ANN001
     return eng.dialect.name == "postgresql"
 
 
-def _has_foreign_activity(eng, tenant_id: str) -> bool:  # noqa: ANN001
+def _maintenance_sighted() -> bool:
+    """Fail-closed гейт (vex#360): maintenance-сессия обязана ВИДЕТЬ tenants под RLS.
+
+    Полу-флип (app-DSN под RLS, maintenance-DSN не разведён) роняет privileged-фолбэк на слепой
+    app-движок: чистка отвечала бы «не существует» при живых строках → ложный PASS + течь.
+    Зрячесть на tenants = суперюзер/BYPASSRLS ИЛИ владелец таблицы (owner обходит non-FORCE RLS)
+    ИЛИ текущая роль покрыта политикой FOR ALL (maintenance). app-роль (self-SELECT) — НЕ зрячая.
+    Не-Postgres (dev-SQLite) — RLS нет, всегда зрячий.
+    """
+    from sqlalchemy import text
+    from sreda.db.session import privileged_session
+    with privileged_session("monitor") as s:
+        if s.get_bind().dialect.name != "postgresql":
+            return True
+        # Ужесточено R2 (sol/terra): владелец НЕ обходит FORCE RLS (relforcerowsecurity);
+        # политика зачитывается только permissive FOR ALL USING(true); всем веткам нужны
+        # табличные привилегии. ГРАНИЦА: RESTRICTIVE-политики поверх и пер-детская зрячесть
+        # не проверяются (parity-мета-тест 138 держит реестр⇔pg_policies, дети — тем же шаблоном).
+        # has_table_privilege со списком 'A,B' = ЛЮБОЕ из прав (OR, семантика PG) —
+        # поэтому три отдельных вызова через AND (sol R3: maintenance без DELETE прошёл
+        # бы гейт, а чистка встала бы с остатком).
+        return bool(s.execute(text("""
+            SELECT has_table_privilege(current_user, 'public.tenants', 'SELECT')
+               AND has_table_privilege(current_user, 'public.tenants', 'UPDATE')
+               AND has_table_privilege(current_user, 'public.tenants', 'DELETE')
+               AND (
+                    (SELECT rolbypassrls OR rolsuper FROM pg_roles WHERE rolname = current_user)
+                 OR ((SELECT tableowner = current_user FROM pg_tables
+                      WHERE schemaname = 'public' AND tablename = 'tenants')
+                     AND NOT (SELECT relforcerowsecurity FROM pg_class
+                              WHERE oid = 'public.tenants'::regclass))
+                 OR EXISTS (SELECT 1 FROM pg_policies
+                            WHERE schemaname = 'public' AND tablename = 'tenants'
+                              AND cmd = 'ALL' AND permissive = 'PERMISSIVE'
+                              AND qual = 'true'
+                              AND current_user::text = ANY(roles::text[]))
+               )
+        """)).scalar())
+
+
+def _has_foreign_activity(tenant_id: str, session=None) -> bool:  # noqa: ANN001
     """Слой 1: есть ли у тенанта inbound с НЕотрицательным external_update_id (= реальная активность).
 
     Наши update_id отрицательные; реальные Telegram — всегда положительные (контракт Bot API). Любой
     inbound не из нашего отрицательного namespace → тенант делит id с реальным чатом → НЕ наш.
     NULL external_update_id тоже считаем чужим (безопаснее: не помечать/не удалять при сомнении).
+    Читаем под maintenance (vex#360): слепая app-сессия под RLS видела бы 0 строк → ложный «наш».
+    ``session`` — переиспользовать открытую maintenance-сессию (ре-пруф ВНУТРИ guard-транзакции
+    чистки, под удерживаемым FOR UPDATE); без неё — своя privileged-сессия (пруф перед маркировкой).
     """
     from sqlalchemy import text
-    with eng.connect() as c:
-        n = c.execute(text(
-            "SELECT count(*) FROM inbound_messages WHERE tenant_id = :t "
-            "AND (external_update_id IS NULL OR external_update_id NOT LIKE '-%')"),
-            {"t": tenant_id}).scalar()
-    return bool(n)
+    from sreda.db.session import privileged_session
+
+    q = ("SELECT count(*) FROM inbound_messages WHERE tenant_id = :t "
+         "AND (external_update_id IS NULL OR external_update_id NOT LIKE '-%')")
+    if session is not None:
+        return bool(session.execute(text(q), {"t": tenant_id}).scalar())
+    with privileged_session("monitor") as s:
+        return bool(s.execute(text(q), {"t": tenant_id}).scalar())
 
 
 async def _await_detached_tasks(timeout_s: float = 40.0) -> list[BaseException]:
@@ -142,36 +206,79 @@ def _tenant_name(session, tenant_id: str) -> str | None:
     return r[0] if r else None
 
 
-def _mark_synthetic(tenant_id: str) -> None:
-    """Пометить наш тенант маркером в имени — чистка удаляет ТОЛЬКО помеченное."""
+def _mark_synthetic(tenant_id: str) -> tuple[bool, str]:
+    """Пометить наш тенант ТОЧНЫМ маркер-именем — чистка удаляет ТОЛЬКО его. Возврат (пометили, почему).
+
+    Одна maintenance-транзакция (R2 sol+terra: между отдельным пруфом и маркировкой был зазор):
+    строка tenants под FOR UPDATE (PG) + ре-пруф владения ПОД замком → реальный inbound,
+    закоммиченный после прогонного пруфа, не даст перезаписать имя реального тенанта.
+    Под maintenance: у app-роли на tenants только self-SELECT — UPDATE молча задел бы 0 строк."""
     from sqlalchemy import text
-    from sreda.db.session import get_engine
-    with get_engine().begin() as c:
-        c.execute(text("UPDATE tenants SET name = :n WHERE id = :t"),
-                  {"n": f"{_SENTINEL} {tenant_id}", "t": tenant_id})
+    from sreda.db.session import privileged_session
+    with privileged_session("monitor") as s:
+        is_pg = s.get_bind().dialect.name == "postgresql"
+        if is_pg:
+            s.execute(text("SET LOCAL lock_timeout = '5s'"))
+            s.execute(text("SET LOCAL statement_timeout = '60s'"))
+        name = s.execute(text("SELECT name FROM tenants WHERE id = :t"
+                              + (" FOR UPDATE" if is_pg else "")),
+                         {"t": tenant_id}).scalar()
+        if name is None:
+            return False, "тенант не найден (слепая сессия или исчез)"
+        if _has_foreign_activity(tenant_id, session=s):
+            return False, "чужая активность (реальный update_id)"
+        rc = s.execute(text("UPDATE tenants SET name = :n WHERE id = :t"),
+                       {"n": f"{_SENTINEL} {tenant_id}", "t": tenant_id}).rowcount
+        s.commit()
+        return rc == 1, ("ok" if rc == 1 else f"UPDATE задел {rc} строк")
 
 
 def _cleanup_synthetic(tenant_id: str, chat: int) -> tuple[bool, str]:
-    """Удалить тенант, ТОЛЬКО если он помечен _SENTINEL И без чужой активности. Возврат (полностью_чисто, why)."""
+    """Удалить тенант, ТОЛЬКО если он помечен ТОЧНЫМ маркер-именем И без чужой активности.
+    Возврат (полностью_чисто, why).
+
+    Одна maintenance-транзакция (vex#360, консенсус R1 sol+terra): строка tenants берётся
+    FOR UPDATE (PG) — FK-INSERT нового inbound (реальный трафик) берёт KEY SHARE на строку
+    родителя и блокируется до конца транзакции → окно proof→delete закрыто; ownership-пруф
+    перечитывается ПОД замком; сбои отдельных таблиц изолируются savepoint'ами (семантика
+    «под FK — добьём на следующем проходе» сохранена); финальный DELETE guard'ится точным
+    именем в той же транзакции. Слепой maintenance (полу-флип) → отказ, не «не существует»."""
     from sqlalchemy import text
-    from sreda.db.session import get_engine
-    eng = get_engine()
-    with eng.connect() as c:
-        name = _tenant_name(c, tenant_id)
+    from sreda.db.session import privileged_session
 
-    tenant_present = name is not None
-    if tenant_present and _SENTINEL not in (name or ""):
-        return False, f"ОТКАЗ: тенант {tenant_id} без маркера (реальный?) — НЕ удаляю"
-    if tenant_present and _has_foreign_activity(eng, tenant_id):
-        return False, f"ОТКАЗ: у {tenant_id} есть реальная активность (чужой update_id) — НЕ удаляю"
+    if not _maintenance_sighted():
+        return False, ("ОТКАЗ: maintenance-сессия слепа под RLS (maintenance-DSN не разведён?) — "
+                       "НЕ чищу (слепое «не существует» = ложный PASS)")
 
-    if tenant_present:
-        # дети: tenant_id-колонки + schema-safe FK-граф на public.tenants(id)
-        with eng.connect() as c:
-            tid_tbls = [r[0] for r in c.execute(text(
+    expected_name = f"{_SENTINEL} {tenant_id}"
+    with privileged_session("monitor") as s:
+        is_pg = s.get_bind().dialect.name == "postgresql"
+        if is_pg:
+            # длинная guard-транзакция не должна виснуть на чужих локах (sol R2):
+            # таймаут → исключение → отказ/остаток (exit 2), а не бессрочная Фаза 6.
+            # statement_timeout 300с, НЕ 60с (субагент R3): child-DELETE'ы seq-сканят
+            # таблицы без tenant_id-индекса (conversation_turns) — легитимный скан
+            # разросшейся таблицы не должен рубиться в ложный «остаток»; ожидание
+            # чужих локов и так гейтит lock_timeout=5s. Индекс — follow-up в vex#360.
+            s.execute(text("SET LOCAL lock_timeout = '5s'"))
+            s.execute(text("SET LOCAL statement_timeout = '300s'"))
+        name = s.execute(text("SELECT name FROM tenants WHERE id = :t"
+                              + (" FOR UPDATE" if is_pg else "")),
+                         {"t": tenant_id}).scalar()
+
+        tenant_present = name is not None
+        if tenant_present and name != expected_name:
+            return False, f"ОТКАЗ: тенант {tenant_id} без точного маркер-имени (реальный?) — НЕ удаляю"
+        # ре-пруф ПОД замком: закоммиченное до нас видно, новые FK-inserts уже заблокированы
+        if tenant_present and _has_foreign_activity(tenant_id, session=s):
+            return False, f"ОТКАЗ: у {tenant_id} есть реальная активность (чужой update_id) — НЕ удаляю"
+
+        if tenant_present:
+            # дети: tenant_id-колонки + schema-safe FK-граф на public.tenants(id)
+            tid_tbls = [r[0] for r in s.execute(text(
                 "SELECT table_name FROM information_schema.columns "
                 "WHERE column_name = 'tenant_id' AND table_schema = 'public'")).all()]
-            fk_children = c.execute(text("""
+            fk_children = s.execute(text("""
                 SELECT tc.table_name, kcu.column_name
                 FROM information_schema.table_constraints tc
                 JOIN information_schema.key_column_usage kcu
@@ -188,60 +295,74 @@ def _cleanup_synthetic(tenant_id: str, chat: int) -> tuple[bool, str]:
                   AND ccu.table_name = 'tenants'
                   AND ccu.column_name = 'id'
             """)).all()
-        for _ in range(10):
-            progress = 0
-            for tbl in tid_tbls:
-                try:
-                    with eng.begin() as c:
-                        progress += c.execute(text(f'DELETE FROM "{tbl}" WHERE tenant_id = :t'),
-                                              {"t": tenant_id}).rowcount
-                except Exception:  # noqa: BLE001 — под FK, добьём на след. проходе
-                    pass
-            # FK-дети с НЕ-tenant_id колонкой (M2)
-            for tbl, col in fk_children:
-                if tbl == "tenants" or col == "tenant_id":
-                    continue
-                try:
-                    with eng.begin() as c:
-                        progress += c.execute(text(f'DELETE FROM "{tbl}" WHERE "{col}" = :t'),
-                                              {"t": tenant_id}).rowcount
-                except Exception:  # noqa: BLE001
-                    pass
-            if progress == 0:
-                break
+            # information_schema фильтруется привилегиями: новую тенант-таблицу без гранта
+            # maintenance чистка МОЛЧА пропустила бы (0078 сознательно без DEFAULT
+            # PRIVILEGES) — сверяем с реестром и отказываем, а не чистим неполно.
+            from sreda.db import rls_registry
+            missing = set(rls_registry.TENANT_TABLES) - set(tid_tbls)
+            if missing:
+                return False, ("ОТКАЗ: maintenance не видит тенантные таблицы "
+                               f"{sorted(missing)} (грант-дрейф?) — чистка была бы неполной")
+            for _ in range(10):
+                progress = 0
+                for tbl in tid_tbls:
+                    try:
+                        with s.begin_nested():
+                            progress += s.execute(
+                                text(f'DELETE FROM "{tbl}" WHERE tenant_id = :t'),
+                                {"t": tenant_id}).rowcount
+                    except Exception:  # noqa: BLE001 — под FK, добьём на след. проходе
+                        pass
+                # FK-дети с НЕ-tenant_id колонкой (M2)
+                for tbl, col in fk_children:
+                    if tbl == "tenants" or col == "tenant_id":
+                        continue
+                    try:
+                        with s.begin_nested():
+                            progress += s.execute(
+                                text(f'DELETE FROM "{tbl}" WHERE "{col}" = :t'),
+                                {"t": tenant_id}).rowcount
+                    except Exception:  # noqa: BLE001
+                        pass
+                if progress == 0:
+                    break
 
-    # signup_attempts (нет tenant_id) — по (channel, хеш источника). Чистим ВСЕГДА (rate-limit-строки
-    # живут независимо от тенанта), с проверкой остатка (M4).
-    signup_leak = ""
-    try:
-        from sreda.services.signup_abuse import hmac_signup_source
-        h = hmac_signup_source(str(chat))
-        with eng.begin() as c:
-            c.execute(text("DELETE FROM signup_attempts WHERE channel = 'telegram' "
-                           "AND source_id_hash = :h"), {"h": h})
-        with eng.connect() as c:
-            left = c.execute(text("SELECT count(*) FROM signup_attempts WHERE channel = 'telegram' "
+        # signup_attempts (нет tenant_id) — по (channel, хеш источника). Чистим ВСЕГДА (rate-limit-строки
+        # живут независимо от тенанта), с проверкой остатка (M4).
+        signup_leak = ""
+        try:
+            from sreda.services.signup_abuse import hmac_signup_source
+            h = hmac_signup_source(str(chat))
+            with s.begin_nested():
+                s.execute(text("DELETE FROM signup_attempts WHERE channel = 'telegram' "
+                               "AND source_id_hash = :h"), {"h": h})
+            left = s.execute(text("SELECT count(*) FROM signup_attempts WHERE channel = 'telegram' "
                                   "AND source_id_hash = :h"), {"h": h}).scalar()
-        if left:
-            signup_leak = f"; signup-остаток={left}"
-    except Exception as e:  # noqa: BLE001
-        signup_leak = f"; signup-чистка сбой: {type(e).__name__}"
+            if left:
+                signup_leak = f"; signup-остаток={left}"
+        except Exception as e:  # noqa: BLE001
+            signup_leak = f"; signup-чистка сбой: {type(e).__name__}"
 
-    if not tenant_present:
-        return (not signup_leak), ("не существует" + signup_leak)
+        blocker = ""
+        if tenant_present:
+            # tenants последним, В ТОЙ ЖЕ транзакции: DELETE guard'ится ТОЧНЫМ именем, строка
+            # под FOR UPDATE — имя не может смениться конкурентно. Сбой НЕ глотаем (M2).
+            try:
+                with s.begin_nested():
+                    s.execute(text("DELETE FROM tenants WHERE id = :t AND name = :m"),
+                              {"t": tenant_id, "m": expected_name})
+            except Exception as e:  # noqa: BLE001
+                blocker = f"delete tenants заблокирован: {type(e).__name__}: {str(e)[:120]}"
+        try:
+            s.commit()
+        except Exception as e:  # noqa: BLE001
+            s.rollback()
+            blocker = blocker or f"commit чистки упал: {type(e).__name__}: {str(e)[:120]}"
 
-    # tenants последним — АТОМАРНО guardʼим маркером (если имя перестало быть маркированным между
-    # проверкой и сюда — DELETE no-op, реальный тенант не удалим). Сбой НЕ глотаем (M2).
-    blocker = ""
-    try:
-        with eng.begin() as c:
-            c.execute(text("DELETE FROM tenants WHERE id = :t AND name LIKE :m"),
-                      {"t": tenant_id, "m": f"{_SENTINEL}%"})
-    except Exception as e:  # noqa: BLE001
-        blocker = f"delete tenants заблокирован: {type(e).__name__}: {str(e)[:120]}"
-    with eng.connect() as c:
-        gone = c.execute(text("SELECT 1 FROM tenants WHERE id = :t"), {"t": tenant_id}).first() is None
-    return (gone and not signup_leak), ((blocker or "ok") + signup_leak)
+        if not tenant_present:
+            return (not signup_leak and not blocker), ("не существует" + signup_leak)
+        gone = s.execute(text("SELECT 1 FROM tenants WHERE id = :t"), {"t": tenant_id}).first() is None
+        return (gone and not blocker and not signup_leak), ((blocker or "ok") + signup_leak)
 
 
 async def run_smoke(bot_key: str) -> int:
@@ -253,18 +374,24 @@ async def run_smoke(bot_key: str) -> int:
 
     from sreda.services import telegram_inbound as TI
     from sreda.services import admin_alerts as AA
-    from sreda.db.session import get_engine, get_session_factory
+    from sreda.db.session import get_engine
     from sreda.runtime.react_loop import _MAX_STEPS_MARKER
     from sqlalchemy import text
 
+    # app-движок здесь ТОЛЬКО для advisory-lock (лок не зависит от RLS/роли);
+    # данные читаем/чистим через tenant_session / privileged_session (vex#360).
     eng = get_engine()
     # M3: сериализуем параллельные прогоны того же тира — держим advisory-lock на ОТДЕЛЬНОМ соединении
     # весь прогон. Второй прогон не возьмёт лок → ABORT (не тронет живой тенант первого). Только PG.
     lock_conn = None
     if _is_pg(eng):
-        lock_conn = eng.connect()
-        locked = lock_conn.execute(text("SELECT pg_try_advisory_lock(:k)"),
-                                   {"k": _lock_key(tenant_id)}).scalar()
+        try:
+            lock_conn = eng.connect()
+            locked = lock_conn.execute(text("SELECT pg_try_advisory_lock(:k)"),
+                                       {"k": _lock_key(tenant_id)}).scalar()
+        except Exception:  # сбой на самом захвате — не течём соединением/локом (sol R1 M)
+            _release_lock(lock_conn, tenant_id)
+            raise
         if not locked:
             lock_conn.close()
             print(f"[smoke] ⛔ ABORT: параллельный прогон {tenant_id} уже идёт — не вмешиваюсь.")
@@ -272,14 +399,15 @@ async def run_smoke(bot_key: str) -> int:
 
     # с этого момента любой выход обязан снять лок → общий try/finally (MINOR: утечка lock_conn)
     try:
-        return await _run_smoke_locked(bot_key, chat, tenant_id, eng, TI, AA,
-                                       get_session_factory, text, _MAX_STEPS_MARKER)
+        return await _run_smoke_locked(bot_key, chat, tenant_id, TI, AA,
+                                       text, _MAX_STEPS_MARKER)
     finally:
         _release_lock(lock_conn, tenant_id)
 
 
-async def _run_smoke_locked(bot_key, chat, tenant_id, eng, TI, AA,  # noqa: ANN001
-                            get_session_factory, text, _MAX_STEPS_MARKER) -> int:
+async def _run_smoke_locked(bot_key, chat, tenant_id, TI, AA,  # noqa: ANN001
+                            text, _MAX_STEPS_MARKER) -> int:
+    from sreda.db.session import privileged_session, tenant_session
     fake = _FakeTelegramClient()
     TI.telegram_client_for = lambda *_a, **_k: fake  # type: ignore[assignment]
     # M1: нейтрализуем egress admin-алерта на всех слоях: функцию send_admin_alert (её импортируют в
@@ -301,18 +429,32 @@ async def _run_smoke_locked(bot_key, chat, tenant_id, eng, TI, AA,  # noqa: ANN0
         print(f"[smoke] ⛔ ABORT: {tenant_id} в message-queue whitelist — воркер минует заглушки, не гоню.")
         return 2
 
-    # verify-before-destroy: тенант с этим id уже есть?
-    with get_session_factory()() as s:
-        existing_name = _tenant_name(s, tenant_id)
-    if existing_name is not None and _SENTINEL not in existing_name:
-        print(f"[smoke] ⛔ ABORT: {tenant_id} существует БЕЗ маркера (реальный тенант?) — не трогаю.")
-        return 2
-    if existing_name is not None:  # наш остаток от прошлого прогона → чистим ДО старта
-        ok, why = _cleanup_synthetic(tenant_id, chat)
-        print(f"[smoke] пред-остаток (маркирован) очищен: {ok} ({why})")
-        if not ok:  # brand-new гарантии больше нет → не гоним, чтобы старый trace не дал ложный PASS
-            print(f"[smoke] ⛔ ABORT: пред-чистка не завершилась — прогон не brand-new.")
+    # Safety-преамбула: сбой ЛЮБОГО её слоя = ABORT (2), не крэш процесса (код 1) — R2 sol/terra.
+    try:
+        # fail-closed (vex#360): maintenance-слой обязан ВИДЕТЬ tenants. Полу-флип (app-DSN под RLS,
+        # maintenance-DSN не разведён) делает safety/чистку слепыми → ложный PASS + течь. Не гоним.
+        if not _maintenance_sighted():
+            print("[smoke] ⛔ ABORT: maintenance-сессия слепа под RLS (maintenance-DSN не разведён?) — "
+                  "safety-слои и чистка не работают, не гоню.")
             return 2
+
+        # verify-before-destroy: тенант с этим id уже есть? Под maintenance (vex#360):
+        # app-сессия под RLS слепа → не увидела бы ни свой остаток, ни РЕАЛЬНЫЙ тенант.
+        with privileged_session("monitor") as s:
+            existing_name = _tenant_name(s, tenant_id)
+        if existing_name is not None and existing_name != f"{_SENTINEL} {tenant_id}":
+            print(f"[smoke] ⛔ ABORT: {tenant_id} существует БЕЗ точного маркер-имени (реальный "
+                  f"тенант?) — не трогаю.")
+            return 2
+        if existing_name is not None:  # наш остаток от прошлого прогона → чистим ДО старта
+            ok, why = _cleanup_synthetic(tenant_id, chat)
+            print(f"[smoke] пред-остаток (маркирован) очищен: {ok} ({why})")
+            if not ok:  # brand-new гарантии больше нет → не гоним, чтобы старый trace не дал ложный PASS
+                print(f"[smoke] ⛔ ABORT: пред-чистка не завершилась — прогон не brand-new.")
+                return 2
+    except Exception as e:  # noqa: BLE001
+        print(f"[smoke] ⛔ ABORT: safety-преамбула упала ({type(e).__name__}) — не гоню.")
+        return 2
 
     print(f"[smoke] bot_key={bot_key} tenant={tenant_id}")
     onboard_ok = True
@@ -320,7 +462,9 @@ async def _run_smoke_locked(bot_key, chat, tenant_id, eng, TI, AA,  # noqa: ANN0
     try:
         await TI.handle_telegram_update(_update(uid, chat, "/start"), bot_key=bot_key)
         await _await_detached_tasks()
-        with get_session_factory()() as s:
+        # верификация — глазами настоящего юзера (app-роль + tenant-контекст, vex#360):
+        # ловит и «не создан», и «создан, но app под RLS не видит».
+        with tenant_session(tenant_id) as s:
             created = s.execute(text("SELECT 1 FROM tenants WHERE id = :t"), {"t": tenant_id}).first()
             sub = s.execute(text("SELECT status FROM tenant_subscriptions WHERE tenant_id = :t"),
                             {"t": tenant_id}).first()
@@ -330,19 +474,26 @@ async def _run_smoke_locked(bot_key, chat, tenant_id, eng, TI, AA,  # noqa: ANN0
         print(f"  [/start] тенант={bool(created)} подписка={sub_status} (ждём {want_sub}, ок={sub_ok})")
         onboard_ok = onboard_ok and bool(created) and sub_ok
 
-        # Слой 1: перед тем как ПОМЕТИТЬ (штамп маркера = точка риска), докажем владение по update_id.
-        if created and _has_foreign_activity(eng, tenant_id):
-            print(f"[smoke] ⛔ ABORT: у {tenant_id} чужая активность (реальный update_id) — не помечаю, "
-                  f"не удаляю. Разберись вручную.")
-            aborted = True
-            return 2
+        # Слой 1: пометить = точка риска. Пруф владения (update_id) выполняется ВНУТРИ
+        # _mark_synthetic ПОД FOR UPDATE (R2 sol/terra: между отдельным пруфом и маркировкой
+        # был зазор — имя реального тенанта могло перезаписаться). Сбой safety-слоя = ABORT (2),
+        # НЕ «онбординг сломан» (1).
         if created:
-            _mark_synthetic(tenant_id)  # безопасно: тенант доказанно наш
+            try:
+                marked, mark_why = _mark_synthetic(tenant_id)
+            except Exception as e:  # noqa: BLE001
+                marked, mark_why = False, f"маркировка упала: {type(e).__name__}"
+            if not marked:  # чужая активность / слепая сессия / тенант исчез — не трогаем
+                print(f"[smoke] ⛔ ABORT: тенант не помечен ({mark_why}) — не удаляю, "
+                      f"разберись вручную.")
+                aborted = True
+                return 2
 
         n_before = len(fake.sent)
         excs = await _run_turn(TI, uid - 1, chat, bot_key)
         from sreda.db.models.react_trace import ReactTurnTrace
-        with get_session_factory()() as s:
+        # трейс — тоже глазами юзера (tenant_session): рантайм писал его под app+ctx (vex#360)
+        with tenant_session(tenant_id) as s:
             rows = [r for r in s.query(ReactTurnTrace).filter(
                         ReactTurnTrace.tenant_id == tenant_id).all()
                     if r.created_at is not None and r.created_at >= t0]  # freshness

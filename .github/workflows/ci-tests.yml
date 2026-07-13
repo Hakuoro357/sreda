@@ -11,6 +11,8 @@ on:
     paths:
       - 'src/**'
       - 'tests/**'
+      - 'scripts/onboard_smoke.py'
+      - 'migrations/**'
       - 'pyproject.toml'
       - '.github/workflows/ci-tests.yml'
   push:
@@ -18,6 +20,8 @@ on:
     paths:
       - 'src/**'
       - 'tests/**'
+      - 'scripts/onboard_smoke.py'
+      - 'migrations/**'
       - 'pyproject.toml'
       - '.github/workflows/ci-tests.yml'
 
@@ -66,5 +70,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
+      # RLS red-suites (#138 + vex#360): полная цепочка миграций (роли/политики/гранты =
+      # та же механика, что на проде) + LOGIN-пароли тестовым ролям → суиты, которые без
+      # роль-DSN'ов скипаются. До этого они бегали только на локальном docker-стенде.
+      # ПОРЯДОК ВАЖЕН (R2 sol/субагент): миграции ДО теста #331 — его фикстура делает
+      # create_all; на уже созданных таблицах alembic-0001 упал бы DuplicateTable. На
+      # мигрированной схеме create_all — no-op (checkfirst).
+      - name: Миграции до головы + LOGIN-роли для RLS red-suite
+        env:
+          SREDA_DATABASE_URL: postgresql+psycopg://sreda:sreda@localhost:5432/sreda
+        run: |
+          uv run --all-extras alembic upgrade head
+          psql postgresql://sreda:sreda@localhost:5432/sreda -v ON_ERROR_STOP=1 \
+            -c "ALTER ROLE sreda_app LOGIN PASSWORD 'app'" \
+            -c "ALTER ROLE sreda_identity LOGIN PASSWORD 'identity'" \
+            -c "ALTER ROLE sreda_maintenance LOGIN PASSWORD 'maintenance'"
       - name: Класс #331 на реальном PG (begin-хук #138 × изоляция quota)
         run: uv run --all-extras python -m pytest tests/integration/test_331_tx_isolation_pg.py -m pg -q
+      - name: RLS red-suites (#138 изоляция + identity + vex#360 onboard-smoke)
+        env:
+          SREDA_PG_TEST_DSN_OWNER: postgresql+psycopg://sreda:sreda@localhost:5432/sreda
+          SREDA_PG_TEST_DSN_APP: postgresql+psycopg://sreda_app:app@localhost:5432/sreda
+          SREDA_PG_TEST_DSN_MAINT: postgresql+psycopg://sreda_maintenance:maintenance@localhost:5432/sreda
+          SREDA_PG_TEST_DSN_IDENTITY: postgresql+psycopg://sreda_identity:identity@localhost:5432/sreda
+        run: >-
+          uv run --all-extras python -m pytest
+          tests/integration/test_138_rls_pg.py
+          tests/integration/test_138_identity_pg.py
+          tests/integration/test_360_onboard_smoke_rls_pg.py -m pg -q

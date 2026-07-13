@@ -23,6 +23,9 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.pool import NullPool
 
+# vex#360: без module-level pg-марки прогон `-m pg` в CI молча отфильтровывал весь суит
+pytestmark = pytest.mark.pg
+
 _DSN_OWNER = os.environ.get("SREDA_PG_TEST_DSN_OWNER")
 _DSN_IDENTITY = os.environ.get("SREDA_PG_TEST_DSN_IDENTITY")
 _DSN_APP = os.environ.get("SREDA_PG_TEST_DSN_APP")
