@@ -242,26 +242,36 @@ def confirm_decline_signal(text: str) -> bool:
     свежем ходе не фабрикует успех; честная «Отменила» для них — UX-nicety, не гарантия)."""
     t = re.sub(r"[^\w\s]", " ", (text or "").lower())
     toks = t.split()
-    i = 0  # снять ведущие филлеры перед отказом
+    i = 0  # снять ведущие филлеры перед отказом («ну нет», «да нет»)
     while i < len(toks) and toks[i] in _LEAD_FILLERS:
         i += 1
     rest = toks[i:]
     if not rest:
         return False
-    is_refusal = False
-    if rest[0] in _DECLINE_WORDS:
-        is_refusal = True
-    elif rest[0] == "не" and len(rest) >= 2 and (rest[1] in _DECLINE_PHRASE2 or _is_ack_verb(rest[1])):
-        is_refusal = True  # «не надо»/«не согласна»/«не удали»/«не удаляй»
+    # определить refusal-PREFIX и ХВОСТ ПОСЛЕ него. R5 (Codex sol MAJOR): хвост оценивается ПОСЛЕ
+    # префикса — НЕ-отрицаемый командный глагол/запись после «нет» = НОВАЯ команда/показатель (dual-intent
+    # «нет, запиши 16»/«нет, добавь задачу 5» → редирект, НЕ теряем). Отрицаемый глагол «не удали» —
+    # ЧАСТЬ префикса (потребляется). «отмени X» (глагол+объект) = команда отмены, НЕ отказ от confirm.
+    tail: list | None = None
+    if rest[0] == "не" and len(rest) >= 2 and (rest[1] in _DECLINE_PHRASE2 or _is_ack_verb(rest[1])):
+        tail = rest[2:]                         # «не надо…»/«не согласна…»/«не удали…»/«не удаляй…»
+    elif rest[0] in {"нет", "неа", "нея"}:
+        tail = rest[1:]                         # «нет …» (чистое отрицание)
+    elif rest[0] in {"отмена", "отказываюсь", "против"}:
+        tail = rest[1:]                         # «отмена …» (существительное/глагол-отказ без объекта-цели)
+    elif rest[0] == "отмени" and len(rest) == 1:
+        tail = []                               # голое «отмени»; «отмени задачу 5» (объект) → команда → редирект
     elif rest[0] == "ни" and "что" in rest[:3]:
-        is_refusal = True  # «ни за что»
-    if not is_refusal:
+        tail = rest[3:] if len(rest) > 3 else []  # «ни за что …»
+    if tail is None:
+        return False                            # не refusal-prefix → редирект (содержательное/да/эхо)
+    # ХВОСТ содержателен? командный глагол ИЛИ запись-существительное (не число/id-ссылка/связка) →
+    # dual-intent → НЕ чистый отказ → редирект (показатель/команда не теряется).
+    for w in tail:
+        if w.isdigit() or w in _DECLINE_TAIL_OK or _NUM_WORD_RE.match(w):
+            continue
         return False
-    # содержательная НОВАЯ запись в хвосте? (не число/id/связка/сам отказ) → dual-intent → НЕ чистый отказ
-    substantive = [w for w in rest
-                   if not w.isdigit() and w not in _DECLINE_TAIL_OK and not _NUM_WORD_RE.match(w)
-                   and not _is_ack_verb(w)]
-    return not substantive
+    return True
 
 
 def confirm_reply_is_noise(text: str) -> bool:

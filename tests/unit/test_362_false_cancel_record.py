@@ -56,7 +56,7 @@ def _mk_tool(name, invoked):
 
 def _clean_add_task(inv):
     """Чистая сигнатура (без **kw): на resume-re-execute candidate-а поле kw=None ломает ре-валидацию
-    (см. #325 test_e2e_325). Нужна, чтобы «да» реально ИСПОЛНИЛ запись → ассерт на состояние данных."""
+    (см. #325 test_e2e_325). Нужна, чтобы «да» реально ВЫЗВАЛ инструмент записи → ассерт tool dispatch+payload."""
     def _f(title: str = "", q: str = "") -> str:
         inv["add_task"] = inv.get("add_task", 0) + 1
         inv["add_task_title"] = title or q
@@ -167,7 +167,7 @@ def _durable_saver(tmp_path, name):
     return EncryptedSqlCheckpointSaver(session_factory=SF)
 
 
-# ─────────── юнит: data_record_signal ───────────
+# ─────────── юнит: _should_redirect_on_pause (протокол-семантика confirm-ветки) ───────────
 def test_confirm_reply_is_noise():
     """#362 R3/R4 (протокол-семантика): noise = ЭХО-подтверждение/filler (отказ вынесен в
     confirm_decline_signal → classify negate). True → resume/fail-closed; содержательное → False → редирект."""
@@ -193,10 +193,11 @@ def test_confirm_decline_signal():
               "нет, 16", "нет 16", "нет, шестнадцать", "отмена, задача 5", "ну нет, 16", "да нет",
               "нет, по задаче 5", "не согласна, задача 5"):
         assert d(t), f"{t!r} — явный отказ, должен быть decline (честная #321)"
-    # НЕ чистый отказ → False (редирект): запись после отказа (dual-intent), запись, новый запрос, да/эхо
-    for t in ("нет, сахар 16", "нет, запиши температуру высокую", SUGAR, "температура высокая",
-              "покажи покупки", "да", "ок", "удали"):
-        assert not d(t), f"{t!r} — НЕ чистый отказ (содержательное/да/эхо) → редирект/иначе"
+    # НЕ чистый отказ → False (редирект): отказ+КОМАНДА/запись (dual-intent, R5 Codex sol MAJOR — не терять!),
+    # «отмени X» (глагол+объект=команда), запись, новый запрос, да/эхо
+    for t in ("нет, сахар 16", "нет, запиши 16", "нет, добавь задачу 5", "нет, запиши температуру высокую",
+              "отмени задачу 5", SUGAR, "температура высокая", "покажи покупки", "да", "ок", "удали"):
+        assert not d(t), f"{t!r} — НЕ чистый отказ (dual-intent/команда/содержательное/да/эхо) → редирект"
 
 
 # ─────────── юнит: _should_redirect_on_pause (confirm-ветка) ───────────
@@ -232,9 +233,9 @@ def test_should_redirect_declarative_record_362():
 def test_e2e_declarative_record_not_falsely_cancelled_362(install, monkeypatch, tmp_path, record, marker):
     """#362 e2e (чеклист issue), ДВА ассерта:
     (а) декларативная запись показателя на живой confirm-паузе → ответ НЕ «Отменила» (свежий ход);
-    (б) СОСТОЯНИЕ ДАННЫХ — показатель дошёл до записи: инструмент add_task ВЫЗВАН с payload показателя
-        (детерминированная идемпотентная запись живёт в сервисе; здесь бьём диспатч+payload+confirm-барьер,
-        не storage-слой).
+    (б) показатель ДОШЁЛ ДО ЗАПИСИ: инструмент add_task ВЫЗВАН с payload показателя — бьём
+        tool dispatch + payload + confirm-барьер (детерминированная идемпотентная запись в storage
+        живёт в сервисе и здесь НЕ проверяется — mock-инструмент фиксирует вызов и аргумент).
 
     Без фикса: R2 → «Отменила, ничего не делаю.» + inv пуст (показатель дискарден: resume подменяет
     user_text на «нет», модель показатель не видит) → оба ассерта КРАСНЫЕ."""
@@ -370,6 +371,64 @@ def test_withdrawal_context_aware_362():
     assert "НЕ сообщать об" in str(red[0].content) and "обработай новый запрос" in str(red[0].content)
     assert "сменил запрос" not in str(stale[0].content), "stale НЕ должен утверждать смену запроса"
     assert "обработай новый запрос" not in str(stale[0].content), "stale не толкает к новому запросу"
+
+
+def test_e2e_dual_intent_refusal_plus_command_redirects_362(install, monkeypatch, tmp_path):
+    """#362 R5 (Codex sol MAJOR — регресс, введённый R4-детектором): «нет, запиши сахар 16» = отказ +
+    НОВАЯ команда (dual-intent) → РЕДИРЕКТ (команда обслужена свежим ходом), НЕ ложная «Отменила» +
+    потеря. Детектор отказа НЕ должен глотать содержательную команду после ведущего «нет»."""
+    saver = _durable_saver(tmp_path, "ck362di.db")
+    monkeypatch.setattr(react_loop, "_persist_enabled", lambda: True)
+    monkeypatch.setattr(react_loop, "_get_checkpointer", lambda: saver)
+    inv = install()
+    freddie = _ChatRecord(_ai_call("add_task", "c1", title="проверка"),
+                          record="запиши сахар 16", marker="апиши")
+    r1 = _turn(freddie, thread="di362", text=UNSIGNALLED)
+    assert getattr(r1, "awaiting_confirm", False) is True, r1
+    r2 = _turn(freddie, thread="di362", text="нет, запиши сахар 16")
+    assert OTMENILA not in str(r2), f"dual-intent «нет, запиши…» НЕ должно давать ложную «Отменила»: {r2!r}"
+    assert getattr(r2, "awaiting_confirm", False) is True, "команда обслужена свежим ходом (candidate под запись)"
+    assert inv.get("add_task", 0) == 0, "до подтверждения запись не исполняется"
+
+
+def test_e2e_stale_withdrawal_neutral_no_false_cancel_362(install, monkeypatch, tmp_path):
+    """#362 R4/R5 (Codex sol/terra MAJOR): на ПРОТУХШЕЙ паузе (не redirect) свежее сообщение → модель
+    получает НЕЙТРАЛЬНЫЙ withdrawal (БЕЗ «сменил запрос») и отвечает по существу, БЕЗ ложной «Отменила».
+    Проверяем реальный stale-путь durable + доставку нейтральной формулировки в модель."""
+    saver = _durable_saver(tmp_path, "ck362st.db")
+    monkeypatch.setattr(react_loop, "_persist_enabled", lambda: True)
+    monkeypatch.setattr(react_loop, "_get_checkpointer", lambda: saver)
+    captured: list = []
+
+    class _Cap:
+        def __init__(self, first):
+            self.first, self.n = first, 0
+
+        async def ainvoke(self, _m):
+            return AIMessage(content="chat")
+
+        def bind_tools(self, tools):
+            outer = self
+
+            def _inv(msgs):
+                outer.n += 1
+                captured.append(list(msgs))
+                if outer.n == 1:
+                    return outer.first          # ход1 → candidate-confirm пауза
+                return AIMessage(content="Привет! Слушаю.")  # stale-clear свежий ход → финал
+            return RunnableLambda(_inv)
+
+    install()
+    freddie = _Cap(_ai_call("add_task", "c1", title="проверка"))
+    r1 = _turn(freddie, thread="st362", text=UNSIGNALLED)
+    assert getattr(r1, "awaiting_confirm", False) is True, r1
+    monkeypatch.setattr(react_loop, "_interrupt_age_seconds", lambda *a, **k: 30 * 3600)  # протухла
+    n_before = len(captured)
+    r2 = _turn(freddie, thread="st362", text="Привет")  # НЕ сигнал → stale-clear (не redirect)
+    assert OTMENILA not in str(r2), f"stale-ход не должен давать ложную «Отменила»: {r2!r}"
+    flat = _flat_msgs(captured[n_before:])
+    assert "вызов инструмента отменён" in flat, "премиса: withdrawal-сирота на stale-пути"
+    assert "сменил запрос" not in flat, "stale withdrawal НЕ должен утверждать «сменил запрос»"
 
 
 def _flat_msgs(caps):
