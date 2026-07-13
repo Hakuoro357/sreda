@@ -164,9 +164,10 @@ def _seed(owner_eng, *, name: str, update_id: str, deep: bool = True) -> None:
             c.execute(text("INSERT INTO users (id, tenant_id) VALUES (:i, :t)"),
                       {"i": f"user_360_{CHAT}", "t": TID})
             c.execute(
-                text("INSERT INTO tenant_subscriptions (id, tenant_id, plan_id, feature_key, status) "
-                     "VALUES (:i, :t, :p, 'smoke360', 'active')"),
-                {"i": f"sub_360_{CHAT}", "t": TID, "p": PLAN_ID},
+                text("INSERT INTO tenant_subscriptions (id, tenant_id, plan_id, feature_key, "
+                     "status, created_at, updated_at) "
+                     "VALUES (:i, :t, :p, 'smoke360', 'active', :now, :now)"),
+                {"i": f"sub_360_{CHAT}", "t": TID, "p": PLAN_ID, "now": now},
             )
 
 
@@ -351,8 +352,9 @@ class _StubTI:
                          "VALUES (:t, 'e2e-360', :now, :now)"), {"t": tid, "now": now})
                 c.execute(
                     text("INSERT INTO tenant_subscriptions (id, tenant_id, plan_id, feature_key, "
-                         "status) VALUES (:i, :t, :p, 'smoke360', :st)"),
-                    {"i": f"sub_{tid}", "t": tid, "p": PLAN_ID, "st": self._sub_status})
+                         "status, created_at, updated_at) "
+                         "VALUES (:i, :t, :p, 'smoke360', :st, :now, :now)"),
+                    {"i": f"sub_{tid}", "t": tid, "p": PLAN_ID, "st": self._sub_status, "now": now})
                 c.execute(
                     text("INSERT INTO inbound_messages "
                          "(id, tenant_id, channel_type, bot_key, external_update_id, status, "
