@@ -17,9 +17,9 @@ _CONTACTS = (
 
 def test_contacts_bot_link_on_telegram_me_home_bot():
     html = _CONTACTS.read_text(encoding="utf-8")
-    # #370: домен на telegram.me, бот home-издания — @sreda_home_assistance.
-    assert 'href="https://telegram.me/sreda_home_assistance"' in html
-    assert "@sreda_home_assistance" in html
+    # #370: домен на telegram.me, бот home-издания — @sreda_home_bot.
+    assert 'href="https://telegram.me/sreda_home_bot"' in html
+    assert "@sreda_home_bot" in html
     # Битый короткий хост и устаревший бот не должны остаться.
     assert "//t.me/" not in html
     assert "sreda01_bot" not in html
