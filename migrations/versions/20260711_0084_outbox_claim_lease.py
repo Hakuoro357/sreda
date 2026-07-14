@@ -26,9 +26,13 @@ CONCURRENTLY (рассматривался на R6) НЕЛЬЗЯ внутри т
 атомарен с revision-стемпом → сбой откатывается чисто, повтор безопасен. Для маленькой
 таблицы это строго лучший трейд. SQLite (тесты) — тот же обычный CREATE INDEX.
 
-Revision ID: 20260711_0083
-Revises: 20260709_0082
+Revision ID: 20260711_0084
+Revises: 20260711_0083
 Create Date: 2026-07-11
+
+Note: изначально ревизия 20260711_0083; перенумерована в 0084 при sync с main
+(#344 F5), т.к. main принёс параллельную 20260711_0083 (identity_resolve_v2).
+Зачейнено после неё — таблицы независимы, порядок identity→outbox безопасен.
 """
 
 from __future__ import annotations
@@ -37,8 +41,8 @@ import sqlalchemy as sa
 from alembic import op
 
 
-revision = "20260711_0083"
-down_revision = "20260709_0082"
+revision = "20260711_0084"
+down_revision = "20260711_0083"
 branch_labels = None
 depends_on = None
 
