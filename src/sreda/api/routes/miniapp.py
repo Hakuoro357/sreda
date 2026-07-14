@@ -21,12 +21,12 @@ from jinja2 import Environment, FileSystemLoader
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
-from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from sreda.api.deps import enforce_miniapp_rate_limit, get_session
+from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
 from sreda.config.settings import get_settings
-from sreda.db.session import privileged_session, tenant_session
 from sreda.db.models.billing import SubscriptionPlan, TenantSubscription
 from sreda.db.repositories.memory import (
     CategoryConfirmMismatch,
@@ -36,6 +36,7 @@ from sreda.db.repositories.memory import (
     MemoryCategoryError,
     MemoryRepository,
 )
+from sreda.db.session import privileged_session, tenant_session
 from sreda.domain.tenants.features import is_feature_disabled
 from sreda.features.app_registry import get_feature_registry
 from sreda.features.contracts import MiniAppSection, MiniAppSectionsProvider
@@ -51,6 +52,7 @@ from sreda.services.housewife_menu import HousewifeMenuService
 from sreda.services.housewife_recipes import HousewifeRecipeService
 from sreda.services.housewife_reminders import HousewifeReminderService
 from sreda.services.housewife_shopping import HousewifeShoppingService
+from sreda.services.identity_resolve import AmbiguousExternalIdentity
 from sreda.services.max_auth import (
     MaxInitDataError,
     resolve_tenant_from_max_account_id,
@@ -61,7 +63,6 @@ from sreda.services.onboarding import (
     ensure_max_user_bundle,
     ensure_telegram_user_bundle_by_id,
 )
-from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
 from sreda.services.telegram_auth import (
     TelegramInitDataError,
     resolve_tenant_from_telegram_id,
@@ -235,26 +236,19 @@ def _require_miniapp_auth(
             user_id = onboarding.user_id
         else:
             tenant_id, user_id = resolved
-            # #187 Phase 4a — soft-delete gate ДО любой durable-мутации
-            # auth-слоя (_stamp_last_bot_key коммитит last_bot_key). Удалён
-            # existing-тенант → 410 БЕЗ мутации. Гейт только для уже
-            # резолвленного тенанта; lazy-provision-ветка (resolved is None)
-            # сюда не попадает — там тенант только что создан, всегда активен.
-            _gate_miniapp_tenant_active(session, tenant_id)
-            # #109 (Codex MAJOR): existing TG-юзер открыл Mini App, но
-            # /start не слал — здесь НЕ вызывается
-            # ensure_telegram_user_bundle_by_id, поэтому _stamp_last_bot_key
-            # не сработал бы. Мигрировавший юзер, который пользуется только
-            # Mini App'ом @sreda_home_bot, остался бы со stale/NULL
-            # last_bot_key → async-уведомления mis-route. Штампуем текущий
-            # (Telegram) bot_key напрямую: helper идемпотентен (no-op +
-            # без commit'а если значение не изменилось), пропускает пустой
-            # bot_key. resolved_bot_key в TG-ветке всегда зарегистрированный
-            # TG bot_key.
+            # #138 Ф5-5c: soft-delete гейт + last_bot_key-штамп существующего юзера —
+            # под tenant_session (app+ctx): после флипа DSN на sreda_app эти
+            # SELECT/UPDATE на неском-скоупленной сессии вернули бы 0 (RLS) и
+            # дропнули бы живого юзера / не обновили бота. Под ctx свой тенант виден.
+            # #187 Phase 4a — гейт ДО мутации; #109 — штамп текущего TG-бота
+            # (helper идемпотентен, no-op без commit'а если не изменилось).
             from sreda.db.models.core import User as _User
-            _user_row = session.get(_User, user_id)
-            if _user_row is not None:
-                _stamp_last_bot_key(session, _user_row, resolved_bot_key)
+            from sreda.db.session import tenant_session as _tenant_session
+            with _tenant_session(tenant_id) as _ts:
+                _gate_miniapp_tenant_active(_ts, tenant_id)
+                _user_row = _ts.get(_User, user_id)
+                if _user_row is not None:
+                    _stamp_last_bot_key(_ts, _user_row, resolved_bot_key)
 
     else:  # channel == "max"
         if not settings.max_bot_token:
@@ -276,14 +270,14 @@ def _require_miniapp_auth(
         account_id = max_user.max_user_id
         try:
             resolved = resolve_tenant_from_max_account_id(session, account_id)
-        except MultipleResultsFound:
+        except (MultipleResultsFound, AmbiguousExternalIdentity):
             # codex R2 MINOR #6: specific exception вместо bare ``Exception``.
-            # `find_user_by_max_account_id` использует one_or_none(),
-            # на duplicate `users.max_account_id` (нет UNIQUE constraint
-            # в текущей schema) бросит MultipleResultsFound. Любые другие
-            # DB ошибки пробрасываются вверх (FastAPI 500) с raw stack —
-            # это правильно: «duplicate integrity» — не маска любого
-            # falure'а, а конкретный case.
+            # На duplicate `users.max_account_id` (нет UNIQUE constraint в
+            # текущей schema): прежний путь через one_or_none() бросал
+            # MultipleResultsFound; #138 Ф5-5b резолв через DEFINER бросает
+            # AmbiguousExternalIdentity (fail-closed на n>1). Оба = «дубль,
+            # не привязывать» → 500. Любые другие DB ошибки пробрасываются
+            # вверх (FastAPI 500) с raw stack — это правильно.
             logger.exception(
                 "miniapp auth: duplicate users.max_account_id for max=%s — "
                 "DATA INTEGRITY ERROR, нужен migration с UNIQUE partial index",
@@ -328,6 +322,18 @@ def _require_miniapp_auth(
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                     detail=f"signup_blocked:{exc.reason}",
+                )
+            except AmbiguousExternalIdentity:
+                # R3 (Codex medium): гонка precheck↔ensure — дубль появился между
+                # ними. Fail-closed: НЕ провижнить, 500 (как duplicate-integrity выше).
+                session.rollback()
+                logger.exception(
+                    "miniapp auth: ambiguous max_account_id at ensure for max=%s — "
+                    "DATA INTEGRITY (>1 user)", account_id,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="duplicate_max_account_integrity",
                 )
             except IntegrityError:
                 session.rollback()
@@ -397,72 +403,72 @@ def _require_miniapp_auth(
                 user_id = onboarding.user_id
         else:
             tenant_id, user_id = resolved
-            # #187 Phase 4a — soft-delete gate ДО durable-мутации
-            # max_chat_id-refresh (session.commit ниже). Удалён existing
-            # MAX-тенант → 410 БЕЗ записи max_chat_id. Гейт только для уже
-            # резолвленного тенанта; lazy-provision/race-ветки (onboarding не
-            # None / resolved-after-race) сюда не попадают — тенант только что
-            # создан, всегда активен.
-            _gate_miniapp_tenant_active(session, tenant_id)
-            # #341 (F1, CRITICAL, Codex R-codex MAJOR D): max_chat_id —
-            # FIRST-SET-ONLY. Ставим ТОЛЬКО когда сейчас NULL/пусто (первичная
-            # установка). НЕ перезаписываем УЖЕ установленный chat_id: единый
-            # инвариант — established max_chat_id меняется ТОЛЬКО через
-            # аутентифицированный channel-link flow (channel_linking.consume_link),
-            # чтобы не было второго неконтролируемого пути перезаписи.
-            # Сценарий пересоздания MAX-аккаунта (новый chat_id для того же
-            # аккаунта) теперь обслуживается ре-линком через consume_link
-            # (same-account ветка обновляет chat_id).
-            if max_user.max_chat_id:
-                try:
-                    from sreda.db.models.core import User
-                    from sqlalchemy import or_ as _or, update as _update
-                    # #341 (R-final MINOR): атомарный conditional first-set —
-                    # зеркалит онбординг (пишем ТОЛЬКО когда сейчас NULL/'').
-                    # read-then-write здесь не эксплуатируем (значение из
-                    # HMAC-initData того же юзера), но держим инвариант единым.
-                    logger.info(
-                        "miniapp auth: first-set max_chat_id (if unset) user=%s",
-                        user_id,
-                    )
-                    session.execute(
-                        _update(User)
-                        .where(User.id == user_id)
-                        .where(_or(User.max_chat_id.is_(None), User.max_chat_id == ""))
-                        .values(max_chat_id=max_user.max_chat_id)
-                        .execution_options(synchronize_session=False)
-                    )
-                    session.commit()
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "miniapp auth: max_chat_id first-set failed user=%s",
-                        user_id, exc_info=True,
-                    )
-                    session.rollback()
+            # #138 Ф5-5c ⊕ #341 (security): под tenant_session (app+ctx) —
+            # после флипа DSN эти SELECT/UPDATE на нескоупленной сессии вернули бы
+            # 0 (RLS); под ctx свой тенант виден. #187 Phase 4a — гейт soft-delete
+            # ДО мутации (удалён existing MAX-тенант → 410 без записи).
+            # #341 (F1, CRITICAL, Codex R-codex MAJOR D): max_chat_id FIRST-SET-ONLY —
+            # ставим ТОЛЬКО когда сейчас NULL/пусто; established chat_id меняется
+            # ТОЛЬКО через аутентифицированный channel-link (consume_link), иначе
+            # поддельный initData увёл бы уведомления жертвы. read-then-write не
+            # эксплуатируем (значение из HMAC-initData того же юзера), но держим
+            # инвариант единым с онбордингом. Гейт только для уже резолвленного
+            # тенанта; lazy-provision/race-ветки сюда не попадают (тенант только
+            # что создан, всегда активен).
+            from sreda.db.models.core import User
+            from sqlalchemy import or_ as _or, update as _update
+            from sreda.db.session import tenant_session as _tenant_session
+            with _tenant_session(tenant_id) as _ts:
+                _gate_miniapp_tenant_active(_ts, tenant_id)
+                if max_user.max_chat_id:
+                    try:
+                        logger.info(
+                            "miniapp auth: first-set max_chat_id (if unset) user=%s",
+                            user_id,
+                        )
+                        _ts.execute(
+                            _update(User)
+                            .where(User.id == user_id)
+                            .where(_or(User.max_chat_id.is_(None), User.max_chat_id == ""))
+                            .values(max_chat_id=max_user.max_chat_id)
+                            .execution_options(synchronize_session=False)
+                        )
+                        _ts.commit()
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "miniapp auth: max_chat_id first-set failed user=%s",
+                            user_id, exc_info=True,
+                        )
+                        _ts.rollback()
 
     # #187 Phase 4a — soft-delete gate уже применён ДО мутаций auth-слоя:
     # для existing-тенанта (обе ветки TG/MAX) через _gate_miniapp_tenant_active
     # сразу после резолва; lazy-provisioned тенант только что создан и всегда
     # активен. Удалённый тенант → 410 БЕЗ stamp/refresh-мутаций.
 
-    # Resolve workspace_id for connect link creation (channel-agnostic)
+    # Resolve workspace_id for connect link creation (channel-agnostic).
+    # #138 Ф5-5c (Codex medium R3 MAJOR): под tenant_session(tenant_id) — иначе
+    # после флипа DSN app-роль без ctx вернёт 0 строк → workspace_id=None →
+    # ломает connect-link. Под ctx свой тенант виден (p_{t}_tenant FOR ALL).
     from sreda.db.models.core import Assistant, Workspace
+    from sreda.db.session import tenant_session as _tenant_session
 
-    assistant = (
-        session.query(Assistant)
-        .filter(Assistant.tenant_id == tenant_id)
-        .order_by(Assistant.id.asc())
-        .first()
-    )
-    workspace_id = assistant.workspace_id if assistant else None
-    if workspace_id is None:
-        workspace = (
-            session.query(Workspace)
-            .filter(Workspace.tenant_id == tenant_id)
-            .order_by(Workspace.id.asc())
+    with _tenant_session(tenant_id) as _ts:
+        assistant = (
+            _ts.query(Assistant)
+            .filter(Assistant.tenant_id == tenant_id)
+            .order_by(Assistant.id.asc())
             .first()
         )
-        workspace_id = workspace.id if workspace else None
+        workspace_id = assistant.workspace_id if assistant else None
+        if workspace_id is None:
+            workspace = (
+                _ts.query(Workspace)
+                .filter(Workspace.tenant_id == tenant_id)
+                .order_by(Workspace.id.asc())
+                .first()
+            )
+            workspace_id = workspace.id if workspace else None
 
     return MiniAppContext(
         tenant_id=tenant_id,
@@ -1481,8 +1487,9 @@ def _batch_load_checklist_counts(
     """
     if not checklist_ids:
         return {}
+    from sqlalchemy import case, func
+
     from sreda.db.models.checklists import Checklist, ChecklistItem
-    from sqlalchemy import func, case
 
     # Ownership filter via Checklist join — defense-in-depth
     rows = (
@@ -2118,7 +2125,8 @@ def _resolve_platform_auth(
 
     if platform == "max":
         from sreda.services.max_auth import (
-            MaxInitDataError, validate_max_init_data,
+            MaxInitDataError,
+            validate_max_init_data,
         )
         if not settings.max_bot_token:
             raise HTTPException(status_code=500, detail="max_bot_token_not_configured")
@@ -2211,7 +2219,8 @@ async def channel_link_start(
         source_bot_key = "sreda"  # MAX platform; no per-bot dispatch here
 
     from sreda.services.channel_linking import (
-        ChannelLinkRateLimitedError, start_link,
+        ChannelLinkRateLimitedError,
+        start_link,
     )
 
     # Server-side recheck: if tenant already has the target channel linked,

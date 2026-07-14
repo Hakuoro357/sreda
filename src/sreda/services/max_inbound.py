@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 from sreda.config.settings import get_settings
 from sreda.db.models.core import Tenant
-from sreda.db.session import get_session_factory, tenant_ctx
+from sreda.db.session import get_session_factory, privileged_session, tenant_ctx
 from sreda.integrations.max import MaxClient
 from sreda.integrations.max.client import MaxDeliveryError
 from sreda.services.inbound_messages import persist_max_inbound_event
@@ -133,18 +133,30 @@ async def handle_max_update(
         # ``_process_approved_max_turn`` — entry-гард его покрывает). Удалённый
         # существующий тенант → ТИХИЙ no-op. Новый юзер (резолв=None) → гард
         # пропускается. RuntimeError из резолва → «не резолвится», НЕ «удалён».
-        from sreda.services.tenant_lifecycle import is_tenant_active
-        from sreda.services.max_auth import resolve_tenant_from_max_account_id
+        from sreda.services.identity_resolve import (
+            AmbiguousExternalIdentity,
+            resolve_external_identity,
+        )
 
+        # #138 Ф5-5c: резолв + soft-delete гейт по identity-DEFINER (tenant_active),
+        # НЕ app-SELECT is_tenant_active — после флипа DSN он дропнул бы живого юзера.
         try:
-            _resolved = resolve_tenant_from_max_account_id(session, str(sender_user_id))
+            _resolved = resolve_external_identity("max", str(sender_user_id))
         except RuntimeError:
             _resolved = None
-        if _resolved is not None and not is_tenant_active(session, _resolved[0]):
+        except AmbiguousExternalIdentity:
+            # max_account_id матчит >1 юзера. Трактовать как None НЕЛЬЗЯ — провижн
+            # создал бы ТРЕТИЙ дубль. Тихий дроп: ждать channel-linking/support.
+            logger.warning(
+                "max inbound: ambiguous max_account_id (>1 user) — silent drop, "
+                "no provision (нужна ручная развязка)"
+            )
+            return ""
+        if _resolved is not None and not _resolved.tenant_active:
             logger.info(
                 "max inbound: tenant %s is soft-deleted — silent drop "
                 "(no ensure/welcome/LLM/STT)",
-                _resolved[0],
+                _resolved.tenant_id,
             )
             return ""
 
@@ -160,6 +172,14 @@ async def handle_max_update(
                 max_chat_id=chat_id,
                 display_name=display_name,
             )
+        except AmbiguousExternalIdentity:
+            # R3 (Codex medium): гонка precheck↔ensure — дубль появился между ними.
+            # Fail-closed: НЕ провижнить третью семью, тихий дроп (как precheck).
+            logger.warning(
+                "max inbound: ambiguous max_account_id at ensure — silent drop, "
+                "no provision (гонка/ручная развязка)"
+            )
+            return ""
         except SignupBlocked as exc:
             logger.info(
                 "max inbound: signup blocked reason=%s — drop update",
@@ -176,274 +196,283 @@ async def handle_max_update(
                     logger.warning("max signup-blocked notify failed", exc_info=True)
             return ""
 
-        # Phase 2 fix 2026-05-08 (Codex MAJOR hardening): welcome
-        # отправляется на основе `is_welcome_sent` флага в БД, не
-        # `is_new_user`. Если HTTP-send падает, флаг остаётся False —
-        # следующий inbound заретраит. Mark-sent ТОЛЬКО на успешный
-        # send, через `mark_welcome_sent` (commit per call).
-        welcome_just_sent = False
-        if (
-            onboarding.tenant_id
-            and onboarding.user_id
-            and onboarding.max_chat_id
-            and settings.max_bot_token
-        ):
-            from sreda.services.onboarding import (
-                build_post_approve_keyboard_max,
-                build_post_approve_message,
-                is_welcome_sent,
-                mark_welcome_sent,
-            )
-            if not is_welcome_sent(session, onboarding.tenant_id, onboarding.user_id):
-                try:
-                    client = MaxClient(token=settings.max_bot_token)
-                    await client.send_message(
-                        recipient={"chat_id": onboarding.max_chat_id},
-                        text=build_post_approve_message(),
-                        attachments=build_post_approve_keyboard_max(),
-                    )
-                    mark_welcome_sent(
-                        session, onboarding.tenant_id, onboarding.user_id,
-                    )
-                    welcome_just_sent = True
-                    logger.info(
-                        "max inbound: post-approve welcome sent tenant=%s",
-                        onboarding.tenant_id,
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "max post-approve welcome failed for tenant=%s "
-                        "(retry on next inbound)",
-                        onboarding.tenant_id, exc_info=True,
-                    )
-
-        result = persist_max_inbound_event(
-            session, bot_key=bot_key, payload=payload,
-        )
-
-        # 2026-05-09 fix (Boris feedback): если welcome ТОЛЬКО ЧТО отправлен
-        # этой inbound-message — НЕ передаём её дальше в chat handler.
-        # Иначе юзер получает double-reply на /start: welcome (с кнопкой)
-        # + LLM chat reply. Welcome consumes the inbound; следующее
-        # сообщение юзера пойдёт нормально в chat. Применяется ко ВСЕМ
-        # inbound types — text/voice/callback/bot_started.
-        if welcome_just_sent:
-            logger.info(
-                "max inbound: welcome consumed inbound — skip chat dispatch "
-                "tenant=%s inbound_id=%s",
-                onboarding.tenant_id, result.inbound_message_id,
-            )
-            _set_processing_status(
-                session, result.inbound_message_id, "ignored",
-            )
-            return result.inbound_message_id
-
-        if result.is_duplicate:
-            logger.info(
-                "max inbound: duplicate update %s for bot %s — no-op",
-                result.inbound_message_id, bot_key,
-            )
-            return result.inbound_message_id
-
-        # Phase 2 (Codex CRITICAL fix 2026-05-07): EntitlementGate enforced
-        # at handler entry. Suspended tenants получают UPGRADE_COPY и
-        # помечаются ignored. См. подробный коммент в telegram_inbound.py.
-        from sreda.services.entitlement_gate import EntitlementGate
-        _gate = EntitlementGate(session).check(onboarding.tenant_id)
-        if not _gate.allowed:
-            logger.info(
-                "max inbound: entitlement gate blocked tenant=%s "
-                "reason=%s — drop turn, mark ignored",
-                onboarding.tenant_id, _gate.reason,
-            )
-            if onboarding.max_chat_id and settings.max_bot_token:
-                try:
-                    client = MaxClient(token=settings.max_bot_token)
-                    await client.send_message(
-                        recipient={"chat_id": onboarding.max_chat_id},
-                        text=UPGRADE_COPY.get(
-                            _gate.reason,
-                            UPGRADE_COPY["no_active_subscription"],
-                        ),
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "max entitlement-blocked notify failed", exc_info=True,
-                    )
-            _set_processing_status(
-                session, result.inbound_message_id, "ignored",
-            )
-            return result.inbound_message_id
-
-        tenant = session.get(Tenant, onboarding.tenant_id)
-        is_approved = tenant is not None and tenant.approved_at is not None
-
-        # Broadcast pattern (2026-05-09): pb:* callbacks от approved
-        # юзеров тоже должны запускать pending_bot wizard. Это позволяет
-        # post-approve welcome message с кнопкой «Покажи примеры»
-        # → callback `pb:voice` → wizard editMessage flow. Без этой ветки
-        # callback'и от approved юзеров silent-drop'ились.
-        is_pb_callback = (
-            update_type == "message_callback"
-            and isinstance(
-                ((payload.get("callback") or {}).get("payload") or ""),
-                str,
-            )
-            and ((payload.get("callback") or {}).get("payload") or "")
-                .startswith("pb:")
-        )
-
-        if not is_approved or is_pb_callback:
-            # Pending tenant ИЛИ approved юзер с pb:* callback'ом —
-            # send welcome через pending_bot (intro branch при
-            # bot_started; tour branch на pb:* callbacks).
-            # Иначе silent (избегаем spam'а при regular messages).
-            #
-            # is_post_approve_tour=True ТОЛЬКО для approved+pb_callback:
-            # pb:done покажет вопрос имени и запишет waiting-flag.
-            # Pending юзеры получают pending-closing без вопроса имени.
-            await _handle_max_pending_tenant(
-                session=session,
-                payload=payload,
-                update_type=update_type,
-                onboarding=onboarding,
-                settings=settings,
-                is_post_approve_tour=is_approved and is_pb_callback,
-            )
-            _set_processing_status(
-                session, result.inbound_message_id, "ignored",
-            )
-            return result.inbound_message_id
-
-        # 2026-05-11 (Boris explicit Pat 2): MAX channel btn_reply handler.
-        # Mirror telegram_bot._handle_btn_reply_callback: resolve token →
-        # ack callback → mutate payload to look like text-message →
-        # downstream `dispatch_max_action` видит обычный text turn и
-        # инжектит label в action.params как user text. Single-use:
-        # `ReplyButtonService.resolve_token` помечает `used_at`, повторный
-        # клик возвращает None → toast «выбор устарел». Только для
-        # approved tenants — кнопки только им и шлются.
-        _cb_data_btn = (
-            (payload.get("callback") or {}).get("payload") or ""
-            if update_type == "message_callback"
-            else ""
-        )
-        # #166 B R2 (Codex medium MAJOR): тап [Да]/[Нет] react-подтверждения
-        # обрабатываем НЕ здесь, а в детач-ходе ``_process_approved_max_turn``
-        # ВНУТРИ per-tenant lock + trace. Раньше обработка шла прямо тут (инлайн
-        # из вебхука): (1) вне tenant-lock → гонка с параллельным текст-ходом того
-        # же треда; (2) без trace → невидима в trace.log; (3) полный LLM-ход
-        # блокировал ответ 202 вебхука. ``react:yes/no`` добавлены в
-        # ``_KNOWN_MAX_CALLBACK_EXACT`` → проходят unknown-prefix-гейт и шедулятся.
-
-        if isinstance(_cb_data_btn, str) and _cb_data_btn.startswith("btn_reply:"):
-            from sreda.services.reply_buttons import ReplyButtonService
-            cb_token = _cb_data_btn.removeprefix("btn_reply:").strip()
-            callback_id = (payload.get("callback") or {}).get("callback_id")
-            label: str | None = None
-            if onboarding.tenant_id and onboarding.user_id and cb_token:
-                try:
-                    label = ReplyButtonService(session).resolve_token(
-                        tenant_id=onboarding.tenant_id,
-                        user_id=onboarding.user_id,
-                        token=cb_token,
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "max btn_reply token resolution failed for "
-                        "tenant=%s token=%s",
-                        onboarding.tenant_id, cb_token, exc_info=True,
-                    )
-                    label = None
-
-            if label is None:
-                # Expired / already used / wrong owner — toast + drop.
-                if callback_id and settings.max_bot_token:
+        # #138 Ф5-5c (Codex high R3 CRIT): пост-резолв ХВОСТ входящего под
+        # tenant-контекстом (welcome/persist/entitlement/status/btn_reply) —
+        # чтобы после флипа DSN app-роль видела/писала свой тенант (иначе
+        # find_user→0, persist tenant_id=NULL, EntitlementGate блок всех).
+        session.commit()
+        _tenant_tok = tenant_ctx.set(onboarding.tenant_id)
+        try:
+            # Phase 2 fix 2026-05-08 (Codex MAJOR hardening): welcome
+            # отправляется на основе `is_welcome_sent` флага в БД, не
+            # `is_new_user`. Если HTTP-send падает, флаг остаётся False —
+            # следующий inbound заретраит. Mark-sent ТОЛЬКО на успешный
+            # send, через `mark_welcome_sent` (commit per call).
+            welcome_just_sent = False
+            if (
+                onboarding.tenant_id
+                and onboarding.user_id
+                and onboarding.max_chat_id
+                and settings.max_bot_token
+            ):
+                from sreda.services.onboarding import (
+                    build_post_approve_keyboard_max,
+                    build_post_approve_message,
+                    is_welcome_sent,
+                    mark_welcome_sent,
+                )
+                if not is_welcome_sent(session, onboarding.tenant_id, onboarding.user_id):
                     try:
-                        _client = MaxClient(token=settings.max_bot_token)
-                        await _client.answer_callback(
-                            str(callback_id),
-                            notification="Выбор устарел. Напиши что нужно.",
+                        client = MaxClient(token=settings.max_bot_token)
+                        await client.send_message(
+                            recipient={"chat_id": onboarding.max_chat_id},
+                            text=build_post_approve_message(),
+                            attachments=build_post_approve_keyboard_max(),
+                        )
+                        mark_welcome_sent(
+                            session, onboarding.tenant_id, onboarding.user_id,
+                        )
+                        welcome_just_sent = True
+                        logger.info(
+                            "max inbound: post-approve welcome sent tenant=%s",
+                            onboarding.tenant_id,
                         )
                     except Exception:  # noqa: BLE001
                         logger.warning(
-                            "max btn_reply expired-ack failed", exc_info=True,
+                            "max post-approve welcome failed for tenant=%s "
+                            "(retry on next inbound)",
+                            onboarding.tenant_id, exc_info=True,
+                        )
+
+            result = persist_max_inbound_event(
+                session, bot_key=bot_key, payload=payload,
+            )
+
+            # 2026-05-09 fix (Boris feedback): если welcome ТОЛЬКО ЧТО отправлен
+            # этой inbound-message — НЕ передаём её дальше в chat handler.
+            # Иначе юзер получает double-reply на /start: welcome (с кнопкой)
+            # + LLM chat reply. Welcome consumes the inbound; следующее
+            # сообщение юзера пойдёт нормально в chat. Применяется ко ВСЕМ
+            # inbound types — text/voice/callback/bot_started.
+            if welcome_just_sent:
+                logger.info(
+                    "max inbound: welcome consumed inbound — skip chat dispatch "
+                    "tenant=%s inbound_id=%s",
+                    onboarding.tenant_id, result.inbound_message_id,
+                )
+                _set_processing_status(
+                    session, result.inbound_message_id, "ignored",
+                )
+                return result.inbound_message_id
+
+            if result.is_duplicate:
+                logger.info(
+                    "max inbound: duplicate update %s for bot %s — no-op",
+                    result.inbound_message_id, bot_key,
+                )
+                return result.inbound_message_id
+
+            # Phase 2 (Codex CRITICAL fix 2026-05-07): EntitlementGate enforced
+            # at handler entry. Suspended tenants получают UPGRADE_COPY и
+            # помечаются ignored. См. подробный коммент в telegram_inbound.py.
+            from sreda.services.entitlement_gate import EntitlementGate
+            _gate = EntitlementGate(session).check(onboarding.tenant_id)
+            if not _gate.allowed:
+                logger.info(
+                    "max inbound: entitlement gate blocked tenant=%s "
+                    "reason=%s — drop turn, mark ignored",
+                    onboarding.tenant_id, _gate.reason,
+                )
+                if onboarding.max_chat_id and settings.max_bot_token:
+                    try:
+                        client = MaxClient(token=settings.max_bot_token)
+                        await client.send_message(
+                            recipient={"chat_id": onboarding.max_chat_id},
+                            text=UPGRADE_COPY.get(
+                                _gate.reason,
+                                UPGRADE_COPY["no_active_subscription"],
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "max entitlement-blocked notify failed", exc_info=True,
                         )
                 _set_processing_status(
                     session, result.inbound_message_id, "ignored",
                 )
                 return result.inbound_message_id
 
-            # Label resolved — ack callback с toast и мутируем payload в
-            # text-message shape. Downstream `dispatch_max_action` увидит
-            # обычный message_created и injectнет label в action.params.text.
-            if callback_id and settings.max_bot_token:
-                try:
-                    _client = MaxClient(token=settings.max_bot_token)
-                    await _client.answer_callback(
-                        str(callback_id), notification=label,
+            tenant = session.get(Tenant, onboarding.tenant_id)
+            is_approved = tenant is not None and tenant.approved_at is not None
+
+            # Broadcast pattern (2026-05-09): pb:* callbacks от approved
+            # юзеров тоже должны запускать pending_bot wizard. Это позволяет
+            # post-approve welcome message с кнопкой «Покажи примеры»
+            # → callback `pb:voice` → wizard editMessage flow. Без этой ветки
+            # callback'и от approved юзеров silent-drop'ились.
+            is_pb_callback = (
+                update_type == "message_callback"
+                and isinstance(
+                    ((payload.get("callback") or {}).get("payload") or ""),
+                    str,
+                )
+                and ((payload.get("callback") or {}).get("payload") or "")
+                    .startswith("pb:")
+            )
+
+            if not is_approved or is_pb_callback:
+                # Pending tenant ИЛИ approved юзер с pb:* callback'ом —
+                # send welcome через pending_bot (intro branch при
+                # bot_started; tour branch на pb:* callbacks).
+                # Иначе silent (избегаем spam'а при regular messages).
+                #
+                # is_post_approve_tour=True ТОЛЬКО для approved+pb_callback:
+                # pb:done покажет вопрос имени и запишет waiting-flag.
+                # Pending юзеры получают pending-closing без вопроса имени.
+                await _handle_max_pending_tenant(
+                    session=session,
+                    payload=payload,
+                    update_type=update_type,
+                    onboarding=onboarding,
+                    settings=settings,
+                    is_post_approve_tour=is_approved and is_pb_callback,
+                )
+                _set_processing_status(
+                    session, result.inbound_message_id, "ignored",
+                )
+                return result.inbound_message_id
+
+            # 2026-05-11 (Boris explicit Pat 2): MAX channel btn_reply handler.
+            # Mirror telegram_bot._handle_btn_reply_callback: resolve token →
+            # ack callback → mutate payload to look like text-message →
+            # downstream `dispatch_max_action` видит обычный text turn и
+            # инжектит label в action.params как user text. Single-use:
+            # `ReplyButtonService.resolve_token` помечает `used_at`, повторный
+            # клик возвращает None → toast «выбор устарел». Только для
+            # approved tenants — кнопки только им и шлются.
+            _cb_data_btn = (
+                (payload.get("callback") or {}).get("payload") or ""
+                if update_type == "message_callback"
+                else ""
+            )
+            # #166 B R2 (Codex medium MAJOR): тап [Да]/[Нет] react-подтверждения
+            # обрабатываем НЕ здесь, а в детач-ходе ``_process_approved_max_turn``
+            # ВНУТРИ per-tenant lock + trace. Раньше обработка шла прямо тут (инлайн
+            # из вебхука): (1) вне tenant-lock → гонка с параллельным текст-ходом того
+            # же треда; (2) без trace → невидима в trace.log; (3) полный LLM-ход
+            # блокировал ответ 202 вебхука. ``react:yes/no`` добавлены в
+            # ``_KNOWN_MAX_CALLBACK_EXACT`` → проходят unknown-prefix-гейт и шедулятся.
+
+            if isinstance(_cb_data_btn, str) and _cb_data_btn.startswith("btn_reply:"):
+                from sreda.services.reply_buttons import ReplyButtonService
+                cb_token = _cb_data_btn.removeprefix("btn_reply:").strip()
+                callback_id = (payload.get("callback") or {}).get("callback_id")
+                label: str | None = None
+                if onboarding.tenant_id and onboarding.user_id and cb_token:
+                    try:
+                        label = ReplyButtonService(session).resolve_token(
+                            tenant_id=onboarding.tenant_id,
+                            user_id=onboarding.user_id,
+                            token=cb_token,
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "max btn_reply token resolution failed for "
+                            "tenant=%s token=%s",
+                            onboarding.tenant_id, cb_token, exc_info=True,
+                        )
+                        label = None
+
+                if label is None:
+                    # Expired / already used / wrong owner — toast + drop.
+                    if callback_id and settings.max_bot_token:
+                        try:
+                            _client = MaxClient(token=settings.max_bot_token)
+                            await _client.answer_callback(
+                                str(callback_id),
+                                notification="Выбор устарел. Напиши что нужно.",
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.warning(
+                                "max btn_reply expired-ack failed", exc_info=True,
+                            )
+                    _set_processing_status(
+                        session, result.inbound_message_id, "ignored",
                     )
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "max btn_reply ack failed (label=%r)",
-                        label, exc_info=True,
-                    )
-            # Mutate to text-message shape.
-            payload["update_type"] = "message_created"
-            _msg = payload.get("message")
-            if isinstance(_msg, dict):
-                _body = _msg.setdefault("body", {})
-                if isinstance(_body, dict):
-                    _body["text"] = label
-            payload.pop("callback", None)
-            update_type = "message_created"  # update local var for downstream
-            logger.info(
-                "max btn_reply resolved tenant=%s user=%s label=%r — "
-                "dispatching as text-message",
-                onboarding.tenant_id, onboarding.user_id, label,
-            )
+                    return result.inbound_message_id
 
-        if not (settings.max_bot_token and onboarding.max_chat_id):
-            logger.info(
-                "approved tenant %s — no MAX token/chat_id, drop "
-                "(inbound_id=%s)",
-                onboarding.tenant_id, result.inbound_message_id,
-            )
-            _set_processing_status(
-                session, result.inbound_message_id, "ignored",
-            )
-            return result.inbound_message_id
+                # Label resolved — ack callback с toast и мутируем payload в
+                # text-message shape. Downstream `dispatch_max_action` увидит
+                # обычный message_created и injectнет label в action.params.text.
+                if callback_id and settings.max_bot_token:
+                    try:
+                        _client = MaxClient(token=settings.max_bot_token)
+                        await _client.answer_callback(
+                            str(callback_id), notification=label,
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "max btn_reply ack failed (label=%r)",
+                            label, exc_info=True,
+                        )
+                # Mutate to text-message shape.
+                payload["update_type"] = "message_created"
+                _msg = payload.get("message")
+                if isinstance(_msg, dict):
+                    _body = _msg.setdefault("body", {})
+                    if isinstance(_body, dict):
+                        _body["text"] = label
+                payload.pop("callback", None)
+                update_type = "message_created"  # update local var for downstream
+                logger.info(
+                    "max btn_reply resolved tenant=%s user=%s label=%r — "
+                    "dispatching as text-message",
+                    onboarding.tenant_id, onboarding.user_id, label,
+                )
 
-        # R-19 (2026-05-13): drop unknown-prefix callbacks SYNCHRONOUSLY.
-        # Production incident 2026-05-12 18:58 UTC — 2 callback events
-        # с opaque MAX-generated payload (echo от bot's own outbound
-        # message c inline-кнопками) застряли с processing_status='ingested'
-        # навечно → monitor alert «unprocessed_inbound».
-        #
-        # Корень: `_handle_max_callback` (line 1107) routит только known
-        # prefixes (btn_reply:/pb:/rem_done:/rem_snooze:). Unknown prefix
-        # → returns False → caller спавнит background task → если task
-        # не start'ит (FastAPI BackgroundTasks race / asyncio loop close)
-        # — status НИКОГДА не updates → stuck в 'ingested' → false
-        # positive monitor alert.
-        #
-        # Defensive fix: detect unknown callback prefix СИНХРОННО и mark
-        # 'ignored' до spawning task. Никакого user-facing ответа
-        # (избегаем spam от echo events).
-        if _is_unknown_max_callback_prefix(payload):
-            cb_payload_str = _max_callback_payload(payload) or ""
-            logger.info(
-                "max callback unknown prefix tenant=%s inbound=%s "
-                "payload_first=%r — sync drop (R-19 defensive)",
-                onboarding.tenant_id, result.inbound_message_id,
-                cb_payload_str[:40],
-            )
-            _set_processing_status(
-                session, result.inbound_message_id, "ignored",
-            )
-            return result.inbound_message_id
+            if not (settings.max_bot_token and onboarding.max_chat_id):
+                logger.info(
+                    "approved tenant %s — no MAX token/chat_id, drop "
+                    "(inbound_id=%s)",
+                    onboarding.tenant_id, result.inbound_message_id,
+                )
+                _set_processing_status(
+                    session, result.inbound_message_id, "ignored",
+                )
+                return result.inbound_message_id
 
-        inbound_message_id = result.inbound_message_id
+            # R-19 (2026-05-13): drop unknown-prefix callbacks SYNCHRONOUSLY.
+            # Production incident 2026-05-12 18:58 UTC — 2 callback events
+            # с opaque MAX-generated payload (echo от bot's own outbound
+            # message c inline-кнопками) застряли с processing_status='ingested'
+            # навечно → monitor alert «unprocessed_inbound».
+            #
+            # Корень: `_handle_max_callback` (line 1107) routит только known
+            # prefixes (btn_reply:/pb:/rem_done:/rem_snooze:). Unknown prefix
+            # → returns False → caller спавнит background task → если task
+            # не start'ит (FastAPI BackgroundTasks race / asyncio loop close)
+            # — status НИКОГДА не updates → stuck в 'ingested' → false
+            # positive monitor alert.
+            #
+            # Defensive fix: detect unknown callback prefix СИНХРОННО и mark
+            # 'ignored' до spawning task. Никакого user-facing ответа
+            # (избегаем spam от echo events).
+            if _is_unknown_max_callback_prefix(payload):
+                cb_payload_str = _max_callback_payload(payload) or ""
+                logger.info(
+                    "max callback unknown prefix tenant=%s inbound=%s "
+                    "payload_first=%r — sync drop (R-19 defensive)",
+                    onboarding.tenant_id, result.inbound_message_id,
+                    cb_payload_str[:40],
+                )
+                _set_processing_status(
+                    session, result.inbound_message_id, "ignored",
+                )
+                return result.inbound_message_id
+
+            inbound_message_id = result.inbound_message_id
+        finally:
+            tenant_ctx.reset(_tenant_tok)
 
     # Detached approved turn. Phase 6 (outbox routing) обеспечит что
     # ответ уйдёт в MAX channel, не TG.
@@ -1965,8 +1994,11 @@ async def _handle_max_link_start_cmd(*, raw_token: str, chat_id: str | None) -> 
         logger.warning("max link /start: missing max_bot_token или chat_id")
         return
 
-    SessionLocal = get_session_factory()
-    with SessionLocal() as session:
+    # #138 Ф5-5c (Codex high R4 MAJOR): кросс-тенантный lookup токена
+    # (channel_link_tokens — tenant-таблица; ветка ДО резолва, source-тенант чужой)
+    # под privileged("channel-link") — после флипа DSN app-роль без ctx не увидела
+    # бы токен → «ссылка недействительна». Как miniapp channel-link роуты.
+    with privileged_session("channel-link") as session:
         # #187 Phase 4a — gate source-тенант ДО показа confirm-кнопки. Column-
         # only пред-чтение ``tenant_id`` по token_hash (как confirm/cancel-ветки
         # и consume_link), НЕ через lookup_token: lookup_token возвращает None
@@ -2050,9 +2082,10 @@ async def _handle_max_link_confirm_cb(
     from sreda.services.tenant_lifecycle import is_tenant_active
 
     settings = get_settings()
-    SessionLocal = get_session_factory()
 
-    with SessionLocal() as session:
+    # #138 Ф5-5c (Codex high R4 MAJOR): кросс-тенантный consume токена под
+    # privileged("channel-link") (channel_link_tokens tenant-таблица, source чужой).
+    with privileged_session("channel-link") as session:
         # #187 Phase 4a — gate source-тенант ДО consume (мутации привязки).
         # ``consume_link`` имеет собственный гейт (defence-in-depth), но здесь
         # удалённый тенант = тихий no-op (без attach, без ответа юзеру), а не
@@ -2123,9 +2156,10 @@ async def _handle_max_link_cancel_cb(
     from sreda.services.tenant_lifecycle import is_tenant_active
 
     settings = get_settings()
-    SessionLocal = get_session_factory()
 
-    with SessionLocal() as session:
+    # #138 Ф5-5c (Codex high R4 MAJOR): кросс-тенантная отмена токена под
+    # privileged("channel-link") (channel_link_tokens tenant-таблица, source чужой).
+    with privileged_session("channel-link") as session:
         token_hash = _hash_token(raw_token)
         # #187 Phase 4a — gate source-тенант ДО мутации токена (used_at).
         # Для удалённого тенанта — тихий no-op (токен и так уже терминирован
