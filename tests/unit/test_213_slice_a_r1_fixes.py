@@ -193,8 +193,11 @@ def test_preflight_directive_unified_no_legacy_name(monkeypatch):
     monkeypatch.setenv("SREDA_CHECKLIST_UNIFIED", "0")
     sm.get_settings.cache_clear()
     hint_off = rp._section_hint("покажи список кино")
-    assert "Используй list_checklists." in hint_off  # легаси байт-в-байт
-    assert "get_checklist" not in hint_off
+    # #374: legacy-директива теперь РАЗЛИЧАЕТ конкретный список от обзора (раньше велела
+    # list_checklists ВСЕГДА → «покажи список X» давал обзор всех вместо пунктов X, ~50% промахов).
+    assert "show_checklist" in hint_off      # назван конкретный → его пункты
+    assert "list_checklists" in hint_off     # «какие списки» → обзор
+    assert "get_checklist" not in hint_off   # legacy НЕ упоминает unified-инструмент
 
 
 @pytest.mark.asyncio
