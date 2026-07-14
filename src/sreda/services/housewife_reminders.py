@@ -50,6 +50,88 @@ SNOOZE_DEFAULT_MINUTES = 10
 LATE_FIRE_GRACE_MINUTES = 15
 
 
+# #344 F5 (Opus-адверсар MAJOR#2) — граница callback-side row-lock.
+#
+# Оба ack/snooze-обработчика (TG ``telegram_bot._handle_reminder_callback`` и MAX
+# ``max_inbound._handle_max_reminder_callback``) живут в UVICORN event-loop и берут
+# строку ``FamilyReminder`` под ``SELECT ... FOR UPDATE`` (см. cross-process гонку в
+# ``read_reminder_for_callback``). Синхронный ``FOR UPDATE`` — блокирующий
+# lock-wait: пока reminder-воркер (job_runner) держит лок строки, весь event-loop
+# (все тенанты процесса) стоит. Без границы медленный тик воркера подвешивает loop.
+# ``lock_timeout`` конвертирует НЕОГРАНИЧЕННОЕ ожидание в fail-fast: короткое окно
+# (ждём типичный краткий тик воркера, не спамим тостом на обычной контенции), но
+# при патологически долгом держателе — сразу отказ + «попробуйте ещё раз».
+REMINDER_CALLBACK_LOCK_TIMEOUT_MS = 3000
+
+# Дружелюбный retry-тост при lock-timeout. Правило «никаких технических данных
+# юзеру» (BIBLE): без имён инструментов, кодов ошибок, латиницы.
+REMINDER_CALLBACK_BUSY_TEXT = "Секунду, попробуйте ещё раз"
+
+
+class ReminderLockTimeout(Exception):
+    """Лок строки ``FamilyReminder`` для ack/snooze-callback не удалось взять за
+    ``REMINDER_CALLBACK_LOCK_TIMEOUT_MS`` (PG ``lock_timeout``, sqlstate 55P03).
+
+    Обработчик обязан fail-fast с retry-тостом, а не стопорить event-loop
+    ожиданием долгого держателя лока (reminder-воркера)."""
+
+
+def _is_lock_timeout_error(exc: Exception) -> bool:
+    """True если ``OperationalError`` — именно PG lock_timeout (55P03), а не
+    любая другая DBAPI-ошибка. psycopg3 кладёт ``.sqlstate``; psycopg2 — ``.pgcode``."""
+    orig = getattr(exc, "orig", None)
+    code = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    return code == "55P03"
+
+
+def read_reminder_for_callback(session, reminder_id):
+    """Прочитать ``FamilyReminder`` для ack/snooze-callback под ОГРАНИЧЕННЫМ
+    row-локом.
+
+    PG: ставит транзакционно-локальный короткий ``lock_timeout``, затем читает
+    строку ``FOR UPDATE`` — так конкурентный держатель лока (reminder-воркер) не
+    подвесит event-loop навсегда; не удалось взять лок за окно → бросаем
+    ``ReminderLockTimeout`` (вызывающий показывает retry-тост). ``populate_existing``
+    форсит СВЕЖИЙ SELECT даже если строка уже в identity-map — иначе ``get`` вернул
+    бы кэш БЕЗ ``FOR UPDATE`` (Opus MINOR: latent identity-map fragility; сейчас обе
+    сессии свежие, но требование свежести делаем явным механизмом, не комментом).
+
+    SQLite (unit, 1 процесс): ни лока, ни таймаута — plain read (тоже
+    ``populate_existing`` ради явного freshness-контракта).
+
+    Держать лок до ``session.commit()`` вызывающего — сеть (answer/edit) уже ПОСЛЕ.
+    """
+    if not reminder_id:
+        return None
+    bind = session.bind
+    is_pg = bind is not None and bind.dialect.name == "postgresql"
+    if not is_pg:
+        return session.get(FamilyReminder, reminder_id, populate_existing=True)
+
+    from sqlalchemy import text as _sql_text
+    from sqlalchemy.exc import OperationalError
+
+    # SET LOCAL — скоуп текущей (autobegun) транзакции, сбрасывается на commit/
+    # rollback. Значение без единиц = миллисекунды. int() — защита от инъекции
+    # (константа наша, но фиксируем контракт).
+    session.execute(
+        _sql_text(f"SET LOCAL lock_timeout = {int(REMINDER_CALLBACK_LOCK_TIMEOUT_MS)}")
+    )
+    try:
+        return session.get(
+            FamilyReminder,
+            reminder_id,
+            with_for_update={"key_share": False},
+            populate_existing=True,
+        )
+    except OperationalError as exc:
+        if _is_lock_timeout_error(exc):
+            # Откатываем: не оставляем висящую транзакцию с SET LOCAL + failed lock.
+            session.rollback()
+            raise ReminderLockTimeout from exc
+        raise
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -562,9 +644,15 @@ class HousewifeReminderService:
             .order_by(FamilyReminder.next_trigger_at.asc())
             .limit(limit)
         )
-        # #163 Фаза 4 — FOR UPDATE SKIP LOCKED (только PG): при будущей многопроцессности второй
-        # воркер пропустит уже залоченные due-строки → нет двойного пика/двойной постановки. Лок
-        # держится до commit тика (после mark_fired). SQLite не поддерживает — без лока (1 воркер).
+        # #163 Фаза 4 — FOR UPDATE SKIP LOCKED (только PG): при многопроцессности снижает
+        # шанс, что два воркера снимут ОДИН due-снимок в один момент. ВАЖНО (субагент-ревью
+        # #344): после #138 Ф2 scan идёт в отдельной `privileged_session("monitor")`, которая
+        # ЗАКРЫВАЕТСЯ сразу после `due_now` (reminder_worker: снимаем только id) → лок
+        # SKIP LOCKED отпускается ДО обработки/`mark_fired`, а НЕ держится «до commit тика».
+        # Поэтому корректность НЕ на локе: двойной-фаер безопасен фактически за счёт
+        # (1) fencing re-check status/next_trigger_at после scan (#344), (2) idempotency_key
+        # доставки + partial-unique, (3) детерминированного advance в единый next_trigger_at.
+        # НЕ убирать эти guard'ы, полагаясь на лок. SQLite не поддерживает — без лока (1 воркер).
         # #187 R1 MAJOR — ``of=FamilyReminder``: после добавления producer-JOIN на Tenant голый
         # FOR UPDATE лочил бы И строки tenants. На PG со SKIP LOCKED это привело бы к ложным
         # пропускам due-напоминаний из-за лока tenant-ряда (общего у многих напоминаний). ``of=``

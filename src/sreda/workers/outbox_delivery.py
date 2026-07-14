@@ -21,9 +21,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
-from sqlalchemy import or_
+from sqlalchemy import or_, text, update
 from sqlalchemy.orm import Session
 
 from sreda.config.bot_registry import (
@@ -41,6 +42,36 @@ from sreda.runtime.delivery_policy import DeliveryKind, decide_delivery
 from sreda.services import trace
 
 logger = logging.getLogger(__name__)
+
+# #344 F5 — параметры атомарного claim'а с lease.
+#
+# Начальный claim БАТЧА берёт КОРОТКИЙ КОНСТАНТНЫЙ lease `OUTBOX_BATCH_LEASE_SECONDS`
+# (НЕ масштабируем размером батча — субагент-ревью past-R5 MAJOR: lease = limit×per-row
+# при прод limit=20 давал ~13 мин; краш/рестарт мид-батч оставлял недоставленный ХВОСТ
+# с длинным lease → рестартнутый процесс считал его не-claimable ~13 мин → регрессия
+# recovery даже на ОДНОМ процессе). Короткий batch-lease → recovery хвоста за ~минуту.
+#
+# ГЛАВНАЯ защита от двойной доставки — НЕ длина batch-lease, а АТОМАРНЫЙ per-row fence
+# `_reclaim_row` НЕПОСРЕДСТВЕННО перед отправкой: продлевает lease от СВЕЖЕГО `_now()`
+# (не от начала тика — R2/R3 MAJOR) на `OUTBOX_LEASE_PER_ROW_SECONDS` и проверяет
+# владение по claim_token. Если хвост переклеймил другой/рестартнутый воркер (сменил
+# claim_token), наш `_reclaim_row(старый_token)` фейлит `WHERE claim_token=старый` →
+# строку пропускаем → нет двойной доставки. Вся доставка строки под жёстким дедлайном
+# `OUTBOX_ROW_DEADLINE_SECONDS` (< per-row lease) + пер-send таймаут
+# `OUTBOX_SEND_TIMEOUT_SECONDS`: пока шлём, lease валиден, переклейма нет. Остаток =
+# краш после send до commit = документированный at-least-once.
+OUTBOX_BATCH_LEASE_SECONDS = 60
+OUTBOX_LEASE_PER_ROW_SECONDS = 40
+# Жёсткий дедлайн на ВСЮ доставку ОДНОЙ строки (весь исходящий путь: для MAX это
+# до 2× edit + fallback send + cleanup, для TG — send). Строго МЕНЬШЕ per-row lease
+# (R4 Codex high+medium MAJOR: отдельные send-таймауты не ограничивали СУММУ MAX
+# edit→fallback→cleanup, которая могла превысить lease → переклейм во время
+# доставки). Дедлайн < lease гарантирует, что пока идёт доставка, наш lease ещё
+# валиден и другой воркер строку не переклеймит. Превышение → строка остаётся
+# pending, claim снимается → повтор (at-least-once).
+OUTBOX_ROW_DEADLINE_SECONDS = 25
+# Жёсткий таймаут ОДНОЙ сетевой отправки (defense-in-depth внутри общего дедлайна).
+OUTBOX_SEND_TIMEOUT_SECONDS = 20
 
 
 class OutboxDeliveryWorker:
@@ -68,39 +99,228 @@ class OutboxDeliveryWorker:
     ) -> int:
         now_utc = now or datetime.now(timezone.utc)
         # #138 Ф2: очередь доставки outbox — КРОСС-ТЕНАНТНАЯ (все семьи) →
-        # privileged. Снимок (id, tenant_id); доставка КАЖДОЙ строки — пер-тенант
-        # (своя транзакция вокруг HTTP-send + перехода статуса).
+        # privileged. #344 F5: АТОМАРНЫЙ claim — не голый SELECT (два воркера
+        # выбирали ту же pending-строку и слали дважды). Клеймим батч эксклюзивно
+        # (claim_token + lease_expires_at) и КОММИТИМ claim ДО доставки, чтобы
+        # второй воркер не увидел claimed-строки. status остаётся 'pending'.
         with privileged_session("queue-dispatch") as scan:
-            row_ids = [
-                (r.id, r.tenant_id)
-                for r in scan.query(OutboxMessage)
-                .filter(
-                    OutboxMessage.status == "pending",
-                    OutboxMessage.channel_type.in_(("telegram", "max")),
-                    or_(
-                        OutboxMessage.scheduled_at.is_(None),
-                        OutboxMessage.scheduled_at <= now_utc,
-                    ),
-                )
-                .order_by(OutboxMessage.created_at.asc())
-                .limit(limit)
-                .all()
-            ]
+            row_ids, token = self._claim_batch(scan, now_utc=now_utc, limit=limit)
         processed = 0
         for row_id, tenant_id in row_ids:
             # Пер-строчная изоляция: сбой одной доставки не роняет тик (в отличие
             # от старой общей сессии — но send/статус-переходы и так ловили ошибки внутри).
             try:
                 with tenant_session(tenant_id) as s:
+                    # #344 F5 (R2/R3 MAJOR — оба ревьюера): АТОМАРНЫЙ per-row fence
+                    # НЕПОСРЕДСТВЕННО перед доставкой. Одним conditional UPDATE
+                    # (WHERE claim_token=наш AND status='pending') подтверждаем
+                    # владение по СВЕЖЕМУ состоянию БД и продлеваем lease от СВЕЖЕГО
+                    # времени (`_now()`, не now_utc начала тика). 0 строк → нас
+                    # переклеймили / строка не pending → пропуск (доставит владелец).
+                    if not self._reclaim_row(s, row_id, token):
+                        continue
                     row = s.get(OutboxMessage, row_id)
                     if row is None or row.status != "pending":
-                        continue  # исчезла / уже обработана между сканом и доставкой
-                    await self._process_one(s, row, now_utc=now_utc)
+                        continue  # исчезла / уже обработана между claim и доставкой
+                    # #344 F5 (R4 MAJOR): ВЕСЬ исходящий путь строки под ЕДИНЫМ
+                    # жёстким дедлайном < lease. Так суммарная MAX-последовательность
+                    # (edit×2 + fallback send + cleanup) не превысит lease → пока
+                    # доставляем, наш lease валиден, переклейма нет.
+                    await asyncio.wait_for(
+                        self._process_one(s, row, now_utc=now_utc),
+                        timeout=OUTBOX_ROW_DEADLINE_SECONDS,
+                    )
                 processed += 1
+            except asyncio.TimeoutError:
+                # Дедлайн доставки превышен. Дедлайн < lease → мы ВСЁ ЕЩЁ владелец
+                # (никто не переклеймил), поэтому безопасно снять claim в свежей
+                # сессии → повтор на следующем тике сразу (at-least-once).
+                logger.warning(
+                    "outbox delivery: row %s exceeded per-row deadline %ss — "
+                    "release claim, retry next tick", row_id, OUTBOX_ROW_DEADLINE_SECONDS,
+                )
+                self._release_claim_by_id(tenant_id, row_id, token)
+                continue
             except Exception:  # noqa: BLE001
                 logger.exception("outbox delivery: failed for row %s", row_id)
                 continue
         return processed
+
+    def _release_claim_by_id(self, tenant_id: str, row_id: str, token: str) -> None:
+        """#344 F5 (R4/R5) — снять claim со строки в СВЕЖЕЙ сессии (после дедлайна
+        доставки исходная сессия откачена/непригодна). Только пока строка pending И
+        claim_token ВСЁ ЕЩЁ наш (R5 MAJOR: `asyncio.wait_for` ждёт завершения отмены,
+        поэтому фактический возврат может быть позже дедлайна; если к этому моменту
+        lease истёк и строку переклеймил другой воркер, наш запоздалый release НЕ
+        должен стирать ЧУЖОЙ активный claim — иначе третий воркер заберёт строку
+        параллельно с новым владельцем). WHERE claim_token=наш → чужой claim не трогаем.
+        Best-effort."""
+        try:
+            with tenant_session(tenant_id) as s:
+                res = s.execute(
+                    update(OutboxMessage)
+                    .where(
+                        OutboxMessage.id == row_id,
+                        OutboxMessage.status == "pending",
+                        OutboxMessage.claim_token == token,
+                    )
+                    .values(claim_token=None, lease_expires_at=None)
+                )
+                s.commit()
+                if res.rowcount == 0:
+                    logger.info(
+                        "outbox delivery: claim on %s уже не наш (переклеймлен) — "
+                        "release-noop", row_id,
+                    )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "outbox delivery: failed to release claim on %s after deadline",
+                row_id, exc_info=True,
+            )
+
+    @staticmethod
+    async def _send_bounded(coro, exc_cls):
+        """#344 F5 (R3 MAJOR) — жёсткий таймаут на ОДНУ отправку: send не может
+        длиться дольше per-row lease. Таймаут → трактуем как сбой доставки
+        (пробрасываем DeliveryError канала → строка остаётся pending, claim
+        снимается, повтор на следующем тике; at-least-once). Без этого медленная
+        отправка (>lease) позволила бы другому воркеру переклеймить и отправить
+        дубль в НОРМАЛЬНОЙ работе."""
+        try:
+            return await asyncio.wait_for(coro, timeout=OUTBOX_SEND_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError as exc:
+            raise exc_cls("outbox send exceeded hard timeout") from exc
+
+    @staticmethod
+    def _now() -> datetime:
+        """Текущее время (UTC). Отдельный метод — чтобы per-row fence продлевал
+        lease от СВЕЖЕГО времени, а не от снимка начала тика, и чтобы тесты могли
+        детерминированно моделировать истечение lease без реального ожидания."""
+        return datetime.now(timezone.utc)
+
+    def _reclaim_row(self, session: Session, row_id: str, token: str) -> bool:
+        """#344 F5 (R2/R3 MAJOR) — атомарно подтвердить владение claim'ом и продлить
+        lease на одну отправку. Возвращает True, если строка всё ещё наша
+        (claim_token совпал и она pending) — тогда lease продлён и можно слать;
+        False, если её переклеймил другой воркер или она уже терминальна.
+
+        Fencing DB-authoritative: conditional UPDATE атомарен, владение — по
+        claim_token. Lease продлевается от СВЕЖЕГО `_now()` (не от начала тика — R3
+        MAJOR: у поздней строки батча снимок начала тика дал бы уже истёкший lease).
+        В паре с жёстким таймаутом отправки (< per-row lease) это гарантирует, что
+        пока мы шлём строку, её lease валиден и другой воркер её не переклеймит →
+        нет steady-state двойной доставки. Остаточное окно = краш = at-least-once.
+        """
+        new_lease = self._now() + timedelta(seconds=OUTBOX_LEASE_PER_ROW_SECONDS)
+        res = session.execute(
+            update(OutboxMessage)
+            .where(
+                OutboxMessage.id == row_id,
+                OutboxMessage.claim_token == token,
+                OutboxMessage.status == "pending",
+            )
+            .values(lease_expires_at=new_lease)
+        )
+        session.commit()
+        return res.rowcount == 1
+
+    def _claim_batch(
+        self, scan: Session, *, now_utc: datetime, limit: int
+    ) -> tuple[list[tuple[str, str]], str]:
+        """#344 F5 — атомарно заклеймить до ``limit`` доставляемых строк.
+
+        Клеймим строки ``status='pending'`` доставляемых каналов, срок которых
+        наступил и которые НЕ заклеймлены (или lease истёк). Claim выражается
+        полями ``claim_token``/``lease_expires_at`` — значение ``status`` НЕ
+        меняется (rollback-safety, §4). COMMIT внутри scan-транзакции фиксирует
+        claim ДО доставки, поэтому второй воркер не выберет ту же строку.
+
+        Lease батча — КОРОТКИЙ КОНСТАНТНЫЙ (`OUTBOX_BATCH_LEASE_SECONDS`), НЕ
+        масштабируется размером батча (past-R5 MAJOR: длинный lease страндил
+        недоставленный хвост при краше на ~13 мин). Владение доставкой держит per-row
+        `_reclaim_row` (продлевает lease перед отправкой). Возвращает (список
+        (id, tenant_id), claim_token).
+
+        Фильтр claimable: `claim_token IS NULL OR lease_expires_at IS NULL OR
+        lease_expires_at < now` — ветка `lease IS NULL` защищает от латентного
+        стрэндинга (token set + lease NULL никогда бы не прошёл `NULL<now`; MINOR).
+
+        PostgreSQL — ``FOR UPDATE SKIP LOCKED`` в под-SELECT (лок В ШАГЕ claim,
+        не в скане; два воркера получают непересекающиеся наборы). SQLite (unit) —
+        без SKIP LOCKED (одно соединение), true-concurrency покрыта PG-тестами.
+        """
+        token = uuid4().hex
+        lease_until = now_utc + timedelta(seconds=OUTBOX_BATCH_LEASE_SECONDS)
+        bind = scan.bind
+        if bind is not None and bind.dialect.name == "postgresql":
+            sql = text(
+                """
+                UPDATE outbox_messages
+                   SET claim_token = :tok, lease_expires_at = :lease
+                 WHERE id IN (
+                     SELECT id FROM outbox_messages
+                      WHERE status = 'pending'
+                        AND channel_type IN ('telegram', 'max')
+                        AND (scheduled_at IS NULL OR scheduled_at <= :now)
+                        AND (claim_token IS NULL
+                             OR lease_expires_at IS NULL
+                             OR lease_expires_at < :now)
+                      ORDER BY created_at ASC
+                      LIMIT :lim
+                      FOR UPDATE SKIP LOCKED
+                 )
+                RETURNING id, tenant_id, created_at
+                """
+            )
+            rows = scan.execute(
+                sql,
+                {"tok": token, "lease": lease_until, "now": now_utc, "lim": limit},
+            ).all()
+            scan.commit()
+            # RETURNING НЕ гарантирует порядок строк (Codex sol MAJOR): под-SELECT
+            # ORDER BY created_at влияет только на то, КАКИЕ строки берутся (LIMIT),
+            # но не на порядок RETURNING. Пере-сортируем по (created_at, id), чтобы
+            # доставлять в FIFO-порядке постановки — иначе несколько сообщений одному
+            # адресату могли уйти в обратном порядке (старый код обрабатывал по created_at).
+            rows_sorted = sorted(rows, key=lambda r: (r.created_at, r.id))
+            return [(r.id, r.tenant_id) for r in rows_sorted], token
+
+        # SQLite / прочие: клеймим через ORM (без SKIP LOCKED).
+        candidates = (
+            scan.query(OutboxMessage)
+            .filter(
+                OutboxMessage.status == "pending",
+                OutboxMessage.channel_type.in_(("telegram", "max")),
+                or_(
+                    OutboxMessage.scheduled_at.is_(None),
+                    OutboxMessage.scheduled_at <= now_utc,
+                ),
+                or_(
+                    OutboxMessage.claim_token.is_(None),
+                    OutboxMessage.lease_expires_at.is_(None),
+                    OutboxMessage.lease_expires_at < now_utc,
+                ),
+            )
+            .order_by(OutboxMessage.created_at.asc())
+            .limit(limit)
+            .all()
+        )
+        claimed: list[tuple[str, str]] = []
+        for r in candidates:
+            r.claim_token = token
+            r.lease_expires_at = lease_until
+            claimed.append((r.id, r.tenant_id))
+        scan.commit()
+        return claimed, token
+
+    @staticmethod
+    def _release_claim(row: OutboxMessage) -> None:
+        """#344 F5 — снять claim со строки, которую оставляем 'pending' (retry
+        после ошибки доставки / defer). Без release строку не переклеймят до
+        истечения lease (медленный повтор); со release следующий тик подхватит
+        её сразу. status не трогаем — остаётся 'pending'."""
+        row.claim_token = None
+        row.lease_expires_at = None
 
     async def _process_one(self, session: Session, row: OutboxMessage, *, now_utc: datetime) -> None:
         # #187 soft-delete — fencing (дверь #9): тенант мог быть удалён ПОСЛЕ
@@ -130,6 +350,8 @@ class OutboxDeliveryWorker:
         if decision.kind == DeliveryKind.defer:
             row.scheduled_at = decision.defer_until_utc
             # status stays 'pending'; worker will re-check after defer.
+            # #344 F5: снимаем claim — строка снова claimable к моменту defer-выхода.
+            self._release_claim(row)
             session.commit()
             return
 
@@ -229,11 +451,14 @@ class OutboxDeliveryWorker:
         trace_payload = payload.pop("_trace", None)
 
         try:
-            send_response = await tg_client.send_message(
-                chat_id=payload.get("chat_id"),
-                text=payload.get("text", ""),
-                reply_markup=payload.get("reply_markup"),
-                parse_mode=payload.get("parse_mode"),
+            send_response = await self._send_bounded(
+                tg_client.send_message(
+                    chat_id=payload.get("chat_id"),
+                    text=payload.get("text", ""),
+                    reply_markup=payload.get("reply_markup"),
+                    parse_mode=payload.get("parse_mode"),
+                ),
+                TelegramDeliveryError,
             )
             # Stage 9.1: capture TG-side message_id/date for ack-vs-final
             # ordering analysis. См. tomorrow-plan пункт 9.
@@ -267,6 +492,9 @@ class OutboxDeliveryWorker:
                             exc_info=True,
                         )
             row.status = "sent"
+            # #344 F5 (R1 MINOR): снимаем lease на терминальном 'sent' — иначе
+            # partial-index (lease_expires_at IS NOT NULL) копил бы все доставленные.
+            self._release_claim(row)
             self._emit_trace(
                 trace_payload,
                 chat_id=payload.get("chat_id"),
@@ -277,6 +505,9 @@ class OutboxDeliveryWorker:
         except TelegramDeliveryError:
             logger.warning("outbox delivery: telegram error on %s, keeping pending", row.id)
             row.status = "pending"
+            # #344 F5: снимаем claim → следующий тик подхватит строку сразу (быстрый
+            # retry), не дожидаясь истечения lease. status остаётся 'pending'.
+            self._release_claim(row)
             # Stays pending — worker retries next tick. Trace will be
             # emitted then. Don't emit now or we'd fire the same block
             # again on retry (idempotency is on a fresh context, which
@@ -417,11 +648,14 @@ class OutboxDeliveryWorker:
                         if attempt == 0:
                             await asyncio.sleep(0.2)
                 if not edit_sent:
-                    await self.max.send_message(
-                        recipient={"chat_id": chat_id},
-                        text=text,
-                        format=payload.get("format"),
-                        attachments=attachments,
+                    await self._send_bounded(
+                        self.max.send_message(
+                            recipient={"chat_id": chat_id},
+                            text=text,
+                            format=payload.get("format"),
+                            attachments=attachments,
+                        ),
+                        MaxDeliveryError,
                     )
                     try:
                         await self.max.delete_message(str(ack_edit_message_id))
@@ -433,13 +667,17 @@ class OutboxDeliveryWorker:
                             exc_info=True,
                         )
             else:
-                await self.max.send_message(
-                    recipient={"chat_id": chat_id},
-                    text=text,
-                    format=payload.get("format"),
-                    attachments=attachments,
+                await self._send_bounded(
+                    self.max.send_message(
+                        recipient={"chat_id": chat_id},
+                        text=text,
+                        format=payload.get("format"),
+                        attachments=attachments,
+                    ),
+                    MaxDeliveryError,
                 )
             row.status = "sent"
+            self._release_claim(row)  # #344 F5 (R1 MINOR): снять lease на терминале
             self._emit_trace(
                 trace_payload, chat_id=chat_id, status="ok",
             )
@@ -448,6 +686,8 @@ class OutboxDeliveryWorker:
                 "max outbox: delivery error on %s, keeping pending", row.id,
             )
             row.status = "pending"
+            # #344 F5: снимаем claim → быстрый retry на следующем тике.
+            self._release_claim(row)
         except Exception:
             logger.exception("max outbox: unexpected error on %s", row.id)
             row.status = "failed"
