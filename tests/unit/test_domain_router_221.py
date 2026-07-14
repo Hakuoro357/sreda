@@ -131,7 +131,9 @@ def test_route_spisok_pokupok_suppresses_checklists():
     assert r.primary_domain == "shopping"
     assert "checklists" in r.suppressed_domains
     assert r.compound_by_connector is False
-    # #250: у shopping директивы НЕТ → chat-узел не подмешает checklists-подсказку на «список покупок»
+    # #250/#374: у shopping директивы НЕТ (None). #374-R2 пробовал дать shopping-директиву, но она
+    # инжектилась и на write/compound/cross-ходы покупок и глушила их (R2 sol/terra/субагент N1-N4) →
+    # откат. Покупки разводит few-shot + оговорка в _HINT_CHECKLIST, без хвостовой shopping-директивы.
     assert r.directive is None
 
 
