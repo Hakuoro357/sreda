@@ -54,6 +54,7 @@ from uuid import uuid4
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
+from sreda.config.constants import TELEGRAM_WEB_DOMAIN
 from sreda.db.models.audit import AuditLog
 from sreda.db.models.channel_linking import LINK_CHANNELS, ChannelLinkToken
 from sreda.db.models.core import User
@@ -108,7 +109,7 @@ class StartLinkResult:
 
 # Deep-link templates per target channel.
 # Phase 0 probe lock-in: bot username `id320700072280_bot` для MAX.
-# TG bot username берём из настроек (для URL t.me/<name>).
+# TG bot username берём из настроек (для URL telegram.me/<name>, #370).
 _MAX_BOT_USERNAME = "id320700072280_bot"
 
 
@@ -135,7 +136,7 @@ def _build_deep_link(
                 "tg_bot_username + tg_miniapp_shortname required for target=telegram"
             )
         return (
-            f"https://t.me/{tg_bot_username}/{tg_miniapp_shortname}"
+            f"https://{TELEGRAM_WEB_DOMAIN}/{tg_bot_username}/{tg_miniapp_shortname}"
             f"?startapp=lnk_{raw_token}"
         )
     raise ValueError(f"unknown target_channel: {target_channel!r}")

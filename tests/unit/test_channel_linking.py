@@ -86,9 +86,26 @@ def test_start_link_max_to_telegram_direction(session):
         tg_bot_username="sreda_test_bot", tg_miniapp_shortname="sreda_app",
     )
     assert result.target_channel == "telegram"
+    # #370: t.me исключён из DNS 2026-07-14 → user-facing deep-link на telegram.me.
     assert result.deep_link.startswith(
-        "https://t.me/sreda_test_bot/sreda_app?startapp=lnk_"
+        "https://telegram.me/sreda_test_bot/sreda_app?startapp=lnk_"
     )
+
+
+def test_start_link_tg_deep_link_uses_telegram_web_domain(session):
+    """#370 format lock-in: TG deep-link идёт через централизованный
+    TELEGRAM_WEB_DOMAIN на telegram.me, а НЕ на битый хост t.me."""
+    from sreda.config.constants import TELEGRAM_WEB_DOMAIN
+
+    assert TELEGRAM_WEB_DOMAIN == "telegram.me"
+
+    result = start_link(
+        session, tenant_id="t1", source_channel="max", source_user_id="u1",
+        tg_bot_username="sreda_test_bot", tg_miniapp_shortname="sreda_app",
+    )
+    assert result.deep_link.startswith(f"https://{TELEGRAM_WEB_DOMAIN}/")
+    # Битый короткий хост t.me не должен встречаться в user-facing ссылке.
+    assert "//t.me/" not in result.deep_link
 
 
 def test_start_link_unknown_source_raises(session):

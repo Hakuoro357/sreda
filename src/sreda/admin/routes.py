@@ -21,6 +21,7 @@ from sreda.admin.queries import (
     get_users_page,
     has_active_subscriptions,
 )
+from sreda.config.constants import TELEGRAM_WEB_DOMAIN
 from sreda.config.settings import get_settings
 from sreda.db.session import privileged_session
 
@@ -255,7 +256,8 @@ def admin_login(request: Request, session=Depends(_get_session)):
             status_code=429,
         )
 
-    deep_link = f"https://t.me/{bot_username}?start=adm_{result.challenge_id}"
+    # #370: t.me выпал из DNS 2026-07-14 → admin-login deep-link через telegram.me.
+    deep_link = f"https://{TELEGRAM_WEB_DOMAIN}/{bot_username}?start=adm_{result.challenge_id}"
     response = templates.TemplateResponse(
         request, "login.html",
         {"deep_link": deep_link, "human_code": result.human_code},

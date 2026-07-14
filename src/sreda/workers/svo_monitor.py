@@ -29,6 +29,7 @@ from typing import Final
 
 import httpx
 
+from sreda.config.constants import TELEGRAM_WEB_DOMAIN
 from sreda.db.session import privileged_session
 from sreda.services import runtime_config as rc
 from sreda.services.admin_alerts import send_admin_alert
@@ -38,7 +39,8 @@ logger = logging.getLogger(__name__)
 
 
 _CHANNEL: Final = "svo_online"
-_PREVIEW_URL: Final = f"https://t.me/s/{_CHANNEL}"
+# #370: t.me исключён из DNS 2026-07-14 → preview-скрейпинг ходит на telegram.me.
+_PREVIEW_URL: Final = f"https://{TELEGRAM_WEB_DOMAIN}/s/{_CHANNEL}"
 
 # Matching правила (2026-05-18 v3 update): только INITIAL объявления
 # о ковре, без followup'ов. Требуем:
@@ -155,7 +157,7 @@ async def _tick() -> None:
         body=(
             f"Канал @{_CHANNEL} опубликовал сообщение содержащее "
             f"ключевые слова: ковёр + ограничения + введены.\n\n"
-            f"Источник: https://t.me/{post_id}"
+            f"Источник: https://{TELEGRAM_WEB_DOMAIN}/{post_id}"
         ),
         dedupe_key=f"svo_monitor:{post_id}",
         extra_context={"post_id": post_id, "channel": _CHANNEL},
