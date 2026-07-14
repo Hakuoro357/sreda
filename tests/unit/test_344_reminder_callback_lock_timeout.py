@@ -309,3 +309,85 @@ async def test_max_retry_text_does_not_leak_into_success_reply(monkeypatch):
     text = fake.messages[0]["text"]
     assert REMINDER_CALLBACK_BUSY_TEXT not in text, text
     assert "✅" in text and "Полить цветы" in text
+
+
+# --------------------------------------------------------------------------
+# R3 (Codex sol+terra MINOR): retry-строка снимается ТОЛЬКО как отдельная
+# trailing-строка (разделитель \n / \r\n — как её и генерирует хендлер), НЕ
+# любой суффикс. Иначе легитимный заголовок, содержащий/равный фразе, терялся бы.
+# Эти три RED-теста краснели на прежней ``endswith(BUSY_TEXT)``-логике.
+# --------------------------------------------------------------------------
+
+
+class _FakeReminderService:
+    def __init__(self, session):  # noqa: ANN001
+        pass
+
+    def acknowledge(self, rem):  # noqa: ANN001
+        pass
+
+    def snooze(self, rem, minutes=0):  # noqa: ANN001
+        pass
+
+
+class _CommitOnlySession:
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+async def _run_max_success_ack(monkeypatch, *, body_text, action="rem_done"):
+    """Прогнать успешный ack/snooze MAX-callback с заданным телом сообщения;
+    вернуть текст финального replacement (``✅ …`` / ``⏰ …``)."""
+    import sreda.services.housewife_reminders as _hr
+    from sreda.services.max_inbound import _handle_max_reminder_callback
+
+    reminder = SimpleNamespace(id="rid-1", tenant_id="t1")
+    monkeypatch.setattr(_hr, "read_reminder_for_callback", lambda *a, **k: reminder)
+    monkeypatch.setattr(_hr, "HousewifeReminderService", _FakeReminderService)
+    fake = _FakeMaxClient()
+    await _handle_max_reminder_callback(
+        session=_CommitOnlySession(),
+        max_client=fake,
+        callback_id="cb1",
+        data=f"{action}:rid-1",
+        payload={"message": {"body": {"text": body_text}}},
+        onboarding=SimpleNamespace(tenant_id="t1"),
+    )
+    return fake.messages[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_max_retry_strip_preserves_title_ending_with_phrase_same_line(monkeypatch):
+    """Заголовок, ОКАНЧИВАЮЩИЙСЯ фразой на ТОЙ ЖЕ строке (без переноса перед ней),
+    НЕ обрезается — это была бы потеря пользовательских данных. RED на прежней
+    ``endswith``-логике (обрезала до ``Записать:``)."""
+    title = f"Записать: {REMINDER_CALLBACK_BUSY_TEXT}"
+    text = await _run_max_success_ack(monkeypatch, body_text=f"🔔 {title}")
+    assert text == f"✅ {title}", text
+
+
+@pytest.mark.asyncio
+async def test_max_retry_strip_handles_crlf_delimited_retry_line(monkeypatch):
+    """Retry-строка с CRLF-разделителем (``\\r\\n``) снимается ЧИСТО — без висящего
+    ``\\r`` и без остатка фразы; заголовок сохранён. RED на прежней логике
+    (``rstrip('\\n \\t')`` не снимала ``\\r`` → оставался хвост ``Полить цветы\\r``)."""
+    body = f"🔔 Полить цветы\r\n{REMINDER_CALLBACK_BUSY_TEXT}"
+    text = await _run_max_success_ack(monkeypatch, body_text=body)
+    assert text == "✅ Полить цветы", text
+    assert "\r" not in text
+    assert REMINDER_CALLBACK_BUSY_TEXT not in text
+
+
+@pytest.mark.asyncio
+async def test_max_retry_strip_preserves_title_exactly_equal_to_phrase(monkeypatch):
+    """Заголовок, РАВНЫЙ фразе целиком (без разделителя-переноса), НЕ снимается:
+    отличить его от нашего инъектированного bare-retry нельзя, и мы выбираем НЕ
+    терять данные пользователя (принятый trade-off — decision-log ACKRACE-2).
+    RED на прежней логике (обрезала в пустоту → generic ``✅ Готово``)."""
+    text = await _run_max_success_ack(
+        monkeypatch, body_text=f"🔔 {REMINDER_CALLBACK_BUSY_TEXT}"
+    )
+    assert text == f"✅ {REMINDER_CALLBACK_BUSY_TEXT}", text

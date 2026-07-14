@@ -1822,11 +1822,23 @@ async def _handle_max_reminder_callback(
                 # осаждает retry-строку в теле («🔔 X\nСекунду, попробуйте ещё раз»).
                 # На следующем tap она бы дублировалась (timeout→timeout) или
                 # протекла в финальный ✅/⏰-текст (timeout→success). Снимаем её с
-                # хвоста (while — на случай накопления от нескольких таймаутов).
-                while original_text.endswith(REMINDER_CALLBACK_BUSY_TEXT):
-                    original_text = original_text[
-                        : -len(REMINDER_CALLBACK_BUSY_TEXT)
-                    ].rstrip("\n \t")
+                # хвоста. R3 (Codex sol+terra MINOR): матчим ТОЛЬКО отдельную
+                # trailing-СТРОКУ (разделитель \n или \r\n — как мы её и генерируем),
+                # НЕ любой суффикс — иначе легитимный заголовок, ОКАНЧИВАЮЩИЙСЯ этой
+                # фразой на той же строке («Записать: Секунду, попробуйте ещё раз»),
+                # обрезался бы (потеря данных). while — на случай накопления.
+                _retry_lines = (
+                    f"\r\n{REMINDER_CALLBACK_BUSY_TEXT}",
+                    f"\n{REMINDER_CALLBACK_BUSY_TEXT}",
+                )
+                _stripping = True
+                while _stripping:
+                    _stripping = False
+                    for _sfx in _retry_lines:
+                        if original_text.endswith(_sfx):
+                            original_text = original_text[: -len(_sfx)].rstrip("\r\n \t")
+                            _stripping = True
+                            break
 
     async def _ack_with_replacement(new_text: str) -> None:
         """Send /answers с message field — replaces original message body
