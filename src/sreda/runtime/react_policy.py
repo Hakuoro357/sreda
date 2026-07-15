@@ -82,7 +82,8 @@ POLICY_VERSION_B2 = 2
 
 def compute_unified_policy(text, route, classified=None, *, base_web=True,
                            sticky_memory_write=False,
-                           prev_open_domains=frozenset()):
+                           prev_open_domains=frozenset(),
+                           disambiguator=None):
     """Двухъярусная политика единого пути (execute). Чистая; поведение прода не трогает (проводка — B2b).
 
     text: текст хода. route: RouteResult из route_domains(text). classified: DomainClassResult|None
@@ -97,7 +98,7 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
     деструктивных инструментов (save_core_fact/save_episode/create_memory_category)."""
     from sreda.runtime.react_preflight import compute_allowed_domains
     from sreda.runtime.react_signals import (
-        declarative_memory_signal, read_cue_domains, write_command_signal,
+        declarative_memory_signal, read_cue_domains, read_cue_groups, write_command_signal,
     )
 
     w_sig = bool(write_command_signal(text))
@@ -168,6 +169,32 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
         llm_domains = sorted(classified.domains)
         allowed_read |= set(llm_domains)
 
+    # #376: subtract-only дизамбигуация неоднозначной read-кюс-группы. disambiguator (умный
+    # классификатор ЭТОГО хода, ОТДЕЛЬНО от continuation-classified выше) high с ровно 1 доменом →
+    # ВЫЧИТАЕТ остальных членов неоднозначной read-кюс-группы из allowed_read (на «список кино»
+    # убирает shopping, оставляя checklists). ТОЛЬКО вычитание: домен ВНЕ поднятых детерминированно
+    # (route.all_domains ∪ read_cues) — это add (напр. промпт-инъекция из истории), НЕ применяем;
+    # вызывающий фиксирует как divergence. write НЕ трогаем (allowed_write вычтен из subtract);
+    # compound/cross пропускаем целиком (reminders/menu не теряются). Гарантия «shopping вырезан»
+    # держится на allowed_read → router_allowed_read_domains (фильтр _apply_unified_policy),
+    # устойчива к freshness/need_family re-add (те трогают active_families, не router_allowed_read).
+    disambig_kind = None
+    disambig_domains: list = []
+    if (disambiguator is not None and disambiguator.confidence == "high"
+            and len(disambiguator.domains) == 1
+            and not route.compound_by_connector and route.cross_intent is None):
+        disambig_domains = sorted(disambiguator.domains)
+        _fd = set(disambiguator.domains)
+        _raised = set(route.all_domains) | read_cues
+        if _fd <= _raised:
+            disambig_kind = "subtract"
+            for _grp in read_cue_groups(text):
+                _g = set(_grp) - {"web"}
+                if len(_g) > 1 and (_fd & _g):
+                    allowed_read -= (_g - _fd) - allowed_write
+        else:
+            disambig_kind = "add"  # анти-инъекция: НЕ применяем, только divergence снаружи
+
     return {
         "v": POLICY_VERSION_B2,
         "mode": "unified-execute",
@@ -177,5 +204,7 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
         "signals": {"write_cmd": w_sig, "declarative": d_sig, "read_cues": sorted(read_cues),
                     "sticky_memory": sticky_applied,
                     "turn_continuation": continuation,   # #338: наблюдаемость наследования
-                    "llm_domains": llm_domains},         # #352: что дал LLM-классификатор
+                    "llm_domains": llm_domains,          # #352: что дал LLM-классификатор
+                    "disambig_kind": disambig_kind,      # #376: subtract | add | None
+                    "disambig_domains": disambig_domains},
     }
