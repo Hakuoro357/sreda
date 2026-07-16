@@ -191,3 +191,51 @@ def test_send_alert_swallows_376(monkeypatch):
     import sreda.services.admin_alerts as aa
     monkeypatch.setattr(aa, "alert_admin_async", _boom)
     _a.run(rl._dis376_send_alert("test"))  # не должно raise
+
+
+# ─────────────────── слой-2 (#376): сужение items-vs-overview внутри чек-листов ───────────────────
+
+
+def test_narrow_excludes_overview_tool_376():
+    """Слой-2: exclude_read вырезает list_checklists из read-набора, show_checklist остаётся."""
+    from langchain_core.tools import StructuredTool
+    from sreda.runtime.react_loop import _apply_unified_policy
+
+    def _f(**kw):
+        return "ok"
+    tools = [StructuredTool.from_function(name=n, func=_f, description="t",
+                                          args_schema=None, infer_schema=True)
+             for n in ("show_checklist", "list_checklists")]
+    out = _apply_unified_policy(tools, ["checklists", "web"], [],
+                                exclude_read=frozenset({"list_checklists"}))
+    names = [t.name for t in out]
+    assert "show_checklist" in names
+    assert "list_checklists" not in names
+
+
+def test_narrow_exclude_never_touches_write_376():
+    """Слой-2: exclude_read НЕ вырезает write-инструменты (защита: сужение только чтения)."""
+    from langchain_core.tools import StructuredTool
+    from sreda.runtime.react_loop import _apply_unified_policy
+
+    def _f(**kw):
+        return "ok"
+    tools = [StructuredTool.from_function(name="add_checklist_items", func=_f, description="t",
+                                          args_schema=None, infer_schema=True)]
+    out = _apply_unified_policy(tools, ["checklists"], ["checklists"],
+                                exclude_read=frozenset({"add_checklist_items"}))
+    assert [t.name for t in out], "write-инструмент не должен вырезаться exclude_read"
+
+
+def test_narrow_default_empty_byte_identical_376():
+    """Слой-2: exclude_read по умолчанию пуст → фильтр байт-в-байт прежний."""
+    from langchain_core.tools import StructuredTool
+    from sreda.runtime.react_loop import _apply_unified_policy
+
+    def _f(**kw):
+        return "ok"
+    tools = [StructuredTool.from_function(name=n, func=_f, description="t",
+                                          args_schema=None, infer_schema=True)
+             for n in ("show_checklist", "list_checklists")]
+    base = [t.name for t in _apply_unified_policy(tools, ["checklists"], [])]
+    assert base == ["show_checklist", "list_checklists"]
