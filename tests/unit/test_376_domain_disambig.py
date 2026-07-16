@@ -344,3 +344,34 @@ def test_v2r2_infinitive_not_read_376():
         assert not _re376_read_marker.search(t), t
     assert _re376_read_marker.search("покажи список кино")
     assert _re376_read_marker.search("что у меня в списке кино")
+
+
+def test_v2_sec_suppressed_on_pre_exec_376():
+    """v2 (прод 16.07 18:37): на pre-exec ходе секц-директива подавлена — иначе она уходит
+    отдельной user-репликой ПОСЛЕ результата, и модель отвечает ей («Поняла, буду опираться…»).
+    Детект: pre_exec-ToolMessage в дельте текущего хода (сканирование до последнего Human)."""
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    # воспроизводим сканер из chat-узла (та же логика)
+    def pre_exec_in_turn(messages):
+        for m in reversed(messages):
+            if isinstance(m, HumanMessage):
+                break
+            if (isinstance(m, ToolMessage)
+                    and isinstance(getattr(m, "artifact", None), dict)
+                    and m.artifact.get("pre_exec")):
+                return True
+        return False
+    pair_turn = [HumanMessage(content="Что у меня в списке кино"),
+                 AIMessage(content="", tool_calls=[{"name": "show_checklist",
+                                                    "args": {}, "id": "pre376_x",
+                                                    "type": "tool_call"}]),
+                 ToolMessage(content="# X", name="show_checklist", tool_call_id="pre376_x",
+                             artifact={"result_kind": "ok", "pre_exec": True})]
+    assert pre_exec_in_turn(pair_turn)
+    plain_turn = [HumanMessage(content="Что у меня в списке кино")]
+    assert not pre_exec_in_turn(plain_turn)
+    # pre_exec ПРОШЛОГО хода (за Human) — не считается
+    old_pre = [ToolMessage(content="# X", name="show_checklist", tool_call_id="old",
+                           artifact={"pre_exec": True}),
+               HumanMessage(content="новый вопрос")]
+    assert not pre_exec_in_turn(old_pre)

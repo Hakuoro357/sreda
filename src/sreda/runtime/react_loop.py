@@ -3324,6 +3324,20 @@ def _build_graph(llm: Any, all_tools: list, *,
             # подмешиваем подсказку мимо LLM-выбранного скоупа). Потенц. follow-up — директива по classified.
             _sec = None
             _recur = None  # #333: «повторяющееся напоминание → передай recurrence_rule»
+            # #376 v2: чтение уже предысполнено сервером (pre_exec-ToolMessage в ДЕЛЬТЕ текущего
+            # хода) → секц-директива «зови show_checklist» бессмысленна И вредна: хвост хода =
+            # ToolMessage → директива уходит ОТДЕЛЬНОЙ user-репликой после результата, и модель
+            # иногда отвечает НА НЕЁ («Поняла, буду опираться на инструменты» — прод 16.07 18:37,
+            # 2/15 ходов) вместо вопроса. Подавляем директиву на pre-exec ходе.
+            _pre_exec376 = False
+            for _m376 in reversed(state["messages"]):
+                if isinstance(_m376, HumanMessage):
+                    break
+                if (isinstance(_m376, ToolMessage)
+                        and isinstance(getattr(_m376, "artifact", None), dict)
+                        and _m376.artifact.get("pre_exec")):
+                    _pre_exec376 = True
+                    break
             if eff == "task":
                 _text = _last_human_text(state["messages"])
                 # #333: НЕЗАВИСИМО от доменной директивы — «кажд»+«напомн» в тексте =
@@ -3360,6 +3374,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                 else:
                     from sreda.runtime.react_preflight import _section_hint
                     _sec = _section_hint(_text)
+                if _pre_exec376:
+                    _sec = None  # #376 v2: чтение предысполнено — директива «зови инструмент» вредна
             # #285 B4 (пилляр 4): единый путь — честный хвост «доступны: …» из ФАКТИЧЕСКОГО bound этого
             # прохода + #279-семантика (способность есть; про текущий ход; нужного нет → уточни, не
             # отказывай). Только на unified_execute; None на легаси-пути (там хвост не меняется).
