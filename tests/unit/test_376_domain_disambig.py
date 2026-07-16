@@ -250,3 +250,17 @@ def test_narrow_l2r1_overview_and_write_phrases_376():
     for t in ("внеси в список кино молоко", "впиши хлеб в список кино",
               "зафиксируй в списке кино"):
         assert C(t) is None, f"write-shaped {t!r} должен давать None"
+
+
+def test_one_clause_guard_l2r2_376():
+    """L2-R2 (sol/terra MAJOR): гард режет союзы или|а|но и ВНУТРЕННЮЮ пунктуацию;
+    хвостовые ./!/?/… легитимны; главный кейс проходит."""
+    from sreda.runtime.react_loop import _one_clause_376 as g
+    assert g("Что у меня в списке кино")
+    assert g("Что у меня в списке кино?")          # хвостовой знак — не разделитель
+    assert not g("в списке кино или какие ещё есть")
+    assert not g("покажи список кино, а какие ещё")
+    assert not g("покажи список кино. Какие ещё есть?")
+    assert not g("кино — какие ещё есть")
+    assert not g("список кино и покупки")
+    assert not g("кино но покажи всё")
