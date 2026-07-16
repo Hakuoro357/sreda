@@ -334,3 +334,13 @@ def test_v2r2_pre_exec_in_trace_376():
                         artifact={"result_kind": "ok", "pre_exec": True})]
     entries = collect_tool_calls(msgs, tenant_id="t")
     assert any(e.get("pre_exec") for e in entries), "pre_exec потерян в трейсе"
+
+
+def test_v2r2_infinitive_not_read_376():
+    """v2-R2 (sol MAJOR, тот же класс): инфинитивы/декларативы не read-запрос."""
+    from sreda.runtime.react_loop import _re376_read_marker
+    for t in ("я хотел показать список кино", "я посмотрю список кино",
+              "я посмотрел список кино"):
+        assert not _re376_read_marker.search(t), t
+    assert _re376_read_marker.search("покажи список кино")
+    assert _re376_read_marker.search("что у меня в списке кино")
