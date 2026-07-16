@@ -2205,6 +2205,19 @@ def _pre_exec_in_turn_376(messages) -> bool:
     return False
 
 
+def _glue376_tail_to_last_human(msgs: list, tt: str) -> list:
+    """#376 v2: приклеить служебный хвост tt к последнему НАСТОЯЩЕМУ HumanMessage
+    (вопрос юзера над pre-exec парой) — пара остаётся замыкающей. Новый список и
+    новый Human-объект (state не мутируется). Human не найден → прежнее поведение
+    (отдельный trailing-user). CR sol/субагент: вынесен для детерминированного теста."""
+    for _hi in range(len(msgs) - 1, -1, -1):
+        if isinstance(msgs[_hi], HumanMessage):
+            return [*msgs[:_hi],
+                    HumanMessage(content=f"{msgs[_hi].content}\n\n{tt}"),
+                    *msgs[_hi + 1:]]
+    return [*msgs, HumanMessage(content=tt)]
+
+
 def _one_clause_376(text: str) -> bool:
     """#376 слой-2: текст — одна клауза (без союзов-соединителей и внутренней пунктуации)?
     Хвостовые «.», «!», «?», «…» — не разделители (стрип). Консервативно: False → без сужения."""
@@ -3414,6 +3427,17 @@ def _build_graph(llm: Any, all_tools: list, *,
                     if _msgs and isinstance(_msgs[-1], HumanMessage):
                         _msgs = [*_msgs[:-1],
                                  HumanMessage(content=f"{_msgs[-1].content}\n\n{_directive}")]
+                    elif _pre_exec376:
+                        # #376 v2 (самопроверка 2026-07-16: 4/8 глитчей нарастали с историей):
+                        # на pre-exec ходе хвост = НАША пара (Tool) — служебный хвост отдельной
+                        # user-репликой ПОСЛЕ результата модель принимает за реплику юзера
+                        # («Поняла, буду опираться…», «Слушаю, чем могу помочь?»). Клеим хвост
+                        # к последнему НАСТОЯЩЕМУ Human (вопрос юзера прямо над парой) — пара
+                        # остаётся замыкающей, инструкции внутри вопроса. Якорь времени — в том
+                        # же блоке (контракт #298 сохранён: время идёт с директивой).
+                        _tt = (f"{time_tail_line}\n\n{_directive}"
+                               if time_tail_line else _directive)
+                        _msgs = _glue376_tail_to_last_human(_msgs, _tt)
                     else:
                         # #356 R1 субагент CRITICAL: директива отдельным trailing-user
                         # (хвост = assistant/tool: guard-нудж после refusal ИЛИ форс
