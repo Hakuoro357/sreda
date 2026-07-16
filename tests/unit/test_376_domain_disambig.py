@@ -351,16 +351,8 @@ def test_v2_sec_suppressed_on_pre_exec_376():
     отдельной user-репликой ПОСЛЕ результата, и модель отвечает ей («Поняла, буду опираться…»).
     Детект: pre_exec-ToolMessage в дельте текущего хода (сканирование до последнего Human)."""
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-    # воспроизводим сканер из chat-узла (та же логика)
-    def pre_exec_in_turn(messages):
-        for m in reversed(messages):
-            if isinstance(m, HumanMessage):
-                break
-            if (isinstance(m, ToolMessage)
-                    and isinstance(getattr(m, "artifact", None), dict)
-                    and m.artifact.get("pre_exec")):
-                return True
-        return False
+    # CR terra: импортируем БОЕВОЙ сканер (дубль логики в тесте дрейфует)
+    from sreda.runtime.react_loop import _pre_exec_in_turn_376 as pre_exec_in_turn
     pair_turn = [HumanMessage(content="Что у меня в списке кино"),
                  AIMessage(content="", tool_calls=[{"name": "show_checklist",
                                                     "args": {}, "id": "pre376_x",

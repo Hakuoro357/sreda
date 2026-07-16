@@ -2190,6 +2190,21 @@ def _prebuilt_checklist_read(tools: list, list_ref: str):
         return None
 
 
+def _pre_exec_in_turn_376(messages) -> bool:
+    """#376 v2: в ДЕЛЬТЕ текущего хода (до последнего HumanMessage) есть pre_exec-ToolMessage?
+    Используется chat-узлом для подавления секц-директивы (иначе она уходит отдельной
+    user-репликой после результата, и модель отвечает ей). Module-level — тесты импортируют
+    боевой сканер (CR terra: дубль логики в тесте дрейфует)."""
+    for _m in reversed(list(messages or [])):
+        if isinstance(_m, HumanMessage):
+            break
+        if (isinstance(_m, ToolMessage)
+                and isinstance(getattr(_m, "artifact", None), dict)
+                and _m.artifact.get("pre_exec")):
+            return True
+    return False
+
+
 def _one_clause_376(text: str) -> bool:
     """#376 слой-2: текст — одна клауза (без союзов-соединителей и внутренней пунктуации)?
     Хвостовые «.», «!», «?», «…» — не разделители (стрип). Консервативно: False → без сужения."""
@@ -3329,15 +3344,7 @@ def _build_graph(llm: Any, all_tools: list, *,
             # ToolMessage → директива уходит ОТДЕЛЬНОЙ user-репликой после результата, и модель
             # иногда отвечает НА НЕЁ («Поняла, буду опираться на инструменты» — прод 16.07 18:37,
             # 2/15 ходов) вместо вопроса. Подавляем директиву на pre-exec ходе.
-            _pre_exec376 = False
-            for _m376 in reversed(state["messages"]):
-                if isinstance(_m376, HumanMessage):
-                    break
-                if (isinstance(_m376, ToolMessage)
-                        and isinstance(getattr(_m376, "artifact", None), dict)
-                        and _m376.artifact.get("pre_exec")):
-                    _pre_exec376 = True
-                    break
+            _pre_exec376 = _pre_exec_in_turn_376(state["messages"])
             if eff == "task":
                 _text = _last_human_text(state["messages"])
                 # #333: НЕЗАВИСИМО от доменной директивы — «кажд»+«напомн» в тексте =
