@@ -3414,6 +3414,24 @@ def _build_graph(llm: Any, all_tools: list, *,
                     if _msgs and isinstance(_msgs[-1], HumanMessage):
                         _msgs = [*_msgs[:-1],
                                  HumanMessage(content=f"{_msgs[-1].content}\n\n{_directive}")]
+                    elif _pre_exec376:
+                        # #376 v2 (самопроверка 2026-07-16: 4/8 глитчей нарастали с историей):
+                        # на pre-exec ходе хвост = НАША пара (Tool) — служебный хвост отдельной
+                        # user-репликой ПОСЛЕ результата модель принимает за реплику юзера
+                        # («Поняла, буду опираться…», «Слушаю, чем могу помочь?»). Клеим хвост
+                        # к последнему НАСТОЯЩЕМУ Human (вопрос юзера прямо над парой) — пара
+                        # остаётся замыкающей, инструкции внутри вопроса. Якорь времени — в том
+                        # же блоке (контракт #298 сохранён: время идёт с директивой).
+                        _tt = (f"{time_tail_line}\n\n{_directive}"
+                               if time_tail_line else _directive)
+                        for _hi in range(len(_msgs) - 1, -1, -1):
+                            if isinstance(_msgs[_hi], HumanMessage):
+                                _msgs = [*_msgs[:_hi],
+                                         HumanMessage(content=f"{_msgs[_hi].content}\n\n{_tt}"),
+                                         *_msgs[_hi + 1:]]
+                                break
+                        else:  # Human не найден (не должно случаться) — прежнее поведение
+                            _msgs = [*_msgs, HumanMessage(content=_tt)]
                     else:
                         # #356 R1 субагент CRITICAL: директива отдельным trailing-user
                         # (хвост = assistant/tool: guard-нудж после refusal ИЛИ форс
