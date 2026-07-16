@@ -239,3 +239,14 @@ def test_narrow_default_empty_byte_identical_376():
              for n in ("show_checklist", "list_checklists")]
     base = [t.name for t in _apply_unified_policy(tools, ["checklists"], [])]
     assert base == ["show_checklist", "list_checklists"]
+
+
+def test_narrow_l2r1_overview_and_write_phrases_376():
+    """L2-R1 (sol/terra MAJOR): mixed/overview/write-фразы НЕ дают items+high
+    (детектор чинён: окно overview {0,4}, write-основы внеси/впиши/зафиксируй)."""
+    from sreda.runtime.react_preflight import classify_checklist_query as C
+    r = C("а какие ещё у меня списки?")
+    assert r is not None and r.kind == "overview", "«какие ещё у меня списки» → обзор"
+    for t in ("внеси в список кино молоко", "впиши хлеб в список кино",
+              "зафиксируй в списке кино"):
+        assert C(t) is None, f"write-shaped {t!r} должен давать None"

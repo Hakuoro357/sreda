@@ -2146,6 +2146,9 @@ def _domain_clf_disambig_for(tenant_id: str) -> bool:
 # инфраструктуру») — потеря калибровочного сообщения не критична.
 _DIS376_SEEN: dict[tuple, float] = {}
 _DIS376_TTL_S = 3600.0
+# #376 слой-2: детектор соединителей для одноклаузного гарда сужения (паттерн = _CONNECTORS_RE
+# роутера #221; вторая клауза может нести обзор-намерение, которое классификатор видит не всегда).
+_re376_connectors = re.compile(r"\b(?:и|потом|затем|также|плюс)\b")
 # CR R1 субагент: event loop держит task слабой ссылкой — без сильной ссылки таск может
 # быть собран GC до завершения (классическая ловушка create_task). Храним до done.
 _DIS376_TASKS: set = set()
@@ -4717,6 +4720,9 @@ async def handle_turn(
                            # invoke в одном треде; без сброса после execute-хода disabled/shadow фильтровали бы
                            # из чекпойнта (не byte-identical). execute ниже перезапишет.
                            "router_allowed_read_domains": None, "router_allowed_write_domains": None,
+                           # #376 слой-2 (CR субагент MAJOR): сброс на КАЖДЫЙ свежий ход — last-value
+                           # канал иначе переживает ход и суживает следующий (класс #221 R1 CRITICAL).
+                           "checklist_narrow_exclude": None,
                            # #221 Ф3b-фикс: router_decision_json ТОЖЕ сбрасывать (как allowed_*). Иначе ход,
                            # пропустивший доменный блок (intent=чат/факт), писал бы в трейс СТАРОЕ решение
                            # прошлого хода → стейл-лог (искажает измерение #234/расхождений). Исполнение это
@@ -4950,7 +4956,18 @@ async def handle_turn(
                     # fail-open (без сужения). Write-ходы детектор сам отсекает (None), mixed не сужаем.
                     _narrow376: list | None = None
                     _narrow_meta: dict = {}
-                    if _dis376_on and "checklists" in _upol["allowed_read"]:
+                    # CR L2-R1 гарды (sol/terra/субагент): (1) только legacy-инструменты — при
+                    # unified ON exclude «list_checklists» = no-op, там рулит querykind #213;
+                    # (2) не write-ход (B1-сигнал шире _CQ_WRITE_RE: «внеси…» и т.п.);
+                    # (3) ОДНА клауза — союз/запятая («кино и какие ещё есть», «кино, а какие
+                    # списки?») может нести обзор-намерение второй клаузой, классификатор его
+                    # видит не всегда → консервативно не сужаем.
+                    _one_clause376 = ("," not in user_text
+                                      and not _re376_connectors.search(user_text.lower()))
+                    if (_dis376_on and "checklists" in _upol["allowed_read"]
+                            and not _checklist_unified()
+                            and not _upol["signals"]["write_cmd"]
+                            and _one_clause376):
                         try:
                             from sreda.runtime.react_preflight import classify_checklist_query
                             _cq376 = classify_checklist_query(user_text)
