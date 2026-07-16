@@ -769,6 +769,11 @@ class ReactState(MessagesState):
     # compute_allowed_domains; resume читает из чекпойнта. Тип Optional — на resume старого чекпойнта = None.
     router_allowed_read_domains: list[str] | None
     router_allowed_write_domains: list[str] | None
+    # #376 слой-2: внутридоменное сужение read-бинда чек-листов. Детерминированный детектор
+    # (classify_checklist_query: items + имя резолвится в реальный список) → вырезать конкурента
+    # (list_checklists) из read-набора, чтобы «покажи список X» не мог уйти в обзор. Last-value;
+    # ставится на свежем ходу в unified-ветке (None когда не сработал); None/отсутствует → без сужения.
+    checklist_narrow_exclude: list[str] | None
     # #285 Фаза B (B2b): ход идёт ЕДИНЫМ путём execute (канареечный тенант) → bind-сайты применяют
     # _apply_unified_policy (write вне allowed_write → кандидат+confirm, не отказ). Last-value; сброс
     # на свежем ходе; отсутствует/False → #221-поведение (_apply_domain_policy). Ставится в override.
@@ -1779,7 +1784,8 @@ def _generic_confirm_wrap(inner: Any) -> Any:
     )
 
 
-def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any) -> list:
+def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any,
+                          exclude_read: frozenset = frozenset()) -> list:
     """#285 B2b-2: фильтр набора на ЕДИНОМ пути execute. Как `_apply_domain_policy` для read, НО write
     ВНЕ allowed_write НЕ отказывает — биндит КАНДИДАТОМ под generic confirm (ярус б). Так unsignaled
     write = подтверждение, не тупик #281/#282; молчаливой мутации нет (write в allowed_write — прямой,
@@ -1810,6 +1816,12 @@ def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any) ->
             else:
                 out.append(_generic_confirm_wrap(t))  # ярус (б): кандидат под confirm
         elif tool_read_domains(name) <= ar:
+            # #376 слой-2: внутридоменное сужение ЧТЕНИЯ — детерминированный детектор
+            # (items+имя резолвится) вырезает конкурента (list_checklists) из read-набора,
+            # чтобы «покажи список X» физически не мог уйти в обзор. ТОЛЬКО read-класс:
+            # write выше не трогается (кандидат+confirm как был).
+            if name in exclude_read:
+                continue
             out.append(t)  # read_pure/read_external по allowed_read (как #221)
     return out
 
@@ -2134,6 +2146,20 @@ def _domain_clf_disambig_for(tenant_id: str) -> bool:
 # инфраструктуру») — потеря калибровочного сообщения не критична.
 _DIS376_SEEN: dict[tuple, float] = {}
 _DIS376_TTL_S = 3600.0
+# #376 слой-2: одноклаузный гард сужения — вторая клауза может нести обзор-намерение,
+# которое классификатор видит не всегда. L2-R2 (sol/terra MAJOR): + противительные/
+# разделительные союзы (а|но|или) и ВНУТРЕННЯЯ пунктуация («кино. Какие ещё есть?»,
+# «кино — какие ещё») — хвостовая точка/вопрос легитимны и стрипаются.
+_re376_connectors = re.compile(r"\b(?:и|или|а|но|потом|затем|также|плюс)\b")
+_re376_inner_punct = re.compile(r"[,;:.!?…—–\r\n]|\s-\s")  # L2-R3 sol: \n — тоже граница клауз
+
+
+def _one_clause_376(text: str) -> bool:
+    """#376 слой-2: текст — одна клауза (без союзов-соединителей и внутренней пунктуации)?
+    Хвостовые «.», «!», «?», «…» — не разделители (стрип). Консервативно: False → без сужения."""
+    _t = (text or "").strip().rstrip(" .!?…")
+    return (not _re376_inner_punct.search(_t)
+            and not _re376_connectors.search(_t.lower()))
 # CR R1 субагент: event loop держит task слабой ссылкой — без сильной ссылки таск может
 # быть собран GC до завершения (классическая ловушка create_task). Храним до done.
 _DIS376_TASKS: set = set()
@@ -3239,7 +3265,8 @@ def _build_graph(llm: Any, all_tools: list, *,
             if state.get("unified_execute"):  # B2b-2: единый путь → candidate-write под confirm
                 bound = _apply_unified_policy(
                     _select_tools(all_tools, state.get("active_families")),
-                    state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
+                    state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"),
+                    exclude_read=frozenset(state.get("checklist_narrow_exclude") or ()))  # #376 слой-2
             else:
                 bound = _apply_domain_policy(
                     _select_tools(all_tools, state.get("active_families")),
@@ -3470,7 +3497,8 @@ def _build_graph(llm: Any, all_tools: list, *,
         if state.get("unified_execute"):  # B2b-2: candidate-write под confirm на dispatch
             _bound_list = _apply_unified_policy(
                 _bind_for(all_tools, active, eff),
-                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"))
+                state.get("router_allowed_read_domains"), state.get("router_allowed_write_domains"),
+                exclude_read=frozenset(state.get("checklist_narrow_exclude") or ()))  # #376 слой-2
         else:
             _bound_list = _apply_domain_policy(
                 _bind_for(all_tools, active, eff),
@@ -4703,6 +4731,9 @@ async def handle_turn(
                            # invoke в одном треде; без сброса после execute-хода disabled/shadow фильтровали бы
                            # из чекпойнта (не byte-identical). execute ниже перезапишет.
                            "router_allowed_read_domains": None, "router_allowed_write_domains": None,
+                           # #376 слой-2 (CR субагент MAJOR): сброс на КАЖДЫЙ свежий ход — last-value
+                           # канал иначе переживает ход и суживает следующий (класс #221 R1 CRITICAL).
+                           "checklist_narrow_exclude": None,
                            # #221 Ф3b-фикс: router_decision_json ТОЖЕ сбрасывать (как allowed_*). Иначе ход,
                            # пропустивший доменный блок (intent=чат/факт), писал бы в трейс СТАРОЕ решение
                            # прошлого хода → стейл-лог (искажает измерение #234/расхождений). Исполнение это
@@ -4927,12 +4958,48 @@ async def handle_turn(
                                     user_text, _route285, _cls352,
                                     sticky_memory_write=_sticky285,
                                     prev_open_domains=_pod)
+                    # #376 слой-2: детерминированное сужение items-vs-overview внутри чек-листов.
+                    # classify_checklist_query (regex, #213) сказал «конкретный список по имени» +
+                    # имя резолвится в РЕАЛЬНЫЙ чек-лист (exact|unique_fuzzy) + домен checklists
+                    # разрешён (после дизамбигуации) → вырезать list_checklists из read-бинда:
+                    # «покажи список X» физически не может уйти в обзор (как list_shopping после
+                    # subtract). Двойной детерминированный замок; сбой/неуверенность/ambiguous →
+                    # fail-open (без сужения). Write-ходы детектор сам отсекает (None), mixed не сужаем.
+                    _narrow376: list | None = None
+                    _narrow_meta: dict = {}
+                    # CR L2-R1 гарды (sol/terra/субагент): (1) только legacy-инструменты — при
+                    # unified ON exclude «list_checklists» = no-op, там рулит querykind #213;
+                    # (2) не write-ход (B1-сигнал шире _CQ_WRITE_RE: «внеси…» и т.п.);
+                    # (3) ОДНА клауза — союз/запятая («кино и какие ещё есть», «кино, а какие
+                    # списки?») может нести обзор-намерение второй клаузой, классификатор его
+                    # видит не всегда → консервативно не сужаем.
+                    _one_clause376 = _one_clause_376(user_text)
+                    if (_dis376_on and "checklists" in _upol["allowed_read"]
+                            and not _checklist_unified()
+                            and not _upol["signals"]["write_cmd"]
+                            and _one_clause376):
+                        try:
+                            from sreda.runtime.react_preflight import classify_checklist_query
+                            _cq376 = classify_checklist_query(user_text)
+                            if (_cq376 is not None and _cq376.kind == "items"
+                                    and _cq376.confidence == "high" and _cq376.name_span):
+                                from sreda.services.checklists import ChecklistService
+                                _res376 = ChecklistService(session).resolve_list_by_title_ranked(
+                                    tenant_id=tenant_id, user_id=user_id, needle=_cq376.name_span)
+                                _narrow_meta = {"resolver": _res376.status}
+                                if _res376.status in ("exact", "unique_fuzzy"):
+                                    _narrow376 = ["list_checklists"]
+                        except Exception as _e376n:  # noqa: BLE001 — сужение не роняет ход
+                            logger.warning(
+                                "react_loop: #376 narrow failed type=%s at=%s → без сужения",
+                                _safe_tn(_e376n), _safe_tb(_e376n))
                     _uar, _uaw = list(_upol["allowed_read"]), list(_upol["allowed_write"])
                     _init["intent"] = "task"  # единый = полный путь (не web-only chat/fact split)
                     _init["intent_meta"] = {"source": "unified", "must_task": False, "classifier_raw": ""}
                     _init["unified_execute"] = True  # B2b-2: bind-сайты → _apply_unified_policy (candidate)
                     _init["router_allowed_read_domains"] = _uar
                     _init["router_allowed_write_domains"] = _uaw
+                    _init["checklist_narrow_exclude"] = _narrow376  # #376 слой-2 (None = без сужения)
                     _init["active_families"] = sorted(set(_uar) & set(_LAZY_FAMILIES))
                     # CR R1 sol/terra MAJOR: disambig-ключ ТОЛЬКО при включённом гейте #376 —
                     # флаг OFF / не-allowlist → трейс байт-в-байт прежний.
@@ -4940,6 +5007,8 @@ async def handle_turn(
                             "signals": _upol["signals"], "llm_fallback": _lf352}
                     if _dis376_on:
                         _rdj["disambig"] = _dis376  # #376: статик/классификатор/вид/применено (без ПД)
+                        # слой-2: сужение (без имени списка — ПД; только факт+статус резолвера)
+                        _rdj["item_narrow"] = {"applied": bool(_narrow376), **_narrow_meta}
                     _init["router_decision_json"] = json.dumps(_rdj, ensure_ascii=False)
                 except Exception:  # noqa: BLE001 — единый путь не роняет ход → ПОЛНЫЙ fail-open
                     # #352 R1 sol/terra: легаси-блок выше на unified-тенанте больше не зовёт LLM-фолбэк
