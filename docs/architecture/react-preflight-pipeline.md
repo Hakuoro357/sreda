@@ -5,7 +5,7 @@
 **Related code:** `src/sreda/runtime/react_loop.py` (узел `chat`, `_build_graph` — потребление; меняется по многим причинам, freshness НЕ трекаем)
 **Tests:** `tests/unit/` — калибровка `_must_task` (`test_must_task_high_precision`), классификаторы интента/доменов, политика `compute_allowed_domains`
 **Status:** задеплоено. Флаг `SREDA_REACT_PREFLIGHT_ENABLED` ВКЛ на проде (2026-06-24); доменный роутер #221 — execute глобально. **С 2026-07-08 поверх конвейера на ВСЕХ тенантах работает ЕДИНЫЙ ПУТЬ #285 (`SREDA_REACT_UNIFIED_TENANTS=*`) — см. «Слой 3»: интент-сплит и #221-домены переопределяются единой политикой; слои 1-2 остаются подложкой и полным поведением при откате**
-**Verified-against:** `e2f67bb` (сверено с кодом 2026-07-14; doc-sync #374 — checklist/shopping-директива: verify-агент Haiku СООТВЕТСТВУЕТ)
+**Verified-against:** `bc200e3` (сверено с кодом 2026-07-16; doc-sync #376 слой-2 — калибровка `classify_checklist_query`: окно overview-фраз `{0,4}` («какие ещё у меня списки» → overview), write-основы `внеси|впиши|зафиксируй` → None; потребители — Срез B cross-check (#213) и сужение read-бинда #376 слой-2 в react_loop)
 **Флаги:** `SREDA_REACT_PREFLIGHT_ENABLED` (default `False`); `SREDA_REACT_PREFLIGHT_CHAT_PROVIDER` (default `openrouter-deepseek` — это и есть прод; история: #224 переводил на `gemini-2.5-flash-lite` ради скорости, #257 вернул на `openrouter-deepseek` — gemini-lite зависал); `SREDA_CHECKLIST_UNIFIED` (default `False`) меняет текст checklist-директивы (#213, см. `route_domains`); **`SREDA_REACT_UNIFIED_PATH_ENABLED` + `SREDA_REACT_UNIFIED_TENANTS` (#285)** — единый путь: флаг ON + тенант в списке (`*` = все) → слой 3 переопределяет слои 1-2; флаг OFF или список пуст → byte-identical слоям 1-2
 
 ## Зачем это существует
