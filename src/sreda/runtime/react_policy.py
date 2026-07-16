@@ -188,12 +188,27 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
         _raised = set(route.all_domains) | read_cues
         if _fd <= _raised:
             disambig_kind = "subtract"
-            for _grp in read_cue_groups(text):
-                _g = set(_grp) - {"web"}
+            # CR R1 sol MAJOR: домен, поднятый ДРУГОЙ кюс-группой, вычитать нельзя —
+            # «список кино и покупки» даёт {checklists,shopping} И {shopping}: вердикт
+            # checklists не должен снять shopping, явно затребованный второй группой.
+            _groups = [set(_grp) - {"web"} for _grp in read_cue_groups(text)]
+            for _i, _g in enumerate(_groups):
                 if len(_g) > 1 and (_fd & _g):
-                    allowed_read -= (_g - _fd) - allowed_write
+                    _others: set = set().union(
+                        *(_groups[:_i] + _groups[_i + 1:])) if len(_groups) > 1 else set()
+                    allowed_read -= (_g - _fd) - allowed_write - _others
         else:
             disambig_kind = "add"  # анти-инъекция: НЕ применяем, только divergence снаружи
+
+    _signals = {"write_cmd": w_sig, "declarative": d_sig, "read_cues": sorted(read_cues),
+                "sticky_memory": sticky_applied,
+                "turn_continuation": continuation,   # #338: наблюдаемость наследования
+                "llm_domains": llm_domains}          # #352: что дал LLM-классификатор
+    if disambiguator is not None:
+        # CR R1 sol/terra MAJOR: без дизамбигуатора форма signals ПРЕЖНЯЯ байт-в-байт
+        # (поля не добавляются) — флаг OFF не меняет ни политику, ни трейс.
+        _signals["disambig_kind"] = disambig_kind    # #376: subtract | add | None
+        _signals["disambig_domains"] = disambig_domains
 
     return {
         "v": POLICY_VERSION_B2,
@@ -201,10 +216,5 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
         "allowed_read": sorted(allowed_read),
         "allowed_write": sorted(allowed_write),   # ярус (а): прямой write без confirm
         "confirm_write": True,                    # ярус (б): write вне allowed_write → кандидат+confirm (B2b)
-        "signals": {"write_cmd": w_sig, "declarative": d_sig, "read_cues": sorted(read_cues),
-                    "sticky_memory": sticky_applied,
-                    "turn_continuation": continuation,   # #338: наблюдаемость наследования
-                    "llm_domains": llm_domains,          # #352: что дал LLM-классификатор
-                    "disambig_kind": disambig_kind,      # #376: subtract | add | None
-                    "disambig_domains": disambig_domains},
+        "signals": _signals,
     }

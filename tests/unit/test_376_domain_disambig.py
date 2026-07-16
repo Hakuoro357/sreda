@@ -79,6 +79,26 @@ def test_disambig_does_not_touch_write_376():
         assert wd in pol["allowed_read"], "write-цель осталась читаемой"
 
 
+def test_disambig_none_full_equality_376():
+    """CR R1 sol/terra MAJOR: disambiguator=None → policy-dict ПОЛНОСТЬЮ равен прежнему
+    (signals БЕЗ disambig-полей) — флаг OFF не меняет ни политику, ни форму трейса."""
+    text = "Что у меня в списке кино"
+    from sreda.runtime.react_preflight import route_domains as _rd
+    pol = compute_unified_policy(text, _rd(text))
+    assert "disambig_kind" not in pol["signals"]
+    assert "disambig_domains" not in pol["signals"]
+
+
+def test_disambig_protects_other_group_domain_376():
+    """CR R1 sol MAJOR: домен, поднятый ДРУГОЙ кюс-группой, НЕ вычитается.
+    «список кино и покупки»: группы {checklists,shopping} и {shopping} — вердикт
+    checklists не снимает shopping (он затребован второй группой явно)."""
+    text = "Что у меня в списке кино и покупки"
+    pol = _pol(text, DomainClassResult(("checklists",), "high"))
+    assert "checklists" in pol["allowed_read"]
+    assert "shopping" in pol["allowed_read"], "shopping второй группы защищён от вычитания"
+
+
 # ─────────────────── проводка: флаг-гейт, дедуп нотификаций, fail-safe ───────────────────
 
 

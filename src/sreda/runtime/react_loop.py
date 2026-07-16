@@ -2134,6 +2134,9 @@ def _domain_clf_disambig_for(tenant_id: str) -> bool:
 # инфраструктуру») — потеря калибровочного сообщения не критична.
 _DIS376_SEEN: dict[tuple, float] = {}
 _DIS376_TTL_S = 3600.0
+# CR R1 субагент: event loop держит task слабой ссылкой — без сильной ссылки таск может
+# быть собран GC до завершения (классическая ловушка create_task). Храним до done.
+_DIS376_TASKS: set = set()
 
 
 async def _dis376_send_alert(text: str) -> None:
@@ -2165,7 +2168,9 @@ def _notify_domain_divergence(tenant_id: str, dis: dict) -> None:
                 + " | классификатор=" + (",".join(dis.get("freddie_domains") or []) or "-")
                 + f" | вид={dis.get('kind')} | применено={'да' if dis.get('applied') else 'нет'}"
                 + f" | tenant={tenant_id}")
-        asyncio.create_task(_dis376_send_alert(text))
+        _t = asyncio.create_task(_dis376_send_alert(text))
+        _DIS376_TASKS.add(_t)
+        _t.add_done_callback(_DIS376_TASKS.discard)
     except Exception:  # noqa: BLE001 — нотификация никогда не роняет ход
         logger.warning("react_loop: #376 divergence notify skipped")
 
@@ -4844,10 +4849,18 @@ async def handle_turn(
                     # fail-open: сбой/таймаут/low → базовая политика. Канарейка
                     # _domain_clf_disambig_for; OFF → ветки нет (байт-в-байт).
                     _dis376: dict = {"ran": False}
-                    if _domain_clf_disambig_for(tenant_id):
+                    _dis376_on = _domain_clf_disambig_for(tenant_id)
+                    # CR R1 sol/terra MINOR: compound/cross гейтим ДО LLM-вызова (вердикт там
+                    # заведомо не применяется — не жжём вызов и до 4с латентности впустую).
+                    if (_dis376_on and not _route285.compound_by_connector
+                            and _route285.cross_intent is None):
                         try:
                             _t0376 = _time.monotonic()
-                            _cls376 = await _cd352(_recent, user_text, llm)  # БЕЗ prev_turn
+                            # CR R1 sol MAJOR: ПУСТАЯ история — системный промпт классификатора
+                            # велит наследовать раздел прошлого хода; с _recent после shopping-хода
+                            # «список кино» дал бы shopping (∈ группы, анти-add не спасёт) →
+                            # вычелся бы checklists (инверсия бага). Правда ТЕКУЩЕГО хода = без истории.
+                            _cls376 = await _cd352([], user_text, llm)  # БЕЗ prev_turn, БЕЗ истории
                             _upol376 = compute_unified_policy(
                                 user_text, _route285,
                                 sticky_memory_write=_sticky285,
@@ -4916,11 +4929,13 @@ async def handle_turn(
                     _init["router_allowed_read_domains"] = _uar
                     _init["router_allowed_write_domains"] = _uaw
                     _init["active_families"] = sorted(set(_uar) & set(_LAZY_FAMILIES))
-                    _init["router_decision_json"] = json.dumps(
-                        {"mode": "unified-execute", "allowed_read": _uar, "allowed_write": _uaw,
-                         "signals": _upol["signals"], "llm_fallback": _lf352,
-                         "disambig": _dis376},  # #376: статик/классификатор/вид/применено (без ПД)
-                        ensure_ascii=False)
+                    # CR R1 sol/terra MAJOR: disambig-ключ ТОЛЬКО при включённом гейте #376 —
+                    # флаг OFF / не-allowlist → трейс байт-в-байт прежний.
+                    _rdj = {"mode": "unified-execute", "allowed_read": _uar, "allowed_write": _uaw,
+                            "signals": _upol["signals"], "llm_fallback": _lf352}
+                    if _dis376_on:
+                        _rdj["disambig"] = _dis376  # #376: статик/классификатор/вид/применено (без ПД)
+                    _init["router_decision_json"] = json.dumps(_rdj, ensure_ascii=False)
                 except Exception:  # noqa: BLE001 — единый путь не роняет ход → ПОЛНЫЙ fail-open
                     # #352 R1 sol/terra: легаси-блок выше на unified-тенанте больше не зовёт LLM-фолбэк
                     # → его решение для routeless-хода = deny (ложные отказы класса #352). Поэтому сбой
