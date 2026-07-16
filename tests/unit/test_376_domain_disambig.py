@@ -299,3 +299,17 @@ def test_prebuilt_read_fail_open_376():
         raise RuntimeError("db down")
     tools = [StructuredTool.from_function(name="show_checklist", func=_boom, description="t")]
     assert _prebuilt_checklist_read(tools, "x") is None
+
+
+def test_v2_read_request_gate_376():
+    """v2-R1 (sol MAJOR): pre-exec только на ЯВНЫЙ read-запрос без отрицания —
+    утверждение/отрицание/меташум не читают список невпопад."""
+    from sreda.runtime.react_loop import _re376_read_marker, _re376_negation
+    def ok(t):
+        tl = t.lower()
+        return bool(_re376_read_marker.search(tl)) and not _re376_negation.search(tl)
+    assert ok("Что у меня в списке кино")            # главный кейс
+    assert ok("покажи список кино")
+    assert not ok("мой список кино очень длинный")   # утверждение — нет read-маркера
+    assert not ok("не показывай мой список кино")    # отрицание
+    assert not ok("список кино длинноват")           # нет маркера

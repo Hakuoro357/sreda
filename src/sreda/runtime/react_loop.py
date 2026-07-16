@@ -2147,6 +2147,12 @@ _DIS376_TTL_S = 3600.0
 # «кино — какие ещё») — хвостовая точка/вопрос легитимны и стрипаются.
 _re376_connectors = re.compile(r"\b(?:и|или|а|но|потом|затем|также|плюс)\b")
 _re376_inner_punct = re.compile(r"[,;:.!?…—–\r\n]|\s-\s")  # L2-R3 sol: \n — тоже граница клауз
+# v2-R1 sol MAJOR: замки проверяли ФОРМУ (items+имя существует), но не сам ЗАПРОС на чтение —
+# «мой список кино очень длинный» (утверждение) / «не показывай список кино» (отрицание)
+# проходили бы → сервер читал бы список невпопад. Требуем явный read-маркер И отсутствие «не».
+_re376_read_marker = re.compile(
+    r"\b(покажи|показать|открой|что|какие|глянь|посмотр\w*|скажи|прочитай|выведи|есть ли)\b")
+_re376_negation = re.compile(r"\bне\b")
 
 
 def _prebuilt_checklist_read(tools: list, list_ref: str):
@@ -2163,6 +2169,7 @@ def _prebuilt_checklist_read(tools: list, list_ref: str):
         _t = next((t for t in tools if t.name == "show_checklist"), None)
         if _t is None:
             return None
+        _t0 = _time.monotonic()
         _res = _t.func(list_id_or_title=list_ref)
         if not isinstance(_res, str) or _res.lstrip().lower().startswith("error"):
             return None  # not_found/ошибка контракта — не подсовываем, штатный путь
@@ -2172,7 +2179,12 @@ def _prebuilt_checklist_read(tools: list, list_ref: str):
                     "name": "show_checklist",
                     "args": {"list_id_or_title": list_ref},
                     "id": _cid, "type": "tool_call"}]),
-                ToolMessage(content=_res, name="show_checklist", tool_call_id=_cid))
+                ToolMessage(content=_res, name="show_checklist", tool_call_id=_cid,
+                            # CR субагент MINOR: паспорт для #213-метрик чтения чек-листов
+                            # (иначе pre-exec невидим канарейке-наблюдаемости)
+                            artifact={"result_kind": "ok", "checklist_kind": "items",
+                                      "latency_ms": int((_time.monotonic() - _t0) * 1000),
+                                      "pre_exec": True}))
     except Exception:  # noqa: BLE001 — предысполнение не роняет ход
         logger.warning("react_loop: #376 prebuilt read failed → штатный путь")
         return None
@@ -4874,6 +4886,7 @@ async def handle_turn(
             # роняет ход, скоуп НЕ расширяется — остаётся #221-решение выше). Ярус (б) candidate/confirm — B2b-2.
             if _preflight and _unified_active:
                 # R2 sol/terra: intent/intent_meta от сплита - для честного отката при сбое ниже
+                _pair376 = None  # #376 v2: до try — except чистит пару при позднем сбое (NameError-guard)
                 _pre352_intent = _init.get("intent")
                 _pre352_meta = _init.get("intent_meta")
                 try:
@@ -4985,16 +4998,19 @@ async def handle_turn(
                     # subtract). Двойной детерминированный замок; сбой/неуверенность/ambiguous →
                     # fail-open (без сужения). Write-ходы детектор сам отсекает (None), mixed не сужаем.
                     _narrow_meta: dict = {}
-                    _pair376 = None
                     # #376 v2 (владелец): детекторы определили ВСЁ (пункты + конкретный список,
                     # имя уверенно резолвится) → сервер САМ читает список и отдаёт mercury
                     # ГОТОВЫЙ результат — модель только оформляет ответ. v1-сужение бинда
                     # откачено (петля в «недоступен», прод 16:09). Гарды прежние (L2-R1/R2):
                     # только legacy; не write-ход (B1); ОДНА клауза (_one_clause_376).
+                    _lc376 = (user_text or "").lower()
                     if (_dis376_on and "checklists" in _upol["allowed_read"]
                             and not _checklist_unified()
                             and not _upol["signals"]["write_cmd"]
-                            and _one_clause_376(user_text)):
+                            and _one_clause_376(user_text)
+                            # v2-R1 sol MAJOR: явный read-запрос, без отрицания
+                            and _re376_read_marker.search(_lc376)
+                            and not _re376_negation.search(_lc376)):
                         try:
                             from sreda.runtime.react_preflight import classify_checklist_query
                             _cq376 = classify_checklist_query(user_text)
@@ -5047,6 +5063,11 @@ async def handle_turn(
                     _init["unified_execute"] = False
                     _init["intent"] = _pre352_intent
                     _init["intent_meta"] = _pre352_meta
+                    # #376 v2 (CR субагент MINOR): поздний сбой (после вставки пары) мог оставить
+                    # синтетическую пару в fail-open ходе (интент может уйти в chat/fact) — убираем.
+                    if _pair376 is not None:
+                        _init["messages"] = [m for m in _init["messages"]
+                                             if m not in _pair376]
             # #285 Фаза A (SHADOW): TurnPolicy сайдкаром — выражает решения сплита (#197 интент,
             # #221 каналы, #256 таймауты, капы) явным объектом в ОТДЕЛЬНЫЙ канал. Legacy-каналы
             # router_allowed_* НЕ трогаются (контракт отката, инвентарь §2 (б)); исполнением НЕ
