@@ -264,3 +264,6 @@ def test_one_clause_guard_l2r2_376():
     assert not g("кино — какие ещё есть")
     assert not g("список кино и покупки")
     assert not g("кино но покажи всё")
+    assert not g("покажи список кино
+какие ещё есть")  # L2-R3 sol: 
+ = граница клауз
