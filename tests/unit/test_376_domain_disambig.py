@@ -80,13 +80,19 @@ def test_disambig_does_not_touch_write_376():
 
 
 def test_disambig_none_full_equality_376():
-    """CR R1 sol/terra MAJOR: disambiguator=None → policy-dict ПОЛНОСТЬЮ равен прежнему
-    (signals БЕЗ disambig-полей) — флаг OFF не меняет ни политику, ни форму трейса."""
-    text = "Что у меня в списке кино"
+    """CR R1 sol/terra MAJOR (+R2 MINOR обоих): disambiguator=None → policy-dict ПОЛНОСТЬЮ
+    в до-#376 форме — golden-заморозка НАБОРА ключей policy и signals (не только двух полей).
+    Регресс «поле просочилось при OFF» красит этот тест."""
     from sreda.runtime.react_preflight import route_domains as _rd
-    pol = compute_unified_policy(text, _rd(text))
-    assert "disambig_kind" not in pol["signals"]
-    assert "disambig_domains" not in pol["signals"]
+    GOLDEN_POLICY_KEYS = {"v", "mode", "allowed_read", "allowed_write", "confirm_write", "signals"}
+    GOLDEN_SIGNAL_KEYS = {"write_cmd", "declarative", "read_cues", "sticky_memory",
+                          "turn_continuation", "llm_domains"}  # форма ДО #376, байт-в-байт
+    for text in ("Что у меня в списке кино", "покажи задачи", "добавь молоко в покупки",
+                 "какая погода", "составь покупки из меню"):
+        pol = compute_unified_policy(text, _rd(text))
+        assert set(pol.keys()) == GOLDEN_POLICY_KEYS, f"policy-ключи изменились при None: {text!r}"
+        assert set(pol["signals"].keys()) == GOLDEN_SIGNAL_KEYS, \
+            f"signals-ключи изменились при None: {text!r}"
 
 
 def test_disambig_protects_other_group_domain_376():

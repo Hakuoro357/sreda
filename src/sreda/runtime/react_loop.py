@@ -2168,7 +2168,12 @@ def _notify_domain_divergence(tenant_id: str, dis: dict) -> None:
                 + " | классификатор=" + (",".join(dis.get("freddie_domains") or []) or "-")
                 + f" | вид={dis.get('kind')} | применено={'да' if dis.get('applied') else 'нет'}"
                 + f" | tenant={tenant_id}")
-        _t = asyncio.create_task(_dis376_send_alert(text))
+        _coro = _dis376_send_alert(text)
+        try:
+            _t = asyncio.create_task(_coro)
+        except RuntimeError:  # нет running loop (тесты/нестандартный контекст) — закрыть корутину
+            _coro.close()
+            raise
         _DIS376_TASKS.add(_t)
         _t.add_done_callback(_DIS376_TASKS.discard)
     except Exception:  # noqa: BLE001 — нотификация никогда не роняет ход
