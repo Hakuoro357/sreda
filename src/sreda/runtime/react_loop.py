@@ -2205,6 +2205,21 @@ def _pre_exec_in_turn_376(messages) -> bool:
     return False
 
 
+def _glue376_tail_to_last_human(msgs: list, tt: str) -> list:
+    """#376 v2: приклеить служебный хвост tt к последнему НАСТОЯЩЕМУ HumanMessage
+    (вопрос юзера над pre-exec парой) — пара остаётся замыкающей. Новый список и
+    новый Human-объект (state не мутируется). Human не найден → прежнее поведение
+    (отдельный trailing-user). CR sol/субагент: вынесен для детерминированного теста."""
+    for _hi in range(len(msgs) - 1, -1, -1):
+        if isinstance(msgs[_hi], HumanMessage):
+            return [*msgs[:_hi],
+                    HumanMessage(content=f"{msgs[_hi].content}
+
+{tt}"),
+                    *msgs[_hi + 1:]]
+    return [*msgs, HumanMessage(content=tt)]
+
+
 def _one_clause_376(text: str) -> bool:
     """#376 слой-2: текст — одна клауза (без союзов-соединителей и внутренней пунктуации)?
     Хвостовые «.», «!», «?», «…» — не разделители (стрип). Консервативно: False → без сужения."""

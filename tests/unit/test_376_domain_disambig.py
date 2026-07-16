@@ -367,3 +367,23 @@ def test_v2_sec_suppressed_on_pre_exec_376():
                            artifact={"pre_exec": True}),
                HumanMessage(content="новый вопрос")]
     assert not pre_exec_in_turn(old_pre)
+
+
+def test_glue_tail_to_last_human_376():
+    """v2-root (sol/субагент MINOR): сплайс хвоста — длина сохранена, пара замыкает,
+    хвост в последнем НАСТОЯЩЕМ Human, исходные объекты не мутированы."""
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+    from sreda.runtime.react_loop import _glue376_tail_to_last_human
+    h = HumanMessage(content="Что у меня в списке кино")
+    msgs = [SystemMessage(content="sp"), h,
+            AIMessage(content="", tool_calls=[{"name": "show_checklist", "args": {},
+                                               "id": "pre376_t", "type": "tool_call"}]),
+            ToolMessage(content="# X", name="show_checklist", tool_call_id="pre376_t")]
+    out = _glue376_tail_to_last_human(msgs, "Сейчас 12:00\n\nДоступны: …")
+    assert len(out) == len(msgs), "длина сохранена"
+    assert isinstance(out[-1], ToolMessage) and isinstance(out[-2], AIMessage), "пара замыкает"
+    assert "Сейчас 12:00" in out[1].content and "списке кино" in out[1].content, "хвост в Human"
+    assert h.content == "Что у меня в списке кино", "исходный Human не мутирован"
+    # Human нет вообще → прежнее поведение (trailing-user)
+    out2 = _glue376_tail_to_last_human([SystemMessage(content="sp")], "tt")
+    assert isinstance(out2[-1], HumanMessage) and out2[-1].content == "tt"
