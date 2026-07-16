@@ -211,6 +211,9 @@ def collect_tool_calls(messages: list, *, tenant_id: str) -> list[dict]:
                 # ambiguous/redirect, дискриминатор — только эти поля). Аддитивно, None если нет.
                 "checklist_kind": (art.get("checklist_kind") if isinstance(art, dict) else None),
                 "checklist_redirected": (art.get("checklist_redirected") if isinstance(art, dict) else None),
+                # #376 v2 (CR terra R2): pre-exec доезжает до tool_calls_json — иначе канарейка
+                # не отличит серверное предысполнение от обычного вызова модели.
+                "pre_exec": (art.get("pre_exec") if isinstance(art, dict) else None),
             }
     # 2) пройтись по вызовам (из AIMessage.tool_calls), сшить с результатом, посчитать HMAC
     out: dict[str, dict] = {}
@@ -239,6 +242,8 @@ def collect_tool_calls(messages: list, *, tenant_id: str) -> list[dict]:
                     _entry["checklist_kind"] = r["checklist_kind"]
                 if r.get("checklist_redirected"):
                     _entry["checklist_redirected"] = True
+                if r.get("pre_exec"):
+                    _entry["pre_exec"] = True  # #376 v2: серверное предысполнение
                 out[cid or f"{name}:{len(out)}"] = _entry
     # 3) #285 A3 (R1 фазового ревью, CodexH+субагент): НЕПАРНЫЕ ToolMessage — на resume-ходе
     # AIMessage с вызовом остался ДО паузы (вне дельты, #269), но исполнение (например

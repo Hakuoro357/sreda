@@ -313,3 +313,24 @@ def test_v2_read_request_gate_376():
     assert not ok("мой список кино очень длинный")   # утверждение — нет read-маркера
     assert not ok("не показывай мой список кино")    # отрицание
     assert not ok("список кино длинноват")           # нет маркера
+
+
+def test_v2r2_declarative_not_read_376():
+    """v2-R2 (terra MAJOR): «я посмотрел список кино» — декларатив (ход отметки), НЕ read-запрос."""
+    from sreda.runtime.react_loop import _re376_read_marker
+    assert not _re376_read_marker.search("я посмотрел список кино")
+    assert _re376_read_marker.search("что у меня в списке кино")  # главный кейс жив
+
+
+def test_v2r2_pre_exec_in_trace_376():
+    """v2-R2 (terra MAJOR): pre_exec из artifact доезжает до tool_calls_json."""
+    from langchain_core.messages import AIMessage, ToolMessage
+    from sreda.runtime.react_trace_persist import collect_tool_calls
+    cid = "pre376_test"
+    msgs = [AIMessage(content="", tool_calls=[{"name": "show_checklist",
+                                               "args": {"list_id_or_title": "x"},
+                                               "id": cid, "type": "tool_call"}]),
+            ToolMessage(content="# X", name="show_checklist", tool_call_id=cid,
+                        artifact={"result_kind": "ok", "pre_exec": True})]
+    entries = collect_tool_calls(msgs, tenant_id="t")
+    assert any(e.get("pre_exec") for e in entries), "pre_exec потерян в трейсе"
