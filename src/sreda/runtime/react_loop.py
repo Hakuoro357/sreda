@@ -2213,9 +2213,7 @@ def _glue376_tail_to_last_human(msgs: list, tt: str) -> list:
     for _hi in range(len(msgs) - 1, -1, -1):
         if isinstance(msgs[_hi], HumanMessage):
             return [*msgs[:_hi],
-                    HumanMessage(content=f"{msgs[_hi].content}
-
-{tt}"),
+                    HumanMessage(content=f"{msgs[_hi].content}\n\n{tt}"),
                     *msgs[_hi + 1:]]
     return [*msgs, HumanMessage(content=tt)]
 
@@ -3439,14 +3437,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                         # же блоке (контракт #298 сохранён: время идёт с директивой).
                         _tt = (f"{time_tail_line}\n\n{_directive}"
                                if time_tail_line else _directive)
-                        for _hi in range(len(_msgs) - 1, -1, -1):
-                            if isinstance(_msgs[_hi], HumanMessage):
-                                _msgs = [*_msgs[:_hi],
-                                         HumanMessage(content=f"{_msgs[_hi].content}\n\n{_tt}"),
-                                         *_msgs[_hi + 1:]]
-                                break
-                        else:  # Human не найден (не должно случаться) — прежнее поведение
-                            _msgs = [*_msgs, HumanMessage(content=_tt)]
+                        _msgs = _glue376_tail_to_last_human(_msgs, _tt)
                     else:
                         # #356 R1 субагент CRITICAL: директива отдельным trailing-user
                         # (хвост = assistant/tool: guard-нудж после refusal ИЛИ форс
