@@ -2119,6 +2119,57 @@ def _unified_execute_for(tenant_id: str) -> bool:
     return bool(s.react_unified_path_enabled) and (tenant_id in s.react_unified_tenants)
 
 
+def _domain_clf_disambig_for(tenant_id: str) -> bool:
+    """#376: every-turn дизамбигуация доменов умным классификатором для этого тенанта.
+    Флаг + канареечный список (паттерн #285/#221). OFF / не в списке → байт-в-байт текущее
+    (classify только по #352-континуации)."""
+    from sreda.config.settings import get_settings
+    s = get_settings()
+    return bool(s.domain_clf_disambig_enabled) and (tenant_id in s.domain_clf_disambig_tenants)
+
+
+# #376: in-process dedup diff-нотификаций владельцу — ОДИНАКОВОЕ расхождение (тот же кортеж
+# доменов/вида) повторно в течение TTL не шлём; РАЗНЫЕ проходят все («вся разница» соблюдена).
+# Лёгкий dict, НЕ durable: канал best-effort по решению владельца 2026-07-15 («не строить
+# инфраструктуру») — потеря калибровочного сообщения не критична.
+_DIS376_SEEN: dict[tuple, float] = {}
+_DIS376_TTL_S = 3600.0
+
+
+async def _dis376_send_alert(text: str) -> None:
+    """#376: доставка diff-алерта; исключения глотаются — нотификация НИКОГДА не роняет ход."""
+    try:
+        from sreda.services.admin_alerts import alert_admin_async
+        await alert_admin_async(text)
+    except Exception:  # noqa: BLE001 — best-effort канал
+        logger.warning("react_loop: #376 divergence alert send failed")
+
+
+def _notify_domain_divergence(tenant_id: str, dis: dict) -> None:
+    """#376: разница статик-vs-Фредди → владельцу (ops-канал). Fire-and-forget
+    (create_task, ход НЕ ждёт и НЕ падает). Payload БЕЗ ПД: только имена доменов,
+    вид расхождения, применено ли (текст пользователя НЕ включается — полный контекст
+    доступен по трейсу turn_key, origin_user_text там зашифрован)."""
+    try:
+        key = (tenant_id, tuple(dis.get("static_domains") or ()),
+               tuple(dis.get("freddie_domains") or ()), dis.get("kind"))
+        now = _time.monotonic()
+        for _k, _ts in list(_DIS376_SEEN.items()):  # протухшее — вон (дешёвая уборка)
+            if now - _ts > _DIS376_TTL_S:
+                _DIS376_SEEN.pop(_k, None)
+        if key in _DIS376_SEEN:
+            return
+        _DIS376_SEEN[key] = now
+        text = ("#376 расхождение доменов: статик="
+                + (",".join(dis.get("static_domains") or []) or "-")
+                + " | классификатор=" + (",".join(dis.get("freddie_domains") or []) or "-")
+                + f" | вид={dis.get('kind')} | применено={'да' if dis.get('applied') else 'нет'}"
+                + f" | tenant={tenant_id}")
+        asyncio.create_task(_dis376_send_alert(text))
+    except Exception:  # noqa: BLE001 — нотификация никогда не роняет ход
+        logger.warning("react_loop: #376 divergence notify skipped")
+
+
 def _tail_directives_enabled() -> bool:
     """#247: динамические директивы (section-hint #215 + guard-нудж) — в ХВОСТ, а не в системный промпт.
     OFF (дефолт) → легаси (дописываем в sp). ON → системный промпт стабилен (кеш-префикс цел)."""
@@ -4782,6 +4833,47 @@ async def handle_turn(
                         user_text, _route285,
                         sticky_memory_write=_sticky285,
                         prev_open_domains=_pod)
+                    # #376: every-turn дизамбигуация неоднозначной read-кюс-группы умным
+                    # классификатором (спецификация владельца 2026-07-15: звать на каждом свежем
+                    # ходе, вся разница — владельцу, классификатор = правда ДЛЯ ДИЗАМБИГУАЦИИ).
+                    # БЕЗ prev_turn (правда ТЕКУЩЕГО хода; prev_turn — смещение к прошлому разделу,
+                    # это юрисдикция #352-континуации ниже). subtract-only внутри
+                    # compute_unified_policy (ядро #376): add-вердикт (домен вне поднятых, возможная
+                    # инъекция из истории) НЕ применяется — только нотификация владельцу; write не
+                    # трогается (кандидат+confirm, ярус б); compound/cross пропускаются целиком.
+                    # fail-open: сбой/таймаут/low → базовая политика. Канарейка
+                    # _domain_clf_disambig_for; OFF → ветки нет (байт-в-байт).
+                    _dis376: dict = {"ran": False}
+                    if _domain_clf_disambig_for(tenant_id):
+                        try:
+                            _t0376 = _time.monotonic()
+                            _cls376 = await _cd352(_recent, user_text, llm)  # БЕЗ prev_turn
+                            _upol376 = compute_unified_policy(
+                                user_text, _route285,
+                                sticky_memory_write=_sticky285,
+                                prev_open_domains=_pod,
+                                disambiguator=_cls376)
+                            _kind376 = _upol376["signals"].get("disambig_kind")
+                            _changed376 = (_upol376["allowed_read"] != _upol["allowed_read"])
+                            _dis376 = {"ran": True,
+                                       "duration_ms": int((_time.monotonic() - _t0376) * 1000),
+                                       "confidence": _cls376.confidence,
+                                       "freddie_domains": sorted(_cls376.domains),
+                                       "static_domains": sorted(
+                                           set(_route285.all_domains)
+                                           | set(_upol["signals"]["read_cues"])),
+                                       "kind": _kind376,
+                                       "applied": bool(_kind376 == "subtract" and _changed376)}
+                            if _kind376 == "subtract":
+                                _upol = _upol376  # вердикт применён (вычтены лишние члены группы)
+                            # вся разница — владельцу: применённое вычитание ИЛИ неприменённый add
+                            if _kind376 == "add" or (_kind376 == "subtract" and _changed376):
+                                _notify_domain_divergence(tenant_id, _dis376)
+                        except Exception as _e376:  # noqa: BLE001 — дизамбигуация не роняет ход
+                            _dis376 = {"ran": True, "error": True}
+                            logger.warning(
+                                "react_loop: #376 disambig failed type=%s at=%s → base policy",
+                                _safe_tn(_e376), _safe_tb(_e376))
                     # #352: LLM-фолбэк домена — ПОСЛЕДНИЙ слой, только когда ВСЕ код-слои молчат:
                     # route ничего не увидел (R1 sol: route-домен без кюса — осознанное НЕоткрытие
                     # own-data, мина #285, не молчание), кюсы/sticky/слот-наследование дали пустую
@@ -4826,7 +4918,9 @@ async def handle_turn(
                     _init["active_families"] = sorted(set(_uar) & set(_LAZY_FAMILIES))
                     _init["router_decision_json"] = json.dumps(
                         {"mode": "unified-execute", "allowed_read": _uar, "allowed_write": _uaw,
-                         "signals": _upol["signals"], "llm_fallback": _lf352}, ensure_ascii=False)
+                         "signals": _upol["signals"], "llm_fallback": _lf352,
+                         "disambig": _dis376},  # #376: статик/классификатор/вид/применено (без ПД)
+                        ensure_ascii=False)
                 except Exception:  # noqa: BLE001 — единый путь не роняет ход → ПОЛНЫЙ fail-open
                     # #352 R1 sol/terra: легаси-блок выше на unified-тенанте больше не зовёт LLM-фолбэк
                     # → его решение для routeless-хода = deny (ложные отказы класса #352). Поэтому сбой

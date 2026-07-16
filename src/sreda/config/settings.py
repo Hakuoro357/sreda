@@ -699,6 +699,17 @@ class Settings(BaseSettings):
     react_unified_tenants_raw: str | None = Field(
         default=None, validation_alias="SREDA_REACT_UNIFIED_TENANTS"
     )
+    # #376: subtract-дизамбигуация неоднозначной read-кюс-группы умным классификатором
+    # (classify_domains на КАЖДОМ свежем task-ходе, спецификация владельца 2026-07-15).
+    # Флаг OFF (дефолт) → байт-в-байт текущее (classify только по #352-континуации);
+    # ON + тенант в списке → every-turn вызов + subtract + diff-нотификация владельцу;
+    # ``*`` → все. Канарейка: сперва тенант владельца.
+    domain_clf_disambig_enabled: bool = Field(
+        default=False, validation_alias="SREDA_DOMAIN_CLF_DISAMBIG"
+    )
+    domain_clf_disambig_tenants_raw: str | None = Field(
+        default=None, validation_alias="SREDA_DOMAIN_CLF_DISAMBIG_TENANTS"
+    )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
     # rollout, not "internal/PD-safe"; planner-enabling an external tenant must
@@ -1311,6 +1322,13 @@ class Settings(BaseSettings):
         Пусто (дефолт) → НИКОМУ execute (флаг ON = глобальный SHADOW); ``*`` → ВСЕ (Фаза F).
         В Фазе A ветки execute не существует — список задел на B."""
         return _parse_tenant_gate(self.react_unified_tenants_raw)
+
+    @property
+    def domain_clf_disambig_tenants(self) -> frozenset[str]:
+        """#376: тенанты every-turn дизамбигуации доменов (при включённом
+        domain_clf_disambig_enabled). Пусто (дефолт) → никому; ``*`` → все.
+        Канарейка: сперва тенант владельца."""
+        return _parse_tenant_gate(self.domain_clf_disambig_tenants_raw)
 
     @property
     def admin_alert_preview_tenants(self) -> frozenset[str]:
