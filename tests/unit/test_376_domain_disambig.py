@@ -265,3 +265,82 @@ def test_one_clause_guard_l2r2_376():
     assert not g("список кино и покупки")
     assert not g("кино но покажи всё")
     assert not g("покажи список кино\nкакие ещё есть")  # L2-R3 sol: \n = граница клауз
+
+
+# ─────────────────── слой-2 v2: предысполненное чтение (по решению владельца 2026-07-16) ───────────────────
+
+
+def test_prebuilt_read_pair_valid_376():
+    """v2: хелпер строит валидную пару «вызов+результат» — AIMessage.tool_calls[show_checklist]
+    и ToolMessage с ТЕМ ЖЕ tool_call_id и результатом реального вызова инструмента."""
+    from langchain_core.messages import AIMessage, ToolMessage
+    from langchain_core.tools import StructuredTool
+    from sreda.runtime.react_loop import _prebuilt_checklist_read
+
+    def _show(list_id_or_title: str) -> str:
+        return f"# Кино к просмотру ({list_id_or_title})\n[i1] X Скорпион"
+    tools = [StructuredTool.from_function(name="show_checklist", func=_show, description="t")]
+    pair = _prebuilt_checklist_read(tools, "checklist_abc")
+    assert pair is not None
+    ai, tm = pair
+    assert isinstance(ai, AIMessage) and isinstance(tm, ToolMessage)
+    assert ai.tool_calls and ai.tool_calls[0]["name"] == "show_checklist"
+    assert ai.tool_calls[0]["id"] == tm.tool_call_id, "инвариант пары: id вызова = id результата"
+    assert "Скорпион" in str(tm.content), "результат — от реального вызова инструмента"
+
+
+def test_prebuilt_read_fail_open_376():
+    """v2: нет show_checklist в наборе / инструмент упал → None (fail-open, без пары)."""
+    from langchain_core.tools import StructuredTool
+    from sreda.runtime.react_loop import _prebuilt_checklist_read
+    assert _prebuilt_checklist_read([], "x") is None
+
+    def _boom(list_id_or_title: str) -> str:
+        raise RuntimeError("db down")
+    tools = [StructuredTool.from_function(name="show_checklist", func=_boom, description="t")]
+    assert _prebuilt_checklist_read(tools, "x") is None
+
+
+def test_v2_read_request_gate_376():
+    """v2-R1 (sol MAJOR): pre-exec только на ЯВНЫЙ read-запрос без отрицания —
+    утверждение/отрицание/меташум не читают список невпопад."""
+    from sreda.runtime.react_loop import _re376_read_marker, _re376_negation
+    def ok(t):
+        tl = t.lower()
+        return bool(_re376_read_marker.search(tl)) and not _re376_negation.search(tl)
+    assert ok("Что у меня в списке кино")            # главный кейс
+    assert ok("покажи список кино")
+    assert not ok("мой список кино очень длинный")   # утверждение — нет read-маркера
+    assert not ok("не показывай мой список кино")    # отрицание
+    assert not ok("список кино длинноват")           # нет маркера
+
+
+def test_v2r2_declarative_not_read_376():
+    """v2-R2 (terra MAJOR): «я посмотрел список кино» — декларатив (ход отметки), НЕ read-запрос."""
+    from sreda.runtime.react_loop import _re376_read_marker
+    assert not _re376_read_marker.search("я посмотрел список кино")
+    assert _re376_read_marker.search("что у меня в списке кино")  # главный кейс жив
+
+
+def test_v2r2_pre_exec_in_trace_376():
+    """v2-R2 (terra MAJOR): pre_exec из artifact доезжает до tool_calls_json."""
+    from langchain_core.messages import AIMessage, ToolMessage
+    from sreda.runtime.react_trace_persist import collect_tool_calls
+    cid = "pre376_test"
+    msgs = [AIMessage(content="", tool_calls=[{"name": "show_checklist",
+                                               "args": {"list_id_or_title": "x"},
+                                               "id": cid, "type": "tool_call"}]),
+            ToolMessage(content="# X", name="show_checklist", tool_call_id=cid,
+                        artifact={"result_kind": "ok", "pre_exec": True})]
+    entries = collect_tool_calls(msgs, tenant_id="t")
+    assert any(e.get("pre_exec") for e in entries), "pre_exec потерян в трейсе"
+
+
+def test_v2r2_infinitive_not_read_376():
+    """v2-R2 (sol MAJOR, тот же класс): инфинитивы/декларативы не read-запрос."""
+    from sreda.runtime.react_loop import _re376_read_marker
+    for t in ("я хотел показать список кино", "я посмотрю список кино",
+              "я посмотрел список кино"):
+        assert not _re376_read_marker.search(t), t
+    assert _re376_read_marker.search("покажи список кино")
+    assert _re376_read_marker.search("что у меня в списке кино")
