@@ -55,7 +55,24 @@ class _AddItems(BaseModel):
 
 @tool(args_schema=_AddItems)
 def add_checklist_items(name: str, items: list[str]) -> str:
-    """Добавить пункты в чек-лист (вложенная модель со ссылками в json-схеме)."""
+    """Добавить пункты в чек-лист (плоские типы, ссылок в схеме не порождают)."""
+    return "ok"
+
+
+class _ItemPatch(BaseModel):
+    title: str = Field(description="новый текст пункта")
+    note: str | None = Field(default=None, description="заметка")
+
+
+class _UpdateItem(BaseModel):
+    name: str = Field(description="имя списка")
+    patch: _ItemPatch = Field(description="правка пункта")
+
+
+@tool(args_schema=_UpdateItem)
+def update_checklist_item(name: str, patch: dict) -> str:
+    """Правка пункта (реально вложенная модель: сырая json-схема несёт ссылки —
+    фикстура анти-вакуумного теста инлайна, Opus Ф1 MINOR#1)."""
     return "ok"
 
 
@@ -96,7 +113,8 @@ def totally_unknown_tool(x: str) -> str:
 
 
 def _bound() -> list:
-    return [create_checklist, show_checklist, add_checklist_items, web_search, get_weather,
+    return [create_checklist, show_checklist, add_checklist_items, update_checklist_item,
+            web_search, get_weather,
             schedule_reminder, link_task, ask_human, totally_unknown_tool]
 
 
@@ -116,7 +134,7 @@ def _act_reply(action: str, args: dict, situation: str = "Пользовател
 def test_sgr_tools_slice_domains_and_meta():
     names = [t.name for t in _slice()]
     assert names == ["create_checklist", "show_checklist", "add_checklist_items",
-                     "web_search", "get_weather"]
+                     "update_checklist_item", "web_search", "get_weather"]
 
 
 def test_sgr_tools_canonicalizes_alias_without_error():
@@ -141,6 +159,25 @@ def test_wire_schema_flat_no_ref_and_exact_coverage():
     # описания веток = описания bound-объектов (R1: не терять прод-описания)
     for b, t in zip(branches, st):
         assert b["description"] == t.description
+
+
+def test_strict_normalize_inlines_real_refs():
+    # Opus Ф1 MINOR#1 (анти-вакуум, класс #74/g-042): боевое «нет $ref» держалось на
+    # преинлайне LangChain — сам _inline_defs не был упражнён. Сырая model_json_schema
+    # вложенной модели РЕАЛЬНО несёт $defs/$ref (проверено запуском) — нормализатор обязан
+    # инлайнить сам. Отключение _inline_defs (identity) валит этот тест.
+    from sreda.runtime.react_sgr import _strict_normalize
+    raw = _UpdateItem.model_json_schema()
+    assert "$ref" in json.dumps(raw)  # предусловие: тест не вакуумный
+    norm = _strict_normalize(raw)
+    dumped = json.dumps(norm)
+    assert "$ref" not in dumped and "$defs" not in dumped
+    patch = norm["properties"]["patch"]
+    assert patch["properties"]["title"]["type"] == "string"  # структура реально инлайнена
+    assert patch["additionalProperties"] is False
+    # optional вложенного уровня → nullable (рекурсия дошла)
+    note = patch["properties"]["note"]
+    assert any(isinstance(x, dict) and x.get("type") == "null" for x in note["anyOf"])
 
 
 def test_wire_schema_long_description_not_truncated():
@@ -209,6 +246,17 @@ def test_parse_rejects_int_for_bool_literal(payload, code):
     with pytest.raises(SgrInvalidReply) as ei:
         parse_sgr_reply(json.dumps(payload, ensure_ascii=False), None, _slice())
     assert code in str(ei.value)
+
+
+def test_parse_envelope_with_non_bool_literal_rejected():
+    # Opus Ф1 MINOR#2: комбинация envelope + не-bool литерал — тип-гейт срабатывает
+    # ПОСЛЕ нормализации конверта (int 0 не проскакивает через вложенную форму Осы)
+    raw = json.dumps({"situation": "s",
+                      "step": {"kind": "clarify", "enough_data": 0, "question": "Какой список?"}},
+                     ensure_ascii=False)
+    with pytest.raises(SgrInvalidReply) as ei:
+        parse_sgr_reply(raw, None, _slice())
+    assert "enough_data_not_bool" in str(ei.value)
 
 
 def test_parse_title_object_coercion_parity_with_dispatch():
@@ -295,6 +343,12 @@ def test_parse_clarify_and_finish():
 
 @pytest.mark.parametrize("raw, reason", [
     ("не json", "json_error"),
+    # Opus Ф1 MINOR#2: JSON-валидные НЕ-объекты — fail-closed top_type
+    ("[]", "top_type"),
+    ("123", "top_type"),
+    ('"строка"', "top_type"),
+    ("null", "top_type"),
+    ("true", "top_type"),
     (json.dumps({"kind": "act", "situation": "s", "enough_data": False,
                  "tool": {"action": "create_checklist", "args": {"title": "x"}}}),
      "branch"),  # act при enough_data=false — связка нарушена (приёмка п.4, код-бекстоп)
