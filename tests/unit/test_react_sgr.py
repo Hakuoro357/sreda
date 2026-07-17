@@ -66,6 +66,12 @@ def web_search(query: str) -> str:
 
 
 @tool
+def get_weather(location: str, day_offset: int = 0) -> str:
+    """Погода (int-параметр для strict-теста коэрции)."""
+    return "ok"
+
+
+@tool
 def schedule_reminder(title: str) -> str:
     """Напоминание (домен reminders — ВНЕ среза)."""
     return "ok"
@@ -90,7 +96,7 @@ def totally_unknown_tool(x: str) -> str:
 
 
 def _bound() -> list:
-    return [create_checklist, show_checklist, add_checklist_items, web_search,
+    return [create_checklist, show_checklist, add_checklist_items, web_search, get_weather,
             schedule_reminder, link_task, ask_human, totally_unknown_tool]
 
 
@@ -109,7 +115,8 @@ def _act_reply(action: str, args: dict, situation: str = "Пользовател
 
 def test_sgr_tools_slice_domains_and_meta():
     names = [t.name for t in _slice()]
-    assert names == ["create_checklist", "show_checklist", "add_checklist_items", "web_search"]
+    assert names == ["create_checklist", "show_checklist", "add_checklist_items",
+                     "web_search", "get_weather"]
 
 
 def test_sgr_tools_canonicalizes_alias_without_error():
@@ -178,6 +185,28 @@ def test_wire_shape_and_history_mode_fixed_by_f0():
     assert WIRE_SHAPE_BY_PROVIDER["inception-mercury2"] == "flat"
     assert WIRE_SHAPE_BY_PROVIDER["groq-gpt-oss-120b"] == "envelope"
     assert STRUCTURED_HISTORY_MODE == "plain"
+
+
+def test_wire_schema_min_lengths_mirror_parser():
+    # CR R2 sol MAJOR: schema-валидный ответ обязан проходить парсер — пустые строки
+    # запрещены УЖЕ схемой (minLength=1 зеркалит pydantic min_length=1)
+    act, clarify, finish = build_wire_schema(_slice(), "flat")["anyOf"]
+    for branch in (act, clarify, finish):
+        assert branch["properties"]["situation"]["minLength"] == 1
+    assert clarify["properties"]["question"]["minLength"] == 1
+    assert finish["properties"]["reply"]["minLength"] == 1
+
+
+def test_parse_rejects_numeric_string_coercion():
+    # CR R2 terra MAJOR: строгая валидация без коэрции — "1" вместо int не проходит
+    # (иначе сырое "1" уехало бы в run_tools при schema-невалидном типе)
+    with pytest.raises(SgrInvalidReply) as ei:
+        parse_sgr_reply(_act_reply("get_weather", {"location": "Москва", "day_offset": "1"}),
+                        None, _slice())
+    assert "args_invalid" in str(ei.value)
+    d = parse_sgr_reply(_act_reply("get_weather", {"location": "Москва", "day_offset": 1}),
+                        None, _slice())
+    assert d.args == {"location": "Москва", "day_offset": 1}
 
 
 # ─────────────────────────── парс ───────────────────────────
@@ -302,7 +331,7 @@ def test_decision_to_aimessage_finish_plain_text():
 def test_sgr_trace_no_free_text():
     d = parse_sgr_reply(_act_reply("create_checklist", {"title": "Секретный список"},
                                    situation="Пользователь хочет секретный список."), None, _slice())
-    fields = decision_trace_fields(d)
+    fields = decision_trace_fields(d, tenant_id="tenant-a")
     assert set(fields) <= {"kind", "action", "enough_data", "task_completed",
                            "situation_len", "args_hash"}
     dumped = json.dumps(fields, ensure_ascii=False)
@@ -311,11 +340,41 @@ def test_sgr_trace_no_free_text():
     assert isinstance(fields["args_hash"], str) and len(fields["args_hash"]) >= 8
 
 
+def test_sgr_trace_args_hash_is_keyed_hmac_not_plain_sha():
+    # CR R2 sol MAJOR: низкоэнтропийные args («молоко») нельзя перебирать словарём —
+    # keyed HMAC трейса #192 (v1:key_id:digest), НЕ голый sha; tenant-separation
+    import hashlib as _hl
+    d = parse_sgr_reply(_act_reply("add_checklist_items",
+                                   {"name": "продукты", "items": ["молоко"]}), None, _slice())
+    h_a = decision_trace_fields(d, tenant_id="tenant-a")["args_hash"]
+    assert h_a.startswith("v1:")
+    plain = _hl.sha256(json.dumps(d.args, sort_keys=True, ensure_ascii=False,
+                                  separators=(",", ":")).encode("utf-8")).hexdigest()
+    assert plain not in h_a
+    assert _hl.sha1(json.dumps(d.args, sort_keys=True,
+                               ensure_ascii=False).encode("utf-8")).hexdigest()[:16] not in h_a
+    h_b = decision_trace_fields(d, tenant_id="tenant-b")["args_hash"]
+    assert h_a != h_b  # tenant-separation против кросс-тенантной корреляции
+    assert h_a == decision_trace_fields(d, tenant_id="tenant-a")["args_hash"]  # детерминизм
+
+
+def test_sgr_trace_hash_fail_safe_without_key(monkeypatch):
+    # нет ключа шифрования → args_hash=None (сводка не роняет ход и не течёт сырьём)
+    from sreda.services import trace_hash as th
+    monkeypatch.setattr(th, "_derive_key",
+                        lambda: (_ for _ in ()).throw(ValueError("no key")))
+    d = parse_sgr_reply(_act_reply("create_checklist", {"title": "x"}), None, _slice())
+    fields = decision_trace_fields(d, tenant_id="t")
+    assert fields["args_hash"] is None
+    assert "x" not in json.dumps({k: v for k, v in fields.items() if k != "kind"})
+
+
 def test_sgr_trace_clarify_question_not_leaked():
     d = parse_sgr_reply(json.dumps({"kind": "clarify", "situation": "s", "enough_data": False,
                                     "question": "Приватный вопрос?"}, ensure_ascii=False),
                         None, _slice())
-    assert "Приватный" not in json.dumps(decision_trace_fields(d), ensure_ascii=False)
+    assert "Приватный" not in json.dumps(decision_trace_fields(d, tenant_id="t"),
+                                         ensure_ascii=False)
 
 
 def test_sgr_system_block_is_stable_russian_text():

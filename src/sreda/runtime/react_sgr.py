@@ -21,7 +21,6 @@ SGR-гейта) — алиасы имён и наборы передаются �
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import uuid
 from dataclasses import dataclass
@@ -162,7 +161,9 @@ def _tool_branches(sgr_tools: list) -> list[dict]:
     return branches
 
 
-_SITUATION = {"type": "string", "maxLength": 400}
+# minLength зеркалит pydantic-парсер (CR R2 sol MAJOR: schema-валидный пустой текст
+# не должен отклоняться парсером — контракт схема⇔парсер точный)
+_SITUATION = {"type": "string", "minLength": 1, "maxLength": 400}
 
 
 def build_wire_schema(sgr_tools: list, shape: str) -> dict:
@@ -185,7 +186,7 @@ def build_wire_schema(sgr_tools: list, shape: str) -> dict:
              "kind": {"const": "clarify"},
              "situation": _SITUATION,
              "enough_data": {"const": False},
-             "question": {"type": "string", "maxLength": 300},
+             "question": {"type": "string", "minLength": 1, "maxLength": 300},
          }},
         {"type": "object", "additionalProperties": False,
          "required": ["kind", "situation", "task_completed", "reply"],
@@ -193,7 +194,7 @@ def build_wire_schema(sgr_tools: list, shape: str) -> dict:
              "kind": {"const": "finish"},
              "situation": _SITUATION,
              "task_completed": {"const": True},
-             "reply": {"type": "string"},
+             "reply": {"type": "string", "minLength": 1},
          }},
     ]}
     if shape == "flat":
@@ -303,7 +304,9 @@ def parse_sgr_reply(content: str, tool_calls: Any, sgr_tools: list) -> SgrDecisi
             extra = set(args) - allowed
             if extra:
                 raise SgrInvalidReply(f"args_invalid:extra_keys:{sorted(extra)}")
-            t.args_schema.model_validate(args)
+            # strict=True (CR R2 terra MAJOR): без коэрции «"1"» → int — иначе schema-
+            # невалидные типы проходили бы парс, а в run_tools уезжали СЫРЫМИ.
+            t.args_schema.model_validate(args, strict=True)
         except SgrInvalidReply:
             raise
         except Exception as e:  # noqa: BLE001 — pydantic/args любого вида
@@ -335,14 +338,22 @@ def decision_to_aimessage(d: SgrDecision) -> AIMessage:
     return AIMessage(content=d.reply or "")
 
 
-def decision_trace_fields(d: SgrDecision) -> dict:
+def decision_trace_fields(d: SgrDecision, *, tenant_id: str) -> dict:
     """PII-free сводка для поля ``sgr`` в llm_calls (приёмка п.10, g-075/g-039): только
     enum/bool/числа/hash — НИКАКОГО свободного текста (situation/question/reply/args не
     попадают; admin/trace_parser рендерит llm_calls-поля как безопасные). Детекция петель
-    #267 — по повтору (kind, action, args_hash) между проходами."""
-    args_hash = hashlib.sha1(
-        json.dumps(d.args or {}, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()[:16]
+    #267 — по повтору (kind, action, args_hash) между проходами.
+
+    args_hash — существующий keyed HMAC трейса (services.trace_hash.args_hmac, #192), НЕ
+    голый sha (CR R2 sol MAJOR: низкоэнтропийные args — «молоко», имена списков —
+    перебираются словарём; HMAC-инвариант проекта). Сбой хэширования (нет ключа) —
+    fail-safe ``None``: сводка не должна ронять ход."""
+    try:
+        from sreda.services.trace_hash import args_hmac
+        args_hash: str | None = args_hmac(
+            tenant_id=tenant_id, tool_name=d.action or f"sgr:{d.kind}", args=d.args or {})
+    except Exception:  # noqa: BLE001 — трейс best-effort, без сырья наружу
+        args_hash = None
     return {
         "kind": d.kind,
         "action": d.action,
