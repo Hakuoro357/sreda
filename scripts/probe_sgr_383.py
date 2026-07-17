@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import sys
 import time
@@ -25,171 +24,17 @@ import uuid
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-SGR_DOMAINS = frozenset({"checklists", "web"})
-SGR_EXCLUDED_META = frozenset({"ask_human", "need_family", "delete_my_account"})
-
-
-# ─────────────────────────── sgr_tools: доменный срез реального набора ───────────────────────────
-
-def compute_sgr_tools(tools: list) -> list:
-    """Срез §3 плана: канонизация имени → read∪write домены ⊆ {checklists, web}; мета вне;
-    неизвестное имя — fail-closed (исключается)."""
-    from sreda.runtime.react_loop import _TOOL_NAME_ALIASES
-    from sreda.services.tool_schemas.families import (
-        TOOL_OP_CLASS, tool_read_domains, tool_write_domains,
-    )
-    out = []
-    for t in tools:
-        if t.name in SGR_EXCLUDED_META:
-            continue
-        canon = _TOOL_NAME_ALIASES.get(t.name, t.name)
-        if canon not in TOOL_OP_CLASS:
-            continue  # fail-closed: метаданные не знают инструмент
-        doms = set(tool_read_domains(canon)) | set(tool_write_domains(canon))
-        if doms and doms <= SGR_DOMAINS:
-            out.append(t)
-    return out
-
-
-# ─────────────────────────── strict-нормализатор JSON-схемы аргументов ───────────────────────────
-
-def _inline_defs(node, defs):
-    if isinstance(node, dict):
-        if "$ref" in node:
-            ref = node["$ref"]
-            name = ref.split("/")[-1]
-            target = copy.deepcopy(defs.get(name, {}))
-            merged = {k: v for k, v in node.items() if k != "$ref"}
-            target.update(merged)
-            return _inline_defs(target, defs)
-        return {k: _inline_defs(v, defs) for k, v in node.items() if k not in ("$defs", "definitions")}
-    if isinstance(node, list):
-        return [_inline_defs(x, defs) for x in node]
-    return node
-
-
-def strict_normalize(schema: dict) -> dict:
-    """Рекурсивно: инлайн $defs; additionalProperties:false; ВСЕ properties → required,
-    optional (не были в required) → nullable (anyOf [тип, null])."""
-    defs = {**schema.get("$defs", {}), **schema.get("definitions", {})}
-    node = _inline_defs(copy.deepcopy(schema), defs)
-
-    def walk(n):
-        if isinstance(n, list):
-            return [walk(x) for x in n]
-        if not isinstance(n, dict):
-            return n
-        n = {k: walk(v) for k, v in n.items()}
-        if n.get("type") == "object" and "properties" in n:
-            n["additionalProperties"] = False
-            prev_req = set(n.get("required", []))
-            props = n["properties"]
-            for pname, pschema in list(props.items()):
-                if pname not in prev_req:
-                    if not (isinstance(pschema, dict) and isinstance(pschema.get("anyOf"), list)
-                            and any(b.get("type") == "null" for b in pschema["anyOf"]
-                                    if isinstance(b, dict))):
-                        props[pname] = {"anyOf": [pschema, {"type": "null"}]}
-            if props:
-                n["required"] = sorted(props.keys())
-            else:
-                # Groq-валидатор: 'required' при пустых properties -> 400
-                # ("'required' present but 'properties' is missing"); пустой
-                # объект оставляем без required (семантически идентично).
-                n.pop("required", None)
-        return n
-
-    return walk(node)
-
-
-def build_tool_branches(sgr_tools: list) -> list[dict]:
-    from langchain_core.utils.function_calling import convert_to_openai_tool
-    branches = []
-    for t in sgr_tools:
-        fn = convert_to_openai_tool(t)["function"]
-        params = strict_normalize(fn.get("parameters") or {"type": "object", "properties": {}})
-        if params.get("type") != "object":
-            params = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
-        branches.append({
-            "type": "object", "additionalProperties": False,
-            "description": (fn.get("description") or "")[:600],
-            "required": ["action", "args"],
-            "properties": {"action": {"const": fn["name"]}, "args": params},
-        })
-    return branches
+# Ядро (срез, схема, SGR-блок) — из боевого модуля: проба гоняет ТОТ ЖЕ код, что рантайм.
+from sreda.runtime.react_sgr import (  # noqa: E402
+    SGR_SYSTEM_BLOCK,
+    WIRE_SHAPE_BY_PROVIDER,
+    build_wire_schema,
+    compute_sgr_tools,
+)
 
 
 def build_anketa_schema(sgr_tools: list, shape: str = "flat") -> dict:
-    """Wire-схема анкеты — Ф0-поправка к §3 плана: форма ПЕР-ПРОВАЙДЕР (structured_wire_shape).
-
-    - "flat" (Mercury): ПЛОСКИЙ top-level anyOf трёх веток шага, situation ВНУТРИ каждой.
-      Причина: двухуровневый конверт {situation, step} Mercury в ~15% случаев ронял (отдавал
-      голый step; guided-режим, не constrained) — плоская форма повторяет доказанную #382.
-    - "envelope" (Оса/Groq): {situation, step:{anyOf...}} — Groq-валидатор ЗАПРЕЩАЕТ anyOf на
-      верхнем уровне (400: schema must have type 'object' ... at the top level), а конверт
-      держит идеально (constrained decoding, ни одного дропа в прогоне).
-
-    Семантика идентична; парсер нормализует обе формы в плоскую. Схемная связка
-    enough_data⇔kind сохранена per-branch в обеих формах."""
-    if shape == "envelope":
-        flat = build_anketa_schema(sgr_tools, "flat")
-        step_branches = []
-        for br in flat["anyOf"]:
-            b = copy.deepcopy(br)
-            b["properties"].pop("situation", None)
-            b["required"] = [k for k in b["required"] if k != "situation"]
-            step_branches.append(b)
-        return {
-            "type": "object", "additionalProperties": False,
-            "required": ["situation", "step"],
-            "properties": {
-                "situation": {"type": "string", "maxLength": 400},
-                "step": {"anyOf": step_branches},
-            },
-        }
-    return {"anyOf": [
-        {"type": "object", "additionalProperties": False,
-         "required": ["kind", "situation", "enough_data", "tool"],
-         "properties": {
-             "kind": {"const": "act"},
-             "situation": {"type": "string", "maxLength": 400},
-             "enough_data": {"const": True},
-             "tool": {"anyOf": build_tool_branches(sgr_tools)},
-         }},
-        {"type": "object", "additionalProperties": False,
-         "required": ["kind", "situation", "enough_data", "question"],
-         "properties": {
-             "kind": {"const": "clarify"},
-             "situation": {"type": "string", "maxLength": 400},
-             "enough_data": {"const": False},
-             "question": {"type": "string", "maxLength": 300},
-         }},
-        {"type": "object", "additionalProperties": False,
-         "required": ["kind", "situation", "task_completed", "reply"],
-         "properties": {
-             "kind": {"const": "finish"},
-             "situation": {"type": "string", "maxLength": 400},
-             "task_completed": {"const": True},
-             "reply": {"type": "string"},
-         }},
-    ]}
-
-
-SGR_SYSTEM_BLOCK = (
-    "Ты — Среда, семейная помощница. Сейчас ты работаешь с разделом «Списки дел» (чек-листы).\n"
-    "Отвечай ТОЛЬКО объектом по заданной схеме — анкетой шага:\n"
-    "- situation: 1-2 фразы — что просит пользователь и что уже сделано в этом ходе.\n"
-    "- step: РОВНО ОДНО из трёх:\n"
-    "  * act — данных достаточно: выбери ОДИН инструмент из списка и заполни его аргументы\n"
-    "    строго по их смыслу (описания инструментов — в схеме). Не выдумывай названия списков\n"
-    "    и пунктов, которых пользователь не называл.\n"
-    "  * clarify — данных НЕ хватает (не назван список, пункт или само действие неоднозначно):\n"
-    "    задай короткий человеческий вопрос. Никаких технических слов.\n"
-    "  * finish — задача пользователя уже выполнена (результат виден в истории) или ход чисто\n"
-    "    разговорный: дай финальный ответ пользователю. Не утверждай, что сделала действие,\n"
-    "    которого не было в истории.\n"
-    "Если в истории есть результат инструмента — опирайся на него, не перечитывай заново без нужды."
-)
+    return build_wire_schema(sgr_tools, shape)
 
 
 # ─────────────────────────── набор Ф0 (заморожен ДО прогона) ───────────────────────────
@@ -310,6 +155,11 @@ def matches_expected(parsed: dict, expected: tuple) -> bool:
 
 # ─────────────────────────── прогон ───────────────────────────
 
+def _slice(tools: list) -> list:
+    from sreda.runtime.react_loop import _TOOL_NAME_ALIASES
+    return compute_sgr_tools(tools, _TOOL_NAME_ALIASES)
+
+
 def _build_tools_no_db() -> list:
     """build_slice_tools(session=None) для схемной части: сборка зовёт EntitlementGate.check
     (SQL) — подменяем на щедрый grandfathered-результат (нужен только тир web_search-капа;
@@ -326,14 +176,11 @@ def _build_tools_no_db() -> list:
         _eg.EntitlementGate.check = _orig  # type: ignore[method-assign]
 
 
-WIRE_SHAPE_BY_PROVIDER = {"inception-mercury2": "flat", "groq-gpt-oss-120b": "envelope"}
-
-
 def run(provider: str, mode: str, timeout_s: float) -> int:
     from sreda.services.llm import get_chat_llm, invoke_with_per_call_timeout
 
     all_tools = _build_tools_no_db()
-    sgr_tools = compute_sgr_tools(all_tools)
+    sgr_tools = _slice(all_tools)
     shape = WIRE_SHAPE_BY_PROVIDER[provider]
     schema = build_anketa_schema(sgr_tools, shape)
     branch_names = [t.name for t in sgr_tools]
@@ -442,7 +289,7 @@ def main() -> int:
                     help="только собрать и напечатать схему (без вызовов)")
     args = ap.parse_args()
     if args.schema_only:
-        st = compute_sgr_tools(_build_tools_no_db())
+        st = _slice(_build_tools_no_db())
         schema = build_anketa_schema(st)
         print(json.dumps(schema, ensure_ascii=False, indent=1))
         print(f"-- веток инструментов: {len(st)}: {[t.name for t in st]}", file=sys.stderr)
