@@ -192,12 +192,16 @@ def test_sgr_off_no_import(install, monkeypatch):
     assert str(res)
 
 
-def test_sgr_inactive_on_non_checklist_turn(install):
-    # флаг+тенант ВКЛ, но ход не чеклистовый → SGR неактивен, легаси; причина в трейсе
+@pytest.mark.parametrize("text", [
+    "поставь напоминание на завтра в 9 утра",   # чужой домен
+    "покажи список кино и покупки",             # CR R1: явная shopping-группа рядом с чеклистовой
+])
+def test_sgr_inactive_on_non_checklist_turn(install, text):
+    # флаг+тенант ВКЛ, но ход не «чисто чеклистовый» → SGR неактивен, легаси; причина в трейсе
     st = install(sgr_flag=True, sgr_tenants="t-canary")
     sgr_binds, legacy_msgs = [], []
     llm = _SgrChat("m", sgr_binds=sgr_binds, legacy_msgs=legacy_msgs)
-    _turn(llm, thread="nonchk", text="поставь напоминание на завтра в 9 утра")
+    _turn(llm, thread=f"nonchk-{len(text)}", text=text)
     assert sgr_binds == [] and legacy_msgs
     sgr_fields = [c["sgr"] for c in _chat_calls(st["trace"]) if c.get("sgr")]
     assert sgr_fields and sgr_fields[0]["active"] is False
@@ -333,6 +337,12 @@ def test_sgr_fallback_shape_by_provider(install):
     fb_schema = fb_binds[0]["response_format"]["json_schema"]["schema"]
     assert "anyOf" in prim_schema and prim_schema.get("type") != "object"       # flat (Mercury)
     assert fb_schema.get("type") == "object" and "step" in fb_schema["properties"]  # envelope
+    # CR R1 sol MINOR: structured-фолбэк виден в общих trace-полях (не скрыт)
+    c0 = _chat_calls(st["trace"])[0]
+    assert c0["fallback_fired"] is True and c0["retries"] == 1
+    assert c0["selected_provider"] == "groq-gpt-oss-120b"
+    assert c0["primary_provider_key"] == "inception-mercury2"
+    assert c0["primary_error"] == "RuntimeError"
 
 
 # ─────────────── п.7: one-shot директивы → SGR неактивен (юнит гейт-хелпера) ───────────────
@@ -349,8 +359,19 @@ def test_sgr_inactive_on_one_shot_directives():
     assert f(**{**base, "allowed_read": frozenset({"checklists", "reminders"})}) == "domain_mix"
     assert f(**{**base, "allowed_read": frozenset({"web"})}) == "domain_mix"
     # shopping — допустимая read-попутчица неоднозначной кюс-группы «список» (Ф2-калибровка
-    # на живой политике: «покажи список дел» даёт {checklists, shopping, web})
-    assert f(**{**base, "allowed_read": frozenset({"checklists", "shopping", "web"})}) is None
+    # на живой политике: «покажи список дел» даёт {checklists, shopping, web}) — НО только
+    # при provenance попутчицы в ТЕКСТЕ (CR R1 sol+terra MAJOR)
+    ar_shop = frozenset({"checklists", "shopping", "web"})
+    assert f(**{**base, "allowed_read": ar_shop,
+                "user_text": "покажи список дел"}) is None
+    # явная shopping-группа рядом с чеклистовой — SGR не умеет покупки → легаси
+    assert f(**{**base, "allowed_read": ar_shop,
+                "user_text": "покажи список кино и покупки"}) == "domain_mix"
+    # route-домен shopping (явное «покупки») → легаси
+    assert f(**{**base, "allowed_read": ar_shop,
+                "user_text": "что в списке покупок"}) == "domain_mix"
+    # пустой текст при shopping в ar → fail-closed (companionship не доказана)
+    assert f(**{**base, "allowed_read": ar_shop, "user_text": ""}) == "domain_mix"
     # но ЗАПИСЬ вне чеклистов — не наш ход
     assert f(**{**base, "allowed_write": frozenset({"shopping"})}) == "domain_mix"
     assert f(**{**base, "allowed_write": frozenset({"checklists"})}) is None

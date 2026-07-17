@@ -2159,9 +2159,37 @@ _SGR_READ_DOMAINS_ALLOWED = frozenset({"checklists", "web", "shopping"})
 _SGR_WRITE_DOMAINS_ALLOWED = frozenset({"checklists"})
 
 
+def _sgr_shopping_is_companion(text: str) -> bool:
+    """#383 Ф2 (CR R1 sol+terra MAJOR): shopping в allowed_read допустим ТОЛЬКО как попутчица
+    неоднозначной кюс-группы «список» (группа несёт И checklists). Детерминированный provenance
+    по ТЕКСТУ хода: (а) route_domains НЕ дал shopping (явное «покупки/список покупок» → не наш
+    ход); (б) каждая read-кюс-группа с shopping содержит и checklists (самостоятельная
+    {shopping}-группа — «список кино И ПОКУПКИ» — явное требование, SGR его физически не
+    исполнит: в срезе нет shopping-инструментов). Любой сбой → False (fail-closed → легаси)."""
+    try:
+        from sreda.runtime.react_preflight import route_domains
+        from sreda.runtime.react_signals import read_cue_groups
+        if "shopping" in set(route_domains(text).all_domains):
+            return False  # явное «покупки/список покупок» в онтологии — не наш ход
+        checklist_evidence = False
+        for _grp in read_cue_groups(text):
+            g = set(_grp) - {"web"}
+            if "shopping" in g and "checklists" not in g:
+                return False  # квалифицированная shopping-группа = явное требование
+            if "checklists" in g:
+                checklist_evidence = True
+        # ПОЗИТИВНОЕ чеклист-доказательство обязательно: shopping в allowed_read при
+        # тексте БЕЗ единой checklists-группы (континуация, унаследованные/LLM-домены)
+        # → fail-closed. Квалифицированный «список дел» даёт чистую {checklists}-группу,
+        # неквалифицированный «покажи список» — смешанную {checklists, shopping}; обе ок.
+        return checklist_evidence
+    except Exception:  # noqa: BLE001 — provenance не определить → fail-closed
+        return False
+
+
 def _sgr_gate_reason(*, unified_execute: bool, allowed_read: Any, allowed_write: Any,
                      guard_nudge: str, stale_pause_note: str,
-                     provider_key: str) -> str | None:
+                     provider_key: str, user_text: str = "") -> str | None:
     """#383 §2B: детерминированное гейт-условие SGR-хода ДО любой тяжёлой работы.
     None = SGR может активироваться; иначе enum-причина неактивности (уходит в трейс
     ``sgr.inactive_reason`` — наблюдаемость сужений для Ф3). Чистая функция — приёмка п.7
@@ -2180,6 +2208,10 @@ def _sgr_gate_reason(*, unified_execute: bool, allowed_read: Any, allowed_write:
     if ("checklists" not in (ar | aw) or not aw <= _SGR_WRITE_DOMAINS_ALLOWED
             or not ar <= _SGR_READ_DOMAINS_ALLOWED):
         return "domain_mix"
+    # CR R1 sol+terra MAJOR: shopping в ar — только попутчица неоднозначной группы «список»;
+    # явная shopping-улика в тексте (route-домен / самостоятельная кюс-группа) → легаси.
+    if "shopping" in ar and not _sgr_shopping_is_companion(user_text):
+        return "domain_mix"
     from sreda.runtime.react_sgr import WIRE_SHAPE_BY_PROVIDER
     if provider_key not in WIRE_SHAPE_BY_PROVIDER:
         return "provider_unsupported"
@@ -2191,7 +2223,7 @@ def _sgr_structured_step(*, bound: list, allowed_read: Any, allowed_write: Any,
                          llm: Any, fallback_llm: Any, provider_key: str,
                          fallback_provider_key: str, fallback_model_name: str,
                          model_name: str, timeout_s: float, tenant_id: str,
-                         session: Any, run_id: str) -> dict:
+                         session: Any, run_id: str, user_text: str = "") -> dict:
     """#383 Ф2: SGR-попытка шага планировщика под ЕДИНОЙ fail-open границей (§5 плана:
     ЛЮБОЕ исключение ЛЮБОЙ точки — import/срез/схема/bind/invoke/parse/конверсия — возвращает
     resp=None → вызывающий идёт ЛЕГАСИ тем же проходом с нетронутым legacy-промптом).
@@ -2202,12 +2234,14 @@ def _sgr_structured_step(*, bound: list, allowed_read: Any, allowed_write: Any,
     штатным блоком. Wire-форма схемы — по ФАКТИЧЕСКИ вызываемому провайдеру
     (WIRE_SHAPE_BY_PROVIDER[...], в т.ч. на фолбэке — Opus Ф1 MINOR#3)."""
     out: dict = {"resp": None, "sgr": None, "latency_ms": 0,
-                 "provider": None, "model": None, "usage_recorded": False}
+                 "provider": None, "model": None, "usage_recorded": False,
+                 "fallback_fired": False, "primary_error": ""}
     stage = "slice_error"
     try:
         reason = _sgr_gate_reason(
             unified_execute=True, allowed_read=allowed_read, allowed_write=allowed_write,
-            guard_nudge=guard_nudge, stale_pause_note=stale_note, provider_key=provider_key)
+            guard_nudge=guard_nudge, stale_pause_note=stale_note, provider_key=provider_key,
+            user_text=user_text)
         if reason is not None:
             out["sgr"] = {"active": False, "inactive_reason": reason, "fallback_reason": None}
             return out
@@ -2235,12 +2269,15 @@ def _sgr_structured_step(*, bound: list, allowed_read: Any, allowed_write: Any,
             raw = invoke_with_per_call_timeout(
                 llm.bind(response_format=_rf), sgr_msgs,
                 timeout_seconds=timeout_s, provider=provider_key)
-        except Exception:  # noqa: BLE001 — сетевой сбой/таймаут primary → structured-Оса (§5)
+        except Exception as _pe:  # noqa: BLE001 — сетевой сбой/таймаут primary → structured-Оса (§5)
             fb_shape = _sgr.WIRE_SHAPE_BY_PROVIDER.get(fallback_provider_key or "")
             if fallback_llm is None or not fb_shape:
                 raise
             logger.warning("react_sgr: primary structured сбой → structured-фолбэк %s",
                            fallback_provider_key, exc_info=True)
+            # CR R1 sol MINOR: телеметрия попытки primary (PII-free: только тип ошибки) —
+            # llm_calls не должен скрывать сбой Mercury и повторную попытку.
+            out["fallback_fired"], out["primary_error"] = True, type(_pe).__name__
             _rf_fb = {"type": "json_schema",
                       "json_schema": {"name": "sgr_step", "strict": True,
                                       "schema": _sgr.build_wire_schema(sgr_tools, fb_shape)}}
@@ -3630,13 +3667,20 @@ def _build_graph(llm: Any, all_tools: list, *,
                     fallback_provider_key=_FALLBACK_PROVIDER_KEY,
                     fallback_model_name=_fallback_model_name, model_name=_model_name,
                     timeout_s=_react_timeout_s, tenant_id=tenant_id, session=session,
-                    run_id=state.get("turn_key") or "")
+                    run_id=state.get("turn_key") or "",
+                    user_text=_last_human_text(state["messages"]))
                 _sgr_field = _sgr_out["sgr"]
                 if _sgr_out["resp"] is not None:
                     resp = _sgr_out["resp"]
                     _latency_ms = _sgr_out["latency_ms"]
                     _used_provider, _used_model = _sgr_out["provider"], _sgr_out["model"]
                     _sgr_done, _sgr_usage_done = True, bool(_sgr_out["usage_recorded"])
+                    if _sgr_out["fallback_fired"]:
+                        # CR R1 sol MINOR: structured-фолбэк виден в общих trace-полях —
+                        # как легаси-фолбэк (#159/#184): попытка primary + фактический провайдер.
+                        _fallback_fired = True
+                        _primary_provider, _primary_model = provider_key, _model_name
+                        _primary_error = _sgr_out["primary_error"]
             # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
             #   (1) учёт пишем на ФАКТИЧЕСКИ отработавший provider_key/model — Оса при срабатывании
             #       запаса, не Mercury (иначе таблица «расход по провайдерам» врёт — R1 MAJOR);
