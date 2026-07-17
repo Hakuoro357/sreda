@@ -287,6 +287,12 @@ def parse_sgr_reply(content: str, tool_calls: Any, sgr_tools: list) -> SgrDecisi
         if "situation" in data["step"]:
             raise SgrInvalidReply("branch:envelope_inner_situation")
         data = {**data["step"], "situation": data["situation"]}
+    # CR R3 sol MAJOR (проверено запуском): pydantic Literal[True] принимает int 1 ДАЖЕ в
+    # strict (hash(1)==hash(True) в literal-лукапе) — а wire-схема требует const true.
+    # Явный тип-гейт на СЫРОМ dict: не-bool в булевых полях = невалид (fail-closed).
+    for _bkey in ("enough_data", "task_completed"):
+        if _bkey in data and not isinstance(data[_bkey], bool):
+            raise SgrInvalidReply(f"branch:{_bkey}_not_bool")
     try:
         step = _AnyStep(root=data).root
     except ValidationError as e:

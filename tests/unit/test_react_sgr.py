@@ -197,6 +197,36 @@ def test_wire_schema_min_lengths_mirror_parser():
     assert finish["properties"]["reply"]["minLength"] == 1
 
 
+@pytest.mark.parametrize("payload, code", [
+    ({"kind": "act", "situation": "s", "enough_data": 1,
+      "tool": {"action": "create_checklist", "args": {"title": "x"}}}, "enough_data_not_bool"),
+    ({"kind": "finish", "situation": "s", "task_completed": 1, "reply": "готово"},
+     "task_completed_not_bool"),
+])
+def test_parse_rejects_int_for_bool_literal(payload, code):
+    # CR R3 sol MAJOR: pydantic Literal[True] принимает 1 даже в strict (hash-коллизия) —
+    # явный тип-гейт обязан отвергать (wire-схема требует const true/false)
+    with pytest.raises(SgrInvalidReply) as ei:
+        parse_sgr_reply(json.dumps(payload, ensure_ascii=False), None, _slice())
+    assert code in str(ei.value)
+
+
+def test_parse_title_object_coercion_parity_with_dispatch():
+    # CR R3 sol, суб-претензия B — ОТКЛОНЕНА осознанно (решение зафиксировано этим тестом):
+    # прод-схемы инструментов НАМЕРЕННО нормализуют {"title": str} → str (#124,
+    # BeforeValidator в specs_checklists) — тот же валидатор отработает на dispatch в
+    # run_tools. SGR-парс ПРИНИМАЕТ эту форму = паритет с легаси-путём; отвергать = быть
+    # строже прода и бессмысленно бегать в легаси, который исполнит то же самое.
+    from sreda.services.tool_schemas.specs_checklists import AddChecklistItemsInput
+    prod_tool = create_checklist.model_copy(
+        update={"name": "add_checklist_items", "args_schema": AddChecklistItemsInput})
+    d = parse_sgr_reply(_act_reply("add_checklist_items",
+                                   {"list_id_or_title": "продукты",
+                                    "items": [{"title": "молоко"}]}),
+                        None, [prod_tool])
+    assert d.action == "add_checklist_items"  # приняли — как принял бы dispatch
+
+
 def test_parse_rejects_numeric_string_coercion():
     # CR R2 terra MAJOR: строгая валидация без коэрции — "1" вместо int не проходит
     # (иначе сырое "1" уехало бы в run_tools при schema-невалидном типе)
