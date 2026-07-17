@@ -136,6 +136,15 @@ def test_wire_schema_flat_no_ref_and_exact_coverage():
         assert b["description"] == t.description
 
 
+def test_wire_schema_long_description_not_truncated():
+    # CR R1 sol MINOR: инвариант равенства описаний ТОЧНЫЙ — без обрезания даже на длинных
+    long_desc = "Показать список. " * 60  # ~1000 символов
+    t = create_checklist.model_copy(update={"description": long_desc})
+    schema = build_wire_schema([t], "flat")
+    branch = schema["anyOf"][0]["properties"]["tool"]["anyOf"][0]
+    assert branch["description"] == long_desc
+
+
 def test_wire_schema_couples_enough_data():
     # приёмка п.4: схемная связка — act несёт const true, clarify const false, finish const true
     schema = build_wire_schema(_slice(), "flat")
@@ -188,6 +197,24 @@ def test_parse_valid_act_envelope_normalized():
                      ensure_ascii=False)
     d = parse_sgr_reply(raw, None, _slice())
     assert (d.kind, d.action) == ("act", "show_checklist")
+
+
+def test_parse_envelope_inner_situation_rejected():
+    # CR R1 sol+terra MAJOR: situation ВНУТРИ step запрещён схемой конверта — внутренний НЕ
+    # должен маскировать невалидный корневой (fail-closed, не «внутренний перезаписал»)
+    raw = json.dumps({"situation": 123,  # невалидный корень
+                      "step": {"kind": "clarify", "situation": "маскирующий валидный",
+                               "enough_data": False, "question": "Какой список?"}},
+                     ensure_ascii=False)
+    with pytest.raises(SgrInvalidReply):
+        parse_sgr_reply(raw, None, _slice())
+    raw2 = json.dumps({"situation": "валидный корень",
+                       "step": {"kind": "clarify", "situation": "лишний внутренний",
+                                "enough_data": False, "question": "Какой список?"}},
+                      ensure_ascii=False)
+    with pytest.raises(SgrInvalidReply) as ei:
+        parse_sgr_reply(raw2, None, _slice())
+    assert "envelope_inner_situation" in str(ei.value)
 
 
 def test_parse_act_null_args_stripped_before_validation():

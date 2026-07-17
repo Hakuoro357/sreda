@@ -87,70 +87,22 @@ def multiturn_trajectories() -> list[tuple[str, list, tuple]]:
     ]
 
 
-# ─────────────────────────── валидация ответа ───────────────────────────
+# ─────────────────────────── валидация ответа — БОЕВОЙ парсер (CR R1 sol MINOR) ───────────────────────────
 
-def validate_reply(raw: str, sgr_tools: list) -> tuple[bool, str, dict | None]:
-    """Минимальная строгая проверка формы (Ф0; в Ф1 — pydantic). Возврат (valid, why, parsed)."""
+def validate_reply(raw: str, tool_calls, sgr_tools: list):
+    """Гейт судит ТЕМ ЖЕ parse_sgr_reply, что будет в рантайме (анти-дрейф: проба не должна
+    засчитывать ответ, который рантайм отклонит). Возврат (valid, why, SgrDecision|None)."""
+    from sreda.runtime.react_sgr import SgrInvalidReply, parse_sgr_reply
     try:
-        data = json.loads(raw)
-    except Exception as e:  # noqa: BLE001
-        return False, f"json_error:{type(e).__name__}", None
-    if not isinstance(data, dict):
-        return False, "top_type", None
-    # Нормализация конверт → плоская (Ф0: у Осы форма envelope)
-    if set(data.keys()) == {"situation", "step"} and isinstance(data.get("step"), dict):
-        data = {"situation": data["situation"], **data["step"]}
-    step = data  # дальше — единая плоская форма
-    if not isinstance(step.get("situation"), str) or not (0 < len(step["situation"]) <= 400):
-        return False, "situation", data
-    kind = step.get("kind")
-    allowed_keys = {
-        "act": {"kind", "situation", "enough_data", "tool"},
-        "clarify": {"kind", "situation", "enough_data", "question"},
-        "finish": {"kind", "situation", "task_completed", "reply"},
-    }
-    if kind in allowed_keys and set(step.keys()) != allowed_keys[kind]:
-        return False, "branch_keys", data
-    names = {t.name for t in sgr_tools}
-    if kind == "act":
-        if step.get("enough_data") is not True:
-            return False, "act_enough_data", data
-        tool = step.get("tool")
-        if not isinstance(tool, dict) or set(tool.keys()) != {"action", "args"}:
-            return False, "act_tool_shape", data
-        if tool.get("action") not in names:
-            return False, f"act_unknown_tool:{tool.get('action')}", data
-        if not isinstance(tool.get("args"), dict):
-            return False, "act_args_type", data
-        # null-вычистка (§3) + прогон через args_schema инструмента
-        args = {k: v for k, v in tool["args"].items() if v is not None}
-        t = next(t for t in sgr_tools if t.name == tool["action"])
-        try:
-            t.args_schema.model_validate(args)
-        except Exception as e:  # noqa: BLE001
-            return False, f"act_args_invalid:{type(e).__name__}", data
-        return True, "", data
-    if kind == "clarify":
-        if step.get("enough_data") is not False:
-            return False, "clarify_enough_data", data
-        q = step.get("question")
-        if not isinstance(q, str) or not (0 < len(q) <= 300):
-            return False, "clarify_question", data
-        return True, "", data
-    if kind == "finish":
-        if step.get("task_completed") is not True:
-            return False, "finish_task_completed", data
-        if not isinstance(step.get("reply"), str) or not step["reply"]:
-            return False, "finish_reply", data
-        return True, "", data
-    return False, f"kind:{kind}", data
+        return True, "", parse_sgr_reply(raw, tool_calls, sgr_tools)
+    except SgrInvalidReply as e:
+        return False, str(e), None
 
 
-def matches_expected(parsed: dict, expected: tuple) -> bool:
-    step = parsed  # плоская форма
+def matches_expected(decision, expected: tuple) -> bool:
     if expected[0] == "act":
-        return step.get("kind") == "act" and step.get("tool", {}).get("action") in expected[1]
-    return step.get("kind") == expected[0]
+        return decision.kind == "act" and decision.action in expected[1]
+    return decision.kind == expected[0]
 
 
 # ─────────────────────────── прогон ───────────────────────────
@@ -218,17 +170,11 @@ def run(provider: str, mode: str, timeout_s: float) -> int:
             return
         ms = int((time.perf_counter() - t0) * 1000)
         raw = resp.content if isinstance(resp.content, str) else str(resp.content)
-        if getattr(resp, "tool_calls", None):
-            results.append({"id": case_id, "valid": False, "why": "native_tool_calls",
-                            "expected": expected[0], "got": "native_tool_calls", "ms": ms})
-            print(f"  {case_id}: INVALID native_tool_calls ({ms}ms)")
-            return
-        valid, why, parsed = validate_reply(raw, sgr_tools)
-        ok_sem = bool(valid and parsed and matches_expected(parsed, expected))
+        valid, why, decision = validate_reply(raw, getattr(resp, "tool_calls", None), sgr_tools)
+        ok_sem = bool(valid and decision and matches_expected(decision, expected))
         got = None
-        if isinstance(parsed, dict):
-            got = (parsed.get("kind") if parsed.get("kind") != "act"
-                   else (parsed.get("tool") or {}).get("action"))
+        if decision is not None:
+            got = decision.kind if decision.kind != "act" else decision.action
         exp_ser = [expected[0], sorted(expected[1])] if len(expected) > 1 else [expected[0]]
         results.append({"id": case_id, "valid": valid, "why": why, "expected": exp_ser,
                         "got": got, "match": ok_sem, "ms": ms,

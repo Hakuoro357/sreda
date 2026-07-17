@@ -141,13 +141,11 @@ def _strict_normalize(schema: dict) -> dict:
     return walk(node)
 
 
-_DESC_CAP = 600  # прод-описания компактны (_react_desc); кап — страховка от раздутых
-
-
 def _tool_branches(sgr_tools: list) -> list[dict]:
     """Ветка на инструмент: const-дискриминатор action + args из штатного LangChain-конвертера
-    (нормализованные parameters) + ОПИСАНИЕ bound-объекта (R1: близкие get/show/list различимы
-    только по описаниям — те же _react_desc, что видит легаси-путь)."""
+    (нормализованные parameters) + ОПИСАНИЕ bound-объекта БЕЗ обрезания (CR R1 sol MINOR:
+    инвариант «описание ветки = описание bound» точный — близкие get/show/list различимы
+    только по описаниям, те же _react_desc, что видит легаси-путь)."""
     from langchain_core.utils.function_calling import convert_to_openai_tool
     branches = []
     for t in sgr_tools:
@@ -157,7 +155,7 @@ def _tool_branches(sgr_tools: list) -> list[dict]:
             params = {"type": "object", "properties": {}, "additionalProperties": False}
         branches.append({
             "type": "object", "additionalProperties": False,
-            "description": (fn.get("description") or "")[:_DESC_CAP],
+            "description": fn.get("description") or "",
             "required": ["action", "args"],
             "properties": {"action": {"const": fn["name"]}, "args": params},
         })
@@ -281,9 +279,13 @@ def parse_sgr_reply(content: str, tool_calls: Any, sgr_tools: list) -> SgrDecisi
         raise SgrInvalidReply(f"json_error:{type(e).__name__}") from None
     if not isinstance(data, dict):
         raise SgrInvalidReply("top_type")
-    # Нормализация конверт → плоская (Ф0: у Осы форма envelope)
+    # Нормализация конверт → плоская (Ф0: у Осы форма envelope). Fail-closed (CR R1 sol+terra
+    # MAJOR): «situation» ВНУТРИ step запрещён схемой конверта — не даём внутреннему значению
+    # перезаписать/замаскировать корневое (невалидный корень прошёл бы). Корневое — последним.
     if set(data.keys()) == {"situation", "step"} and isinstance(data.get("step"), dict):
-        data = {"situation": data["situation"], **data["step"]}
+        if "situation" in data["step"]:
+            raise SgrInvalidReply("branch:envelope_inner_situation")
+        data = {**data["step"], "situation": data["situation"]}
     try:
         step = _AnyStep(root=data).root
     except ValidationError as e:
