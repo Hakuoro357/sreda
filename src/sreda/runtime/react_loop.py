@@ -3670,17 +3670,20 @@ def _build_graph(llm: Any, all_tools: list, *,
                     run_id=state.get("turn_key") or "",
                     user_text=_last_human_text(state["messages"]))
                 _sgr_field = _sgr_out["sgr"]
+                if _sgr_out["fallback_fired"]:
+                    # CR R1 sol MINOR + R2 оба (не терять на «оба structured упали → легаси»):
+                    # телеметрия structured-фолбэка — В ОБЩИЕ trace-поля БЕЗУСЛОВНО, как
+                    # легаси-фолбэк (#159/#184): попытка primary не должна выглядеть
+                    # «не вызывался». Легаси-инвок ниже при СВОЁМ фолбэке перепишет
+                    # primary_* своими значениями (последняя ошибка побеждает).
+                    _fallback_fired = True
+                    _primary_provider, _primary_model = provider_key, _model_name
+                    _primary_error = _sgr_out["primary_error"]
                 if _sgr_out["resp"] is not None:
                     resp = _sgr_out["resp"]
                     _latency_ms = _sgr_out["latency_ms"]
                     _used_provider, _used_model = _sgr_out["provider"], _sgr_out["model"]
                     _sgr_done, _sgr_usage_done = True, bool(_sgr_out["usage_recorded"])
-                    if _sgr_out["fallback_fired"]:
-                        # CR R1 sol MINOR: structured-фолбэк виден в общих trace-полях —
-                        # как легаси-фолбэк (#159/#184): попытка primary + фактический провайдер.
-                        _fallback_fired = True
-                        _primary_provider, _primary_model = provider_key, _model_name
-                        _primary_error = _sgr_out["primary_error"]
             # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
             #   (1) учёт пишем на ФАКТИЧЕСКИ отработавший provider_key/model — Оса при срабатывании
             #       запаса, не Mercury (иначе таблица «расход по провайдерам» врёт — R1 MAJOR);

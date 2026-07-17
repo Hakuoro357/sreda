@@ -414,6 +414,20 @@ def test_sgr_trace_no_free_text_in_llm_calls(install):
                         "enough_data", "task_completed", "situation_len", "args_hash"}
 
 
+def test_sgr_double_structured_failure_keeps_telemetry(install):
+    # CR R2 sol+terra MINOR: primary structured упал, Оса structured невалидна → легаси
+    # успешен; телеметрия structured-попыток НЕ теряется (retries/primary_error видны)
+    st = install(sgr_flag=True, sgr_tenants="t-canary")
+    primary = _SgrChat("m", sgr_responses=[RuntimeError("boom-primary")])
+    osa = _SgrChat("osa", sgr_responses=["мусор от осы"])
+    res = _turn(primary, thread="dblfail", text=CHECKLIST_TEXT, fallback=osa)
+    assert str(res).startswith("legacy-")
+    c0 = _chat_calls(st["trace"])[0]
+    assert c0["fallback_fired"] is True and c0["retries"] == 1
+    assert c0["primary_error"] == "RuntimeError"
+    assert c0["sgr"]["fallback_reason"] == "invalid_response"
+
+
 def test_sgr_per_attempt_usage(install, monkeypatch):
     # invalid → легаси: учтены ОБЕ завершённые попытки (structured + легаси)
     install(sgr_flag=True, sgr_tenants="t-canary")
