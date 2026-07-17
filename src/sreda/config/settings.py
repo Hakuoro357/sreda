@@ -710,6 +710,16 @@ class Settings(BaseSettings):
     domain_clf_disambig_tenants_raw: str | None = Field(
         default=None, validation_alias="SREDA_DOMAIN_CLF_DISAMBIG_TENANTS"
     )
+    # #383: SGR-шаг планировщика (схемное принуждение) для домена чеклистов.
+    # OFF (дефолт) → байт-в-байт текущий путь (react_sgr даже не импортируется);
+    # ON + тенант в списке + «чисто чеклистовый» unified-ход → structured-вызов
+    # планировщика (анкета + объединение sgr_tools). Канарейка: тенант владельца.
+    sgr_planner_enabled: bool = Field(
+        default=False, validation_alias="SREDA_SGR_PLANNER_ENABLED"
+    )
+    sgr_planner_tenants_raw: str | None = Field(
+        default=None, validation_alias="SREDA_SGR_PLANNER_TENANTS"
+    )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
     # rollout, not "internal/PD-safe"; planner-enabling an external tenant must
@@ -1329,6 +1339,12 @@ class Settings(BaseSettings):
         domain_clf_disambig_enabled). Пусто (дефолт) → никому; ``*`` → все.
         Канарейка: сперва тенант владельца."""
         return _parse_tenant_gate(self.domain_clf_disambig_tenants_raw)
+
+    @property
+    def sgr_planner_tenants(self) -> frozenset[str]:
+        """#383: тенанты SGR-шага планировщика (при включённом sgr_planner_enabled).
+        Пусто (дефолт) → никому; ``*`` → все. Канарейка: тенант владельца."""
+        return _parse_tenant_gate(self.sgr_planner_tenants_raw)
 
     @property
     def admin_alert_preview_tenants(self) -> frozenset[str]:
