@@ -1,10 +1,10 @@
-"""Read-only export of Boris's MAX dialogue archive from prod DB.
+"""Read-only export of a MAX dialogue archive from prod DB.
 
 Runs on VDS via run_probe.sh (which loads /etc/sreda/.env first).
 Writes to /tmp/replay-sample.json — scp'd back to local.
 
-Selects the last ~30 conversation.chat agent_runs for
-tenant_max_40921122, plus:
+Selects the last ~30 conversation.chat agent_runs for the tenant from
+env ``SREDA_REPLAY_TENANT`` (реальный id не коммитим — audit 2026-07-18), plus:
   - user_message (decrypted from input_json)
   - per-run history substitute (prior completed runs, same thread,
     user_text + bot_text pairs — mirrors _load_chat_history logic)
@@ -15,6 +15,7 @@ READ-ONLY: only SELECT + decrypt_value. NO writes / DDL / restart.
 """
 
 import json
+import os
 import sys
 
 sys.path.insert(0, "/opt/sreda/src")
@@ -24,7 +25,12 @@ from sqlalchemy import text  # noqa: E402
 from sreda.db.session import get_session_factory  # noqa: E402
 from sreda.services.encryption import decrypt_value  # noqa: E402
 
-TENANT = "tenant_max_40921122"
+TENANT = os.environ.get("SREDA_REPLAY_TENANT", "")
+if not TENANT:
+    raise SystemExit(
+        "Set SREDA_REPLAY_TENANT=<tenant_id> (real ids are not committed — "
+        "audit 2026-07-18)."
+    )
 LIMIT = 30
 OUTPUT = "/tmp/replay-sample.json"
 

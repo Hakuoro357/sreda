@@ -1,6 +1,6 @@
-"""R-32 Sub-step B: One-shot cleanup для tg_755682022 task duplicates.
+"""R-32 Sub-step B: One-shot cleanup дублей tasks для одного тенанта.
 
-User feedback (tg_755682022, 2026-05-15): «Расписание работает
+User feedback (2026-05-15): «Расписание работает
 некорректно. Многие пункты задвоились. Найти причину, дубли удалить».
 
 Root cause (R-32 Sub-step A — already deployed): mimo иногда эмитит
@@ -12,7 +12,7 @@ Default: **dry-run** — читает + показывает план DELETE б�
 Use `--execute` flag для actual DELETE.
 
 Logic:
-1. SELECT все tasks tg_755682022 с status='pending', recurrence_rule IS NULL
+1. SELECT все tasks целевого тенанта с status='pending', recurrence_rule IS NULL
    (recurring tasks могут legit повторяться — не трогаем).
 2. ORM-level decrypt `title` (через EncryptedString property).
 3. Group в Python by (scheduled_date, title_norm, time_start).
@@ -23,6 +23,9 @@ Logic:
 Audit trail: print task_id'ы для каждого decision — Borisus reviews dry-run
 output, approves, runs `--execute`.
 
+Tenant id — PII, НЕ коммитится (audit 2026-07-18): передаётся через
+``--tenant`` или env ``SREDA_ONESHOT_TARGET_TENANT`` (fail-fast без обоих).
+
 Created: 2026-05-15 для R-32 cleanup.
 Issue: vex-assistant#41.
 """
@@ -32,7 +35,6 @@ import argparse
 import os
 import sys
 from collections import defaultdict
-from datetime import datetime
 
 # Sreda imports — assumes running from /opt/sreda с venv activated и .env loaded
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -43,7 +45,7 @@ from sreda.db.models.tasks import Task
 from sreda.db.session import get_session_factory
 
 
-TARGET_TENANT = "tenant_tg_755682022"
+TARGET_TENANT = os.environ.get("SREDA_ONESHOT_TARGET_TENANT", "")
 
 
 def _normalize_title(title: str | None) -> str:
@@ -62,7 +64,7 @@ def _group_key(t: Task) -> tuple:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="R-32 one-shot cleanup of duplicate tasks for tg_755682022"
+        description="R-32 one-shot cleanup of duplicate tasks for a tenant"
     )
     parser.add_argument(
         "--execute",
@@ -71,10 +73,19 @@ def main() -> int:
     )
     parser.add_argument(
         "--tenant",
-        default=TARGET_TENANT,
-        help=f"Tenant ID to clean (default: {TARGET_TENANT}).",
+        default=TARGET_TENANT or None,
+        help="Tenant ID to clean (default: env SREDA_ONESHOT_TARGET_TENANT).",
     )
     args = parser.parse_args()
+
+    if not args.tenant:
+        print(
+            "Refusing to run: pass --tenant <tenant_id> or set "
+            "SREDA_ONESHOT_TARGET_TENANT (real ids are not committed — "
+            "audit 2026-07-18).",
+            file=sys.stderr,
+        )
+        return 1
 
     sf = get_session_factory()
     with sf() as session:

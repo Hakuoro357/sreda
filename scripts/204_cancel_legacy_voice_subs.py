@@ -4,14 +4,14 @@
 Контекст. После слияния ``voice_transcription`` в основной тариф (Ф1: расход
 голоса пишется под carrier-агентом ``housewife_assistant``; Ф2: ВСЕ пути
 реактивации мёртвого плана ``voice_transcription_base`` закрыты) на проде
-остались РОВНО 2 тенанта со старой отдельной voice-подпиской:
+остались РОВНО 2 тенанта со старой отдельной voice-подпиской.
 
-  * ``tenant_tg_1089832184``
-  * ``tenant_tg_755682022``
-
-(Плановая стенограмма пишет их как ``tg_1089832184`` / ``tg_755682022`` — это
-shorthand; реальный ``Tenant.id`` = ``tenant_tg_<telegram_id>``, см.
-``services/onboarding.py:292``.) У обоих параллельно active ``housewife_assistant``
+(Реальные ``Tenant.id`` = ``tenant_tg_<telegram_id>``, см.
+``services/onboarding.py:292``. Конкретные id — PII и НЕ коммитятся
+(audit 2026-07-18): оператор передаёт их через env
+``SREDA_204_EXPECTED_TENANTS`` — comma-separated, напр.
+``tenant_tg_111,tenant_tg_222`` — из deploy-заметок задачи #204.)
+У обоих параллельно active ``housewife_assistant``
 — именно он теперь несёт голос (атрибуция Ф1). Эта подписка снимает их легаси
 voice-подписки, чтобы в /admin/budget не осталось отдельной active voice-строки;
 голос продолжает работать (resolve → housewife).
@@ -25,7 +25,7 @@ voice-подписки, чтобы в /admin/budget не осталось отд
 
 Безопасность (Только Вперёд, Tombstone не delete):
   * Hard preconditions в ОДНОЙ транзакции: ровно 2 active voice-подписки И
-    tenant-set РОВНО {tenant_tg_1089832184, tenant_tg_755682022} И у ОБОИХ active
+    tenant-set РОВНО ``SREDA_204_EXPECTED_TENANTS`` И у ОБОИХ active
     housewife. Любое расхождение (дрейф прода) → печать diagnostics + STOP БЕЗ
     мутаций (rollback).
   * Мутация зеркалит ``BillingService.cancel_voice_subscription`` (billing.py):
@@ -39,6 +39,10 @@ voice-подписки, чтобы в /admin/budget не осталось отд
     ручной dump в эту сессию через ``--i-have-a-fresh-backup``.
 
 Usage:
+
+    # Обязательный env: точный tenant-set (НЕ коммитить, брать из
+    # deploy-заметок #204):
+    export SREDA_204_EXPECTED_TENANTS="tenant_tg_<id1>,tenant_tg_<id2>"
 
     # Прод-проверка БЕЗ записи (печатает, что СДЕЛАЛ БЫ):
     python scripts/204_cancel_legacy_voice_subs.py --dry-run
@@ -60,6 +64,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -90,12 +95,20 @@ VOICE_PLAN_KEY = PLAN_VOICE_TRANSCRIPTION  # "voice_transcription_base"
 # select subscriptions (that goes by plan_key above).
 VOICE_FEATURE_KEY = "voice_transcription"
 
-# Canonical production tenant ids. Plan shorthand is ``{tg_1089832184,
-# tg_755682022}``; the real Tenant.id is ``tenant_tg_<telegram_id>`` (see
-# onboarding.py:292 ``tenant_id = f"tenant_tg_{telegram_id}"``).
-EXPECTED_TENANT_IDS: frozenset[str] = frozenset(
-    {"tenant_tg_1089832184", "tenant_tg_755682022"}
-)
+# Canonical production tenant ids — PII, НЕ коммитятся (audit 2026-07-18).
+# Передаются через env ``SREDA_204_EXPECTED_TENANTS`` (comma-separated
+# ``tenant_tg_<telegram_id>``, формат см. onboarding.py:292
+# ``tenant_id = f"tenant_tg_{telegram_id}"``). Пустой set = fail-fast в main()
+# (а чистая функция безопасно остановится на precondition-2 без мутаций).
+EXPECTED_TENANTS_ENV = "SREDA_204_EXPECTED_TENANTS"
+
+
+def _load_expected_tenant_ids() -> frozenset[str]:
+    raw = os.environ.get(EXPECTED_TENANTS_ENV, "")
+    return frozenset(t.strip() for t in raw.split(",") if t.strip())
+
+
+EXPECTED_TENANT_IDS: frozenset[str] = _load_expected_tenant_ids()
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +380,15 @@ def main(argv: list[str] | None = None) -> int:
         "(satisfies the backup gate when the monitor isn't reachable).",
     )
     args = parser.parse_args(argv)
+
+    # Fail-fast без tenant-set: иначе precondition-2 просто отклонит прогон,
+    # и оператор может неверно прочитать это как «дрейф прода».
+    if not EXPECTED_TENANT_IDS:
+        print(
+            f"ABORT: {EXPECTED_TENANTS_ENV} is not set. Provide the exact "
+            "comma-separated tenant ids out-of-band (never commit them)."
+        )
+        return 2
 
     # The session factory reads DATABASE_URL etc. from the environment
     # (settings) — on prod via EnvironmentFile=/etc/sreda/.env.

@@ -6,7 +6,8 @@
 #   scripts/wipe_tenant.sh <tenant_id> --force   — skip confirm (CI / loops)
 #
 # Env overrides:
-#   SREDA_VDS_HOST  — default boris@62.113.41.104
+#   SREDA_VDS_HOST  — REQUIRED (user@host боевого VDS; дефолт удалён из репо —
+#                     audit 2026-07-18: адрес сервера не публикуем)
 #   SREDA_VDS_KEY   — default ~/.ssh/timeweb_openclaw
 #
 # Use case: orphan-tenant cleanup during channel-linking smoke testing,
@@ -36,7 +37,12 @@ if [[ ! "$TENANT_ID" =~ ^tenant_[a-z]+_[0-9]+$ ]]; then
   exit 1
 fi
 
-SSH_HOST="${SREDA_VDS_HOST:-boris@62.113.41.104}"
+if [[ -z "${SREDA_VDS_HOST:-}" ]]; then
+  echo "Refusing to run: SREDA_VDS_HOST is not set (user@host of the target VDS)." >&2
+  echo "The hardcoded default was removed (audit 2026-07-18: server address is not public)." >&2
+  exit 1
+fi
+SSH_HOST="$SREDA_VDS_HOST"
 SSH_KEY="${SREDA_VDS_KEY:-$HOME/.ssh/timeweb_openclaw}"
 
 # ----- Inventory before delete
@@ -50,7 +56,11 @@ UNION ALL SELECT 'agent_runs',    (SELECT COUNT(*) FROM agent_runs              
 UNION ALL SELECT 'memories',      (SELECT COUNT(*) FROM assistant_memories      WHERE tenant_id='$TENANT_ID')::int
 UNION ALL SELECT 'reminders',     (SELECT COUNT(*) FROM family_reminders        WHERE tenant_id='$TENANT_ID')::int
 UNION ALL SELECT 'subscriptions', (SELECT COUNT(*) FROM tenant_subscriptions    WHERE tenant_id='$TENANT_ID')::int
-UNION ALL SELECT 'secure',        (SELECT COUNT(*) FROM secure_records          WHERE tenant_id='$TENANT_ID')::int;
+UNION ALL SELECT 'secure',        (SELECT COUNT(*) FROM secure_records          WHERE tenant_id='$TENANT_ID')::int
+UNION ALL SELECT 'react_trace',   (SELECT COUNT(*) FROM react_turn_trace        WHERE tenant_id='$TENANT_ID')::int
+UNION ALL SELECT 'react_ckpt',    (SELECT COUNT(*) FROM react_checkpoint        WHERE tenant_id='$TENANT_ID')::int
+UNION ALL SELECT 'conv_turns',    (SELECT COUNT(*) FROM conversation_turns      WHERE tenant_id='$TENANT_ID')::int
+UNION ALL SELECT 'heartbeats',    (SELECT COUNT(*) FROM poller_heartbeats       WHERE tenant_id='$TENANT_ID')::int;
 SQL
 
 # ----- Confirm
@@ -64,16 +74,25 @@ if [[ "$FORCE" != "--force" ]]; then
 fi
 
 # ----- Cascade delete in single transaction
+# Audit 2026-07-18 (#6): список дополнен react_turn_trace / react_checkpoint /
+# conversation_turns / poller_heartbeats (no-FK таблицы с текстами переписки —
+# раньше «wipe» оставлял их PII в БД). При добавлении новых tenant-таблиц в
+# схему этот список надо держать в синхроне с rls_registry.TENANT_TABLES
+# (динамический эталон — onboard_smoke.py).
 ssh -i "$SSH_KEY" "$SSH_HOST" "sudo -u postgres psql sreda -v ON_ERROR_STOP=1" <<SQL
 BEGIN;
 DELETE FROM agent_runs                    WHERE tenant_id='$TENANT_ID';
 DELETE FROM agent_threads                 WHERE tenant_id='$TENANT_ID';
 DELETE FROM assistant_memories            WHERE tenant_id='$TENANT_ID';
+DELETE FROM conversation_turns            WHERE tenant_id='$TENANT_ID';
 DELETE FROM jobs                          WHERE tenant_id='$TENANT_ID';
 DELETE FROM assistants                    WHERE tenant_id='$TENANT_ID';
 DELETE FROM inbound_messages              WHERE tenant_id='$TENANT_ID';
 DELETE FROM inbound_events                WHERE tenant_id='$TENANT_ID';
 DELETE FROM outbox_messages               WHERE tenant_id='$TENANT_ID';
+DELETE FROM poller_heartbeats             WHERE tenant_id='$TENANT_ID';
+DELETE FROM react_checkpoint              WHERE tenant_id='$TENANT_ID';
+DELETE FROM react_turn_trace              WHERE tenant_id='$TENANT_ID';
 DELETE FROM secure_records                WHERE tenant_id='$TENANT_ID';
 DELETE FROM connect_sessions              WHERE tenant_id='$TENANT_ID';
 DELETE FROM channel_link_tokens           WHERE tenant_id='$TENANT_ID';

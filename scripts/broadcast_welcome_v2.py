@@ -11,14 +11,15 @@
 
 ИСПОЛЬЗОВАНИЕ.
 
-    # Тест на одном юзере (по telegram_account_id):
-    python -m scripts.broadcast_welcome_v2 --only 352612382
+    # Тест на одном юзере (по telegram_account_id; реальные id не коммитим —
+    # audit 2026-07-18):
+    python -m scripts.broadcast_welcome_v2 --only <telegram_account_id>
 
     # Только Boris-сообщение, без INTRO (для разделения шагов):
-    python -m scripts.broadcast_welcome_v2 --only 352612382 --boris-only
+    python -m scripts.broadcast_welcome_v2 --only <telegram_account_id> --boris-only
 
     # Только INTRO (если уже отправил Boris отдельно):
-    python -m scripts.broadcast_welcome_v2 --only 352612382 --intro-only
+    python -m scripts.broadcast_welcome_v2 --only <telegram_account_id> --intro-only
 
     # Dry-run — печатает кому что отправил бы, но не шлёт:
     python -m scripts.broadcast_welcome_v2 --dry-run

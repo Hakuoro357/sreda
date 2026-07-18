@@ -1,5 +1,6 @@
 """One-shot recovery: переносит «осиротевшую» task «Найти чек от ноутбука»
-из расписания в чек-лист «Глобальные дела на даче» юзера 634496616.
+из расписания в чек-лист «Глобальные дела на даче» (инцидент 2026-04-28,
+юзер-ид не коммитим — audit 2026-07-18).
 
 Контекст 2026-04-28 16:26: LLM услышал «запиши в список дел на сегодня
 найти чек от ноутбука» как task-with-date вместо checklist-item, создал
@@ -33,7 +34,7 @@ def main() -> None:
         if task.status == "pending":
             task.status = "cancelled"
             sess.commit()
-            print(f"  → cancelled")
+            print("  → cancelled")
         else:
             print(f"  → already {task.status}, skip")
 

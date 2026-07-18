@@ -36,7 +36,7 @@ from sreda.db.session import get_engine, get_session_factory  # noqa: E402
 from sreda.runtime import react_loop  # noqa: E402
 from sreda.services.llm import get_chat_llm  # noqa: E402
 
-TENANT, USER = "tenant_max_40921122", "u1"
+TENANT, USER = "tenant_max_90000001", "u1"
 
 
 def _seed(session):
@@ -44,12 +44,13 @@ def _seed(session):
     session.add(Workspace(id="w1", tenant_id=TENANT, name="W"))
     session.flush()
     session.add(Assistant(id="a1", tenant_id=TENANT, workspace_id="w1", name="Sreda"))
-    session.add(User(id=USER, tenant_id=TENANT, telegram_account_id="352612382"))
+    session.add(User(id=USER, tenant_id=TENANT, telegram_account_id="900000001"))
     session.commit()
 
 
 async def main() -> int:
-    get_engine.cache_clear(); get_session_factory.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
     Base.metadata.create_all(get_engine())
     session = get_session_factory()()
     _seed(session)

@@ -1,13 +1,16 @@
-"""READ-ONLY diagnostic: where do MAX bot replies live for tenant_max_40921122?
+"""READ-ONLY diagnostic: where do MAX bot replies live for a tenant?
 
 Pinpoints why old_reply/history came back empty:
 - dumps result_json (raw keys + value) for 2 recent completed runs
 - checks whether outbox_messages has ANY rows for the tenant + their payload shape
 
 READ-ONLY: only SELECT. No writes.
+
+Tenant id — PII, НЕ коммитится (audit 2026-07-18): env SREDA_REPLAY_TENANT.
 """
 
 import json
+import os
 import sys
 
 sys.path.insert(0, "/opt/sreda/src")
@@ -16,7 +19,12 @@ from sqlalchemy import text  # noqa: E402
 
 from sreda.db.session import get_session_factory  # noqa: E402
 
-TENANT = "tenant_max_40921122"
+TENANT = os.environ.get("SREDA_REPLAY_TENANT", "")
+if not TENANT:
+    raise SystemExit(
+        "Set SREDA_REPLAY_TENANT=<tenant_id> (real ids are not committed — "
+        "audit 2026-07-18)."
+    )
 
 
 def main() -> None:

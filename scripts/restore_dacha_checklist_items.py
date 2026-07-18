@@ -1,5 +1,6 @@
 """One-shot recovery: восстанавливает 3 пропавших пункта в чек-листе
-«Глобальные дела на даче» юзера tg_634496616.
+«Глобальные дела на даче» (инцидент 2026-04-28, юзер-ид не коммитим —
+audit 2026-07-18).
 
 Контекст (incident 2026-04-28):
 - 26.04 20:42:33 юзер сказал «Чинить забор» — LLM выдал text «Добавила»
@@ -14,7 +15,7 @@
 «Забрать с дачи» юзер сам удалил — не восстанавливаем.
 
 Использование:
-    python scripts/restore_634496616_checklist_items.py
+    python scripts/restore_dacha_checklist_items.py
 """
 from sreda.db.session import get_db_session
 from sreda.services.checklists import ChecklistService

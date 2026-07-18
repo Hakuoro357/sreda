@@ -4,6 +4,8 @@
 #
 # Pipeline: pg_dump (custom format) → integrity-check → gzip → openssl AES-256.
 # Output: /var/backups/sreda/sreda-YYYYMMDD-HHMMSS.dump.gz.enc
+# Offsite: SREDA_BACKUP_OFFSITE_CMD (env) — см. блок в конце; без неё копии
+# живут только на этом хосте (WARN в лог каждый прогон).
 #
 # Restore (DR):
 #   openssl enc -d -aes-256-cbc -pbkdf2 -in sreda-DATE.dump.gz.enc \
@@ -42,6 +44,13 @@ if [ ! -r "$KEY_FILE" ]; then
     exit 1
 fi
 
+# Audit 2026-07-18: на ЛЮБОМ failure-пути ниже (pg_dump/gzip/openssl:
+# диск/ключ/сеть) не оставляем plaintext-дампы и partial-артефакты в $DEST.
+DUMP_GZ="$DUMP.gz"
+DUMP_ENC="$DUMP_GZ.enc"
+cleanup_on_error() { rm -f "$DUMP" "$DUMP_GZ" "$DUMP_ENC"; }
+trap cleanup_on_error ERR
+
 # pg_dump custom format. -Z 0 disables internal compression — gzip after.
 # .pgpass provides credentials. --no-owner/--no-acl makes restore portable.
 pg_dump -F c -Z 0 -d sreda \
@@ -51,30 +60,60 @@ pg_dump -F c -Z 0 -d sreda \
 
 # Integrity check via pg_restore --list (reads custom-format header)
 if ! pg_restore --list "$DUMP" > /dev/null 2>&1; then
-    log "INTEGRITY FAIL: pg_restore --list rejected dump"
-    mv "$DUMP" "$DEST/sreda-$DATE.CORRUPT.dump"
+    # Audit 2026-07-18: plaintext-дамп НЕ оставляем (legacy-поведение —
+    # переименование в «corrupt»-файл — держало plaintext вечно) —
+    # удаляем артефакт, алертим через лог.
+    log "INTEGRITY FAIL: pg_restore --list rejected dump — removing plaintext artefact"
+    rm -f "$DUMP"
     exit 1
 fi
 
 # Compress + encrypt в один pipe (no temp file with plaintext)
 gzip -9 "$DUMP"
-DUMP_GZ="$DUMP.gz"
-DUMP_ENC="$DUMP_GZ.enc"
 
 openssl enc -aes-256-cbc -pbkdf2 -salt \
     -in "$DUMP_GZ" \
     -out "$DUMP_ENC" \
     -pass "file:$KEY_FILE"
 
+trap - ERR
+
 # Удаляем plain gzip — оставляем только encrypted
-rm "$DUMP_GZ"
+rm -f "$DUMP_GZ"
 
 # Retention cleanup
 find "$DEST" -name 'sreda-*.dump.gz.enc' -mtime +$RETENTION_DAYS -delete
+# Defense-in-depth (audit 2026-07-18): plaintext-остатки failed-прогонов
+# (.dump / .dump.gz, включая легаси-артефакты) не живут дольше суток.
+find "$DEST" \( -name 'sreda-*.dump' -o -name 'sreda-*.dump.gz' \) -mtime +1 -delete
 
 SIZE=$(stat -c '%s' "$DUMP_ENC")
 COUNT=$(ls -1 "$DEST"/sreda-*.dump.gz.enc 2>/dev/null | wc -l)
 log "backup ok: sreda-$DATE.dump.gz.enc size=${SIZE}b retained=$COUNT files"
+
+# ============================================================================
+# Offsite-копия (audit 2026-07-18: раньше ВСЕ бэкапы жили на этом же VDS —
+# отказ диска/взлом = потеря БД и бэкапов одновременно).
+#
+# Настройка: SREDA_BACKUP_OFFSITE_CMD в /etc/sreda/.env — shell-команда,
+# выполняется через `sh -c` с экспортированным $DUMP_ENC. Примеры:
+#   rsync -az --timeout=120 "$DUMP_ENC" backup-host:/srv/sreda-backups/
+#   rclone copyto "$DUMP_ENC" remote:sreda-backups/
+# Безопасный дефолт: переменная НЕ задана → копия пропускается с WARN в лог
+# (локальный бэкап уже сделан; молчать об отсутствии offsite нельзя).
+# Провал offsite-копии НЕ валит прогон: локальный зашифрованный бэкап валиден,
+# но WARN в логе обязателен.
+# ============================================================================
+OFFSITE_CMD="${SREDA_BACKUP_OFFSITE_CMD:-}"
+if [ -n "$OFFSITE_CMD" ]; then
+    if DUMP_ENC="$DUMP_ENC" sh -c "$OFFSITE_CMD"; then
+        log "offsite copy ok"
+    else
+        log "WARN: offsite copy FAILED (local encrypted backup intact) — check SREDA_BACKUP_OFFSITE_CMD"
+    fi
+else
+    log "WARN: no offsite copy configured (set SREDA_BACKUP_OFFSITE_CMD) — backups exist on this host only"
+fi
 
 # ============================================================================
 # Issue #68 — backup enforcement: llm-trace PII НЕ должен попадать в backup.

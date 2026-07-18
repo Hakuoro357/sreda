@@ -11,6 +11,7 @@ git push + reload cron (cron сам подхватит).
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import socket
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import httpx
 
@@ -33,7 +34,10 @@ TRACE_LOG = Path("/var/log/sreda/trace.log")
 BACKUP_DIR = Path("/var/backups/sreda")
 ENV_PATH = "/etc/sreda/.env"
 COOLDOWN_MIN = 15
-ADMIN_CHAT_ID = "352612382"  # Boris
+# Admin alert target — реальный chat_id НЕ коммитим (audit 2026-07-18: PII в
+# публичном репо). Берётся из SREDA_ADMIN_TELEGRAM_CHAT_ID (env или
+# /etc/sreda/.env) ПОСЛЕ загрузки _ENV ниже; без него алерты пропускаются,
+# probes продолжают работать.
 
 Severity = Literal["ok", "warning", "critical"]
 
@@ -57,6 +61,11 @@ def _load_env(path: str = ENV_PATH) -> dict[str, str]:
 
 
 _ENV = _load_env()
+
+# Каноничная переменная — та же, что у settings.admin_telegram_chat_id.
+ADMIN_CHAT_ID = os.environ.get("SREDA_ADMIN_TELEGRAM_CHAT_ID") or _ENV.get(
+    "SREDA_ADMIN_TELEGRAM_CHAT_ID", ""
+)
 
 
 def _proxy_for_url(url: str) -> str | None:
@@ -126,14 +135,23 @@ def probe_job_runner_active() -> ProbeResult:
     )
 
 
+def _pg_password_from_dsn(dsn: str) -> str | None:
+    """Пароль из SREDA_DATABASE_URL. urlparse (а не ручной split) — иначе
+    ломается на пароле с ``:`` или ``@`` (audit 2026-07-18 #13)."""
+    try:
+        pwd = urlparse(dsn).password
+    except Exception:
+        return None
+    return unquote(pwd) if pwd else None
+
+
 def probe_pg_responsive() -> ProbeResult:
     pg_pwd = _ENV.get("SREDA_DATABASE_URL", "")
     # SREDA_DATABASE_URL=postgresql+psycopg://sreda:PASS@localhost:5432/sreda
     if "@" not in pg_pwd:
         return ProbeResult("pg_responsive", "critical", "SREDA_DATABASE_URL not parseable")
-    try:
-        password = pg_pwd.split("://")[1].split("@")[0].split(":")[1]
-    except Exception:
+    password = _pg_password_from_dsn(pg_pwd)
+    if password is None:
         return ProbeResult("pg_responsive", "critical", "DSN parse fail")
 
     rc = subprocess.run(
@@ -492,9 +510,8 @@ def _pg_query(sql: str) -> str | None:
     pg_pwd_dsn = _ENV.get("SREDA_DATABASE_URL", "")
     if "@" not in pg_pwd_dsn:
         return None
-    try:
-        password = pg_pwd_dsn.split("://")[1].split("@")[0].split(":")[1]
-    except Exception:
+    password = _pg_password_from_dsn(pg_pwd_dsn)
+    if password is None:
         return None
     rc = subprocess.run(
         ["psql", "-h", "127.0.0.1", "-U", "sreda", "-d", "sreda",
@@ -951,6 +968,9 @@ def send_telegram_alert(text: str) -> None:
     if not token:
         print("[alert] no bot token, skipping send", file=sys.stderr)
         return
+    if not ADMIN_CHAT_ID:
+        print("[alert] no SREDA_ADMIN_TELEGRAM_CHAT_ID, skipping send", file=sys.stderr)
+        return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     proxy = _proxy_for_url(url)
     # #324: слать алерт через egress SOCKS — иначе при флапе прямого маршрута сам
@@ -989,10 +1009,13 @@ def format_alert(name: str, prev_status: Severity, new: ProbeResult,
             f"Host: {host}"
         )
     icon = icons.get(new.status, "❓")
+    # html.escape (audit 2026-07-18 #13): в message попадают сырые psql stderr,
+    # last_error_message из Telegram, str(exc) внешних проб — один `<`/`&` =
+    # HTTP 400 от Bot API, и алерт молча дропается.
     return (
         f"{icon} <b>{new.status.upper()}:</b> {new.name}\n"
         f"Probe: <code>{name}</code>\n"
-        f"Message: {new.message}\n"
+        f"Message: {html.escape(new.message)}\n"
         f"Host: {host}"
     )
 
@@ -1042,9 +1065,16 @@ def main() -> int:
             else:
                 last_alert_iso = prev.last_alert_at if prev else None
 
+            # Audit 2026-07-18 #13: переход critical→warning (оба не-ok) НЕ
+            # сбрасывает since — инцидент продолжается, иначе «Down for» в
+            # recovery-алерте занижает реальную длительность.
+            since_iso = now.isoformat()
+            if prev and prev_status != "ok" and result.status != "ok":
+                since_iso = prev.since
+
             state[result.name] = ProbeState(
                 status=result.status,
-                since=now.isoformat(),
+                since=since_iso,
                 last_alert_at=last_alert_iso,
                 last_message=result.message,
             )

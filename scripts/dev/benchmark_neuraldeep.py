@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
@@ -39,7 +39,14 @@ from sreda.runtime.handlers import build_system_prompt
 
 
 BASE_URL = "https://api.neuraldeep.ru/v1"
-API_KEY = os.environ.get("NEURALDEEP_API_KEY") or "sk-qzSw9U6wW2MXU1e2DuuGyg"
+# Audit 2026-07-18: hardcoded fallback-ключ удалён (считать скомпрометированным,
+# ротация — действие владельца). Ключ ТОЛЬКО из env, fail-fast без него.
+API_KEY = os.environ.get("NEURALDEEP_API_KEY")
+if not API_KEY:
+    raise SystemExit(
+        "NEURALDEEP_API_KEY is not set. Export it before running "
+        "(hardcoded keys are forbidden — audit 2026-07-18)."
+    )
 
 CHAT_MODELS = [
     {"label": "ND/qwen3.6-35b-a3b", "model": "qwen3.6-35b-a3b"},

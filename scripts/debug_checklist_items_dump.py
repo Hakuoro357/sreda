@@ -1,6 +1,8 @@
-"""Read-only debug: dump all checklist items for tg_634496616.
+"""Read-only debug: dump all checklist items для чек-листов инцидента 2026-04-28.
 
 Без UPDATE/DELETE — только чтение для диагностики рассинхрона.
+(Checklist-id'ы нечувствительны; tenant/user id здесь не храним —
+audit 2026-07-18.)
 """
 from sreda.db.session import get_db_session
 from sreda.db.models.checklists import ChecklistItem

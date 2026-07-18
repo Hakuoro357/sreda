@@ -36,7 +36,7 @@ os.environ.setdefault("SREDA_MIMO_API_KEY_FILE", str(_SEC / "mimo_api_key.txt"))
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 from langchain_core.messages import (  # noqa: E402
-    AIMessage, HumanMessage, SystemMessage, ToolMessage,
+    HumanMessage, SystemMessage, ToolMessage,
 )
 from langchain_core.tools import tool  # noqa: E402
 from langgraph.checkpoint.memory import InMemorySaver  # noqa: E402
@@ -51,7 +51,7 @@ from sreda.db.models.housewife import FamilyReminder  # noqa: E402
 from sreda.db.session import get_engine, get_session_factory  # noqa: E402
 from sreda.services.llm import get_chat_llm  # noqa: E402
 
-TENANT = "tenant_max_40921122"  # как у Бориса (реалистичный ключ)
+TENANT = "tenant_max_90000001"  # синтетический id (audit 2026-07-18: реальные id не коммитим)
 _MONTHS = ["", "января", "февраля", "марта", "апреля", "мая", "июня",
            "июля", "августа", "сентября", "октября", "ноября", "декабря"]
 
@@ -89,7 +89,7 @@ def _seed(session) -> None:
     session.add(Workspace(id="w1", tenant_id=TENANT, name="W"))
     session.flush()
     session.add(Assistant(id="a1", tenant_id=TENANT, workspace_id="w1", name="Sreda"))
-    session.add(User(id="u1", tenant_id=TENANT, telegram_account_id="352612382"))
+    session.add(User(id="u1", tenant_id=TENANT, telegram_account_id="900000001"))
     now = datetime.now(timezone.utc)
     for title, dt in [
         ("Разминка с гантелями утром", now + timedelta(days=1, hours=9)),
@@ -181,13 +181,14 @@ def handle_turn(graph, thread_id: str, user_text: str) -> str:
 
 
 def main() -> int:
-    get_engine.cache_clear(); get_session_factory.cache_clear()
+    get_engine.cache_clear()
+    get_session_factory.cache_clear()
     Base.metadata.create_all(get_engine())
     session = get_session_factory()()
     _seed(session)
 
     graph = build_react_graph(session)  # singleton (как процесс uvicorn)
-    thread = f"tg:{TENANT}:352612382"
+    thread = f"tg:{TENANT}:900000001"
 
     def _count():
         session.expire_all()

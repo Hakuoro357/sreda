@@ -1,21 +1,30 @@
-"""One-shot debug: dump checklists for tg_634496616.
+"""One-shot debug: dump checklists для тенанта.
 
-Используется для исследования рассинхрона в Mini App у этого юзера
-(2026-04-28). Не committable — артефакт расследования.
+Использовался для исследования рассинхрона в Mini App (инцидент 2026-04-28).
+Не committable — артефакт расследования.
+
+Tenant id — PII, НЕ коммитится (audit 2026-07-18): передаётся аргументом.
+
+Usage: python scripts/debug_checklists_dump.py <tenant_id>
 """
+import sys
+
 from sreda.db.session import get_db_session
 from sreda.db.models.checklists import Checklist, ChecklistItem
 
 
 def main() -> None:
+    if len(sys.argv) < 2 or not sys.argv[1].strip():
+        raise SystemExit("Usage: debug_checklists_dump.py <tenant_id>")
+    tenant_id = sys.argv[1].strip()
     sess = next(get_db_session())
     lists = (
         sess.query(Checklist)
-        .filter_by(tenant_id="tenant_tg_634496616")
+        .filter_by(tenant_id=tenant_id)
         .order_by(Checklist.created_at)
         .all()
     )
-    print(f"Found {len(lists)} checklists for tenant_tg_634496616")
+    print(f"Found {len(lists)} checklists for {tenant_id}")
     print()
     for cl in lists:
         print(f"id={cl.id}")
