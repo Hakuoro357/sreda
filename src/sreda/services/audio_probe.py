@@ -30,6 +30,7 @@ Errors handling rationale:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import subprocess
@@ -63,8 +64,14 @@ class FfprobeError(Exception):
 # воспроизведённому MAX-cap'у `_VOICE_MAX_BYTES`). Превышать смысла
 # нет — sandard MAX voice уже отбрасывается на download stage если
 # больше 1MB (~30s).
+#
+# Аудит 2026-07-18 (svc-features #10): кап 30s систематически ЗАНИЖАЛ
+# длительность для голосовых >30s (TG такие позволяет — 1MB-cap'а нет)
+# → недосписание voice_stt_seconds в money-path. Поднят до 300s (дневной
+# free-лимит): estimate и так conservative over-estimate (1500 B/s — низ
+# битрейта), а за сутки больше 300s free-юзеру всё равно не списать.
 _VOICE_BITRATE_BYTES_PER_SEC = 1500  # 12 kbps OGG/Opus voice (conservative)
-_BYTE_ESTIMATE_MAX_SEC = 30.0  # Free-tier per-voice ceiling
+_BYTE_ESTIMATE_MAX_SEC = 300.0  # = SREDA_FREE_VOICE_SECONDS_DAILY (free day cap)
 
 
 def ffprobe_duration(audio_bytes: bytes, *, timeout_sec: float = 10.0) -> float:
@@ -163,3 +170,21 @@ def ffprobe_duration(audio_bytes: bytes, *, timeout_sec: float = 10.0) -> float:
         )
 
     return duration
+
+
+async def probe_audio_async(audio_bytes: bytes, *, timeout_sec: float = 10.0) -> float:
+    """Async-обёртка над ``ffprobe_duration`` через ``asyncio.to_thread``.
+
+    Аудит 2026-07-18 (svc-features #2): синхронный ``ffprobe_duration`` —
+    blocking ``subprocess.run`` (hard cap ``timeout_sec``, дефолт 10 с);
+    вызов из async voice-хендлера кладёт event-loop на всё время probe
+    (стунор для параллельных ходов/напоминаний/доставки). Голос —
+    разговорный hot-path, латентность — главный констрейнт.
+
+    Контракт (межворкерный): inbound-воркер переводит call-site'ы
+    (``telegram_bot.py``, ``max_inbound.py``) на эту обёртку; семантика
+    и исключения (``FfprobeError``) — ровно как у синхронной версии.
+    """
+    return await asyncio.to_thread(
+        ffprobe_duration, audio_bytes, timeout_sec=timeout_sec
+    )

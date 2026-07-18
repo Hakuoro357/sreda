@@ -88,7 +88,9 @@ def _collect_field_validator_names(
     for fname, finfo in model.model_fields.items():
         annotation = finfo.annotation
         for nested_cls in _iter_nested_basemodel_types(annotation):
-            sub_prefix = f"{_prefix}{fname}." if not _prefix else f"{_prefix}{fname}."
+            # Audit 2026-07-18 MINOR: was a dead conditional — both
+            # ternary branches were identical (refactoring leftover).
+            sub_prefix = f"{_prefix}{fname}."
             paths.update(
                 _collect_field_validator_names(
                     nested_cls, _prefix=sub_prefix, _seen=_seen

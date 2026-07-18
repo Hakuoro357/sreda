@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import threading
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -40,6 +41,24 @@ from sreda.config.settings import Settings, get_settings
 logger = logging.getLogger(__name__)
 
 EMBEDDING_DIM_FAKE = 64
+
+# 2026-07-18 audit (llm-core MINOR #9b): раньше ``_embed`` создавал
+# ``httpx.Client`` на КАЖДЫЙ вызов — полный TCP/TLS-handshake на каждый
+# embed на recall hot-path. Shared client с пулом соединений снимает
+# стабильные десятки мс с хода. httpx.Client thread-safe; per-request
+# ``timeout=`` сохраняет per-instance конфигурацию. Живёт до конца
+# процесса (service lifetime), close не требуется.
+_SHARED_HTTP_CLIENT: httpx.Client | None = None
+_SHARED_HTTP_CLIENT_LOCK = threading.Lock()
+
+
+def _get_shared_http_client() -> httpx.Client:
+    global _SHARED_HTTP_CLIENT
+    if _SHARED_HTTP_CLIENT is None:
+        with _SHARED_HTTP_CLIENT_LOCK:
+            if _SHARED_HTTP_CLIENT is None:
+                _SHARED_HTTP_CLIENT = httpx.Client()
+    return _SHARED_HTTP_CLIENT
 
 # Canonical embedding-model name for stored vectors (recall-broadcast,
 # 2026-05-04). Recorded в `embedding_model` колонках для каждой записи —
@@ -103,16 +122,33 @@ class OpenAICompatEmbeddingClient:
             "Authorization": f"Bearer {self.api_key}",
         }
         payload = {"input": text, "model": self.model}
-        with httpx.Client(timeout=self.timeout_seconds) as client:
-            resp = client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+        client = _get_shared_http_client()
+        resp = client.post(
+            url, headers=headers, json=payload, timeout=self.timeout_seconds,
+        )
+        resp.raise_for_status()
+        data = resp.json()
         vectors = data.get("data") or []
         if not vectors or "embedding" not in vectors[0]:
+            # Тело ответа обрезаем: при глючном endpoint'е это могут быть
+            # мегабайты и/или эхо входного текста (ПД) в логах
+            # (аудит 2026-07-18, llm-core MINOR #9a).
             raise RuntimeError(
-                f"embeddings endpoint {url} returned unexpected body: {data!r}"
+                f"embeddings endpoint {url} returned unexpected body: "
+                f"{repr(data)[:500]}"
             )
-        return [float(x) for x in vectors[0]["embedding"]]
+        embedding = [float(x) for x in vectors[0]["embedding"]]
+        if len(embedding) != self.dim:
+            # Fail-fast на дрейф размерности (смена/мисконфиг модели на
+            # endpoint'е): вектор чужой размерности молча сохранился бы,
+            # cosine_similarity вернул бы 0.0 → тихая деградация recall —
+            # класс инцидента 2026-05-04 (аудит 2026-07-18, MINOR #8).
+            raise RuntimeError(
+                f"embeddings endpoint {url} returned dim={len(embedding)}, "
+                f"expected dim={self.dim} (model={self.model!r}) — "
+                f"refusing mismatched vector (recall would silently degrade)"
+            )
+        return embedding
 
 
 @dataclass

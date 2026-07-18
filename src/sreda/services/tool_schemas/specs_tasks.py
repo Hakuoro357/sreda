@@ -34,6 +34,7 @@ from sreda.services.tool_schemas.common import (
     ChecklistId,
     RecurrenceRule,
     TaskId,
+    TitleMatch,
 )
 from sreda.services.tool_schemas.housewife import (
     AddTaskOutput,
@@ -103,24 +104,6 @@ ScheduledDate = Annotated[
 """Task schedule slot: ``"today"`` / ``"tomorrow"`` / ``"inbox"`` /
 ISO ``YYYY-MM-DD``. Mirrors ``_parse_task_date`` semantics at
 housewife_chat_tools.py:1705-1722. Inbox means undated."""
-
-
-ListTasksDateFilter = Annotated[
-    str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=32),
-    AfterValidator(_validate_scheduled_date),  # accepts the same set
-]
-"""list_tasks accepts the same date tokens AS WELL AS ``"all"`` —
-covered below by a separate Literal-union for clarity."""
-
-
-ListTasksDateArg = Annotated[
-    str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=32),
-]
-"""list_tasks ``date`` field is union of schedule tokens + ``"all"``.
-We validate via a model-level validator instead of fighting two
-AfterValidator paths."""
 
 
 def _validate_list_tasks_date(value: str) -> str:
@@ -251,7 +234,7 @@ class ListTasksInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     date: ListTasksDate = "today"
     status: ListTasksStatus = "pending"
-    title_match: str | None = None
+    title_match: TitleMatch | None = None
     """#122: подстрока названия (регистр/ё неважны) — для «выполнена/
     отмени задачу X» используй date="all" + title_match, дальше .only."""
 

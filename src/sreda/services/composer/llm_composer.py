@@ -85,6 +85,7 @@ from sreda.services.llm import (
     LLMCallTimeout,
     get_chat_llm,
     invoke_with_per_call_timeout,
+    strip_reasoning_prefix,
 )
 
 
@@ -314,6 +315,14 @@ def make_llm_composer(
 
         # 6. Extract + guard against blank/unparseable
         text = _extract_text(response)
+        # Аудит 2026-07-18 (llm-core MINOR #7): скрабберы ReAct-префиксов
+        # («thought\n…»), утечек tool-синтаксиса и внутренних id раньше
+        # применялись только в legacy handlers (_sanitize_chat_reply).
+        # Planner-путь берёт текст композера как есть — скрабим на
+        # границе композера, чтобы покрыть ОБА потребителя. Скраб
+        # идёт ДО blank-check: если ответ целиком состоял из утечки,
+        # уходим в per-key fallback, а не шлём пустоту/артефакт.
+        text = strip_reasoning_prefix(text)
         if not text or not text.strip():
             raise ComposerEmptyOutput(
                 f"composer LLM returned blank/unparseable text for "

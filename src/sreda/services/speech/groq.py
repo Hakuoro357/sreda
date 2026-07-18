@@ -50,8 +50,9 @@ def _resolve_outbound_proxy() -> str | None:
 class GroqWhisperRecognizer:
     """Groq-hosted Whisper transcription over an OpenAI-compatible
     ``/audio/transcriptions`` route. ``model`` defaults to
-    ``whisper-large-v3-turbo`` — fastest at ~200x real-time with only
-    a minor quality gap vs plain ``whisper-large-v3``.
+    ``whisper-large-v3`` (see ``_DEFAULT_MODEL`` — full decoder; the
+    ``-turbo`` variant was rejected: weaker WER on foreign words and
+    code-switching in Russian speech).
     """
 
     def __init__(self, api_key: str, *, model: str = _DEFAULT_MODEL) -> None:
@@ -92,7 +93,27 @@ class GroqWhisperRecognizer:
         except httpx.RequestError as exc:
             logger.warning("Groq Whisper request error: %s", exc)
             raise SpeechRecognitionError("Groq Whisper request failed") from exc
+        except ValueError as exc:
+            # json.JSONDecodeError ⊂ ValueError: провайдер ответил не-JSON
+            # телом с HTTP 200 (самодельный SOCKS-туннель повышает шанс
+            # нестандартных тел). Обязаны остаться в контракте
+            # SpeechRecognitionError — иначе обходим fallback groq→yandex
+            # и refund квот (аудит 2026-07-18, llm-core MAJOR).
+            logger.warning("Groq Whisper invalid JSON body: %s", exc)
+            raise SpeechRecognitionError(
+                "Groq Whisper returned invalid JSON"
+            ) from exc
 
+        if not isinstance(payload, dict):
+            # JSON-список/скаляр вместо объекта — .get() бросил бы
+            # AttributeError вне контракта SpeechRecognitionError.
+            logger.warning(
+                "Groq Whisper unexpected payload type: %s",
+                type(payload).__name__,
+            )
+            raise SpeechRecognitionError(
+                "Groq Whisper returned unexpected payload shape"
+            )
         text = (payload.get("text") or "").strip()
         if not text:
             raise SpeechRecognitionError("Groq Whisper returned empty transcript")

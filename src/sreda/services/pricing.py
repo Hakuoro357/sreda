@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -47,7 +46,6 @@ def get_monthly_price_rub(
 
     from sreda.db.models.billing import SubscriptionPlan
 
-    price: int | None = None
     try:
         row = (
             session.query(SubscriptionPlan)
@@ -56,12 +54,16 @@ def get_monthly_price_rub(
             .order_by(SubscriptionPlan.price_rub.asc())
             .first()
         )
-        if row is not None:
-            price = int(row.price_rub or 0) or None
     except Exception:  # noqa: BLE001
+        # 2026-07-18 audit fix (#8): transient DB-ошибка НЕ кэшируется —
+        # раньше (now, None) ложилось в кэш на 60 с, и upsell-тексты минуту
+        # показывали fallback без цены из-за одного сбойного SELECT.
         logger.exception("pricing: fetch failed for feature_key=%s", feature_key)
-        price = None
+        return None
 
+    # 2026-07-18 audit fix (#8): цена 0 ₽ — валидное значение (бесплатный
+    # план), а не «цены нет». `or None` превращал sreda_free в None.
+    price = int(row.price_rub or 0) if row is not None else None
     _cache[feature_key] = (now, price)
     return price
 

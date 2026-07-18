@@ -32,6 +32,12 @@ logger = logging.getLogger(__name__)
 
 _CACHE_TTL = 60.0
 _cache_lock = threading.Lock()
+# Single-flight для самих фетчей (2026-07-18 audit #7): _cache_lock держится
+# только на чтение/запись dict, поэтому параллельные refresh'ы админки шли в
+# сеть пачкой — каждый /models-проба сам тратил тот rate-limit, который
+# измеряет. Отдельный lock: фетчи до ~50 с (5 провайдеров × timeout 10 с),
+# держать _cache_lock на это время нельзя (invalidate_cache бы висел).
+_fetch_lock = threading.Lock()
 _cache: dict[str, tuple[list["ProviderBalance"], float]] = {}
 
 
@@ -428,17 +434,29 @@ def fetch_balances(settings: Settings, *, force_refresh: bool = False) -> list[P
         if not force_refresh and hit is not None and (now - hit[1]) < _CACHE_TTL:
             return hit[0]
 
-    balances = [
-        _fetch_openrouter(settings),
-        _fetch_inception(settings),   # планировщик «Фредди» (#150 follow-up)
-        _fetch_mimo(settings),
-        _fetch_groq(settings),
-        _fetch_yandex(settings),      # STT + биллинг, реальный остаток ₽ (#229)
-    ]
+    # Single-flight: дедуплицируем параллельные refresh'ы админки. Проигравшие
+    # ждут победителя и забирают его свежий кэш (double-checked ниже).
+    with _fetch_lock:
+        with _cache_lock:
+            hit = _cache.get(cache_key)
+            if not force_refresh and hit is not None and (now - hit[1]) < _CACHE_TTL:
+                return hit[0]
 
-    with _cache_lock:
-        _cache[cache_key] = (balances, now)
-    return balances
+        balances = [
+            _fetch_openrouter(settings),
+            _fetch_inception(settings),   # планировщик «Фредди» (#150 follow-up)
+            _fetch_mimo(settings),
+            _fetch_groq(settings),
+            _fetch_yandex(settings),      # STT + биллинг, реальный остаток ₽ (#229)
+        ]
+
+        # 2026-07-18 audit fix (#7): метка кэша — ПОСЛЕ сетевых фетчей, а не
+        # до. Раньше запись ложилась почти протухшей (фетчи до ~50 с при TTL
+        # 60 с) и следующий refresh снова шёл в сеть.
+        fetched_at = time.monotonic()
+        with _cache_lock:
+            _cache[cache_key] = (balances, fetched_at)
+        return balances
 
 
 def invalidate_cache() -> None:

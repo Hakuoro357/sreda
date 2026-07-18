@@ -13,12 +13,14 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
 
 from sreda.db.models.admin_auth import AdminSession
 
 SESSION_TTL_HOURS = 24
+# last_seen_at трогаем не чаще, чем раз в N секунд — не писать на каждый запрос.
+_LAST_SEEN_TOUCH_SECONDS = 60
 
 
 def _utcnow() -> datetime:
@@ -70,6 +72,23 @@ def resolve_session(
         return None
     if _coerce_utc(row.expires_at) < now:
         return None
+    # audit-fix 2026-07-18 (svc-security MINOR #7): last_seen_at раньше
+    # писался только при mint — «последняя активность» была мёртвым весом.
+    # Обновляем троттлингом (не чаще _LAST_SEEN_TOUCH_SECONDS), чтобы не
+    # писать на каждый запрос. Commit — в стиле остальных хелперов модуля
+    # (admin-сессии request-scoped, resolve вызывается в начале запроса).
+    # Жёсткий 24h TTL с mint (без sliding) — осознанное упрощение, не меняем.
+    if row.last_seen_at is None or (
+        now - _coerce_utc(row.last_seen_at)
+        > timedelta(seconds=_LAST_SEEN_TOUCH_SECONDS)
+    ):
+        session.execute(
+            update(AdminSession)
+            .where(AdminSession.id == row.id)
+            .values(last_seen_at=now)
+        )
+        session.commit()
+        row.last_seen_at = now
     return row
 
 
@@ -113,6 +132,57 @@ class AdminLoginRateLimited(Exception):
     """С одного IP слишком много challenge'ей за окно."""
 
 
+def trusted_client_ip(
+    xff_header: str | None,
+    peer_host: str | None,
+    *,
+    behind_trusted_proxy: bool,
+) -> str | None:
+    """Client IP для rate-limit'а/логов (audit-fix 2026-07-18,
+    svc-security MINOR #5).
+
+    ``X-Forwarded-For`` — client-controlled заголовок: доверять ему можно
+    ТОЛЬКО когда приложение гарантированно за строгим ingress/proxy, который
+    ПЕРЕЗАПИСЫВАЕТ XFF своим значением. Иначе атакующий ротирует XFF и
+    обходит per-IP rate-limit (неограниченные challenge'и, рост таблицы
+    ``admin_login_challenges``). Вызывающий передаёт
+    ``behind_trusted_proxy=True`` только при таком deployment; при False
+    (или пустом XFF) используется непосредственный peer
+    (``request.client.host``).
+    """
+    if behind_trusted_proxy and xff_header:
+        first = xff_header.split(",")[0].strip()
+        if first:
+            return first
+    return peer_host or None
+
+
+def _rate_limit_lock_key(client_ip: str) -> int:
+    """Стабильный signed-64-bit ключ advisory-lock для rate-slot'а IP."""
+    digest = hashlib.sha256(
+        f"sreda-admin-login-rl:{client_ip}".encode()
+    ).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
+
+
+def _lock_rate_slot(session: Session, client_ip: str) -> None:
+    """Сериализация check-then-insert rate-limit'а (audit-fix 2026-07-18,
+    svc-security MINOR #5a): без лока конкурентный burst с одного IP
+    превышал ``_RATE_MAX`` (оба запроса видели count < max до insert).
+
+    На Postgres — ``pg_advisory_xact_lock`` по хешу IP: отпускается на
+    commit ``start_challenge`` (не требует отдельного unlock, переживает
+    ровно check+insert). На SQLite (тесты) — no-op: там конкурентности
+    нет, advisory-локов нет."""
+    bind = session.get_bind()
+    if bind is None or bind.dialect.name != "postgresql":
+        return
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(:k)"),
+        {"k": _rate_limit_lock_key(client_ip)},
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class StartChallengeResult:
     challenge_id: str          # публичный хендл (в deep-link)
@@ -132,9 +202,15 @@ def start_challenge(
     session: Session, client_ip: str | None, *, now: datetime | None = None
 ) -> StartChallengeResult:
     """GET /admin/login: создать pending challenge, вернуть публичный id +
-    секрет browser_bind (в куку) + human_code. Rate-limit по client_ip."""
+    секрет browser_bind (в куку) + human_code. Rate-limit по client_ip.
+
+    ``client_ip`` ДОЛЖЕН быть доверенным — см. ``trusted_client_ip``:
+    сырой XFF без trusted-proxy атакующий ротирует и обходит лимит."""
     now = now or _utcnow()
     if client_ip:
+        # Сначала сериализуем slot (Postgres; no-op на SQLite) — иначе
+        # check-count-then-insert не атомарен и burst превышает лимит.
+        _lock_rate_slot(session, client_ip)
         window_start = now - timedelta(minutes=_RATE_WINDOW_MINUTES)
         recent = session.execute(
             select(func.count(AdminLoginChallenge.id)).where(

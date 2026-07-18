@@ -409,7 +409,11 @@ async def _process_approved_turn_locked(
                         channel="telegram", provider_key=_prov2)
             if trace_ctx is not None:
                 trace.emit_block(trace_ctx)
-            _set_processing_status(bg_session, inbound_message_id, "processed")
+            # FC-1 (аудит 2026-07-18, cross-concurrency Н1): resume-ход,
+            # завершившийся внутренним сбоем (safe-fallback), НЕ помечаем
+            # processed — статус остаётся для unprocessed_inbound monitor'а.
+            if not getattr(_reply2, "had_internal_error", False):
+                _set_processing_status(bg_session, inbound_message_id, "processed")
             return
 
         # #166 голос на ReAct: для флагованного тенанта транскрибируем голос ДО
@@ -518,6 +522,11 @@ async def _process_approved_turn_locked(
                     enabled=True,
                 )
 
+        # FC-1 (аудит 2026-07-18, cross-concurrency Н1): успешность хода для
+        # условного post-turn commit'а «processed» (внизу функции). Legacy-путь
+        # бросает исключения наружу (дошли до конца == успех); react-путь
+        # сигналит внутренний сбой через ``_Reply.had_internal_error``.
+        _turn_ok = True
         try:
             # #66 ГЕЙТ-эксперимент: тенант из react_loop_enabled_tenants + текст →
             # новый LangGraph ReAct+interrupt-цикл (InMemory, single-process
@@ -580,7 +589,7 @@ async def _process_approved_turn_locked(
                     _ack_mid = await _send_initial_ack(
                         telegram_client, onboarding.chat_id)
                 _progress_task = (
-                    asyncio.create_task(
+                    _create_task(  # #133: через локальный шов (харнес патчит его)
                         _drive_ack_progress(
                             telegram_client, str(onboarding.chat_id), _ack_mid,
                         ),
@@ -612,6 +621,12 @@ async def _process_approved_turn_locked(
                             pass
                         except Exception:  # noqa: BLE001
                             pass
+                # FC-1 (аудит 2026-07-18, cross-concurrency Н1): react-ход,
+                # завершившийся внутренним сбоем (safe-fallback handle_turn),
+                # НЕ «processed» — статус остаётся для unprocessed_inbound
+                # monitor'а. getattr-default False: до появления флага
+                # ``had_internal_error`` в react_loop._Reply поведение прежнее.
+                _turn_ok = not getattr(_reply, "had_internal_error", False)
                 trace.record("react_loop.replied", chars=len(_reply or ""))
                 # #166 B: на да/нет-подтверждение вешаем inline-кнопки [Подтверждаю][Отменить] с id
                 # КОНКРЕТНОЙ паузы в callback_data (текст «да/нет» тоже работает — кнопки добавка).
@@ -708,7 +723,12 @@ async def _process_approved_turn_locked(
 
         # Reached only on the success path (no re-raise above). Mark
         # processed so the unprocessed_inbound monitor stays quiet.
-        _set_processing_status(bg_session, inbound_message_id, "processed")
+        # FC-1 (аудит 2026-07-18, cross-concurrency Н1): commit ТОЛЬКО при
+        # успешном ходе — react-ход с внутренним сбоем (safe-fallback) доходит
+        # сюда с _turn_ok=False; статус остаётся 'processing_started' и его
+        # подхватывает unprocessed_inbound probe вместо ложного «обработано».
+        if _turn_ok:
+            _set_processing_status(bg_session, inbound_message_id, "processed")
     except Exception:  # noqa: BLE001
         logger.exception("background turn processing crashed")
     finally:
@@ -851,6 +871,10 @@ _ADMIN_LOGIN_NEUTRAL_REPLY = (
 # module-level анти-спам для не-админов, дёргающих admin-команды (deny-throttle).
 _ADMIN_DENY_LAST: dict[str, float] = {}
 _ADMIN_DENY_WINDOW_SEC = 30.0
+# Аудит 2026-07-18 svc-inbound #7: cap на throttle-таблицу — без eviction
+# каждый новый tg_id, дёрнувший admin-префикс, оставался в памяти процесса
+# навсегда (медленная утечка на долгоживущем single-server процессе).
+_ADMIN_DENY_MAX_ENTRIES = 1024
 
 
 def _admin_deny_should_reply(tg_id: str, *, now: float | None = None) -> bool:
@@ -861,6 +885,19 @@ def _admin_deny_should_reply(tg_id: str, *, now: float | None = None) -> bool:
     last = _ADMIN_DENY_LAST.get(tg_id)
     if last is not None and (_now - last) < _ADMIN_DENY_WINDOW_SEC:
         return False
+    if len(_ADMIN_DENY_LAST) >= _ADMIN_DENY_MAX_ENTRIES:
+        # Eviction на капе: сначала протухшие (старше окна — всё равно
+        # бесполезны), при продолжающемся флуде свежих — самую старую запись
+        # (O(n) только на капе; холодный путь admin-deny).
+        stale = [
+            k for k, ts in _ADMIN_DENY_LAST.items()
+            if (_now - ts) >= _ADMIN_DENY_WINDOW_SEC
+        ]
+        for k in stale:
+            del _ADMIN_DENY_LAST[k]
+        if len(_ADMIN_DENY_LAST) >= _ADMIN_DENY_MAX_ENTRIES:
+            oldest = min(_ADMIN_DENY_LAST, key=_ADMIN_DENY_LAST.get)
+            del _ADMIN_DENY_LAST[oldest]
     _ADMIN_DENY_LAST[tg_id] = _now
     return True
 
@@ -1265,6 +1302,7 @@ async def handle_telegram_update(
             tenant_id=onboarding.tenant_id,
             channel="telegram",
             external_chat_id=str(onboarding.chat_id),
+            bot_key=bot_key,
         )
         enqueued_ok = False
         # #138 Ф5-5c (Codex high R4 / субагент MINOR): message_jobs — tenant RLS
@@ -1281,6 +1319,7 @@ async def handle_telegram_update(
                         thread_id=thread_key,
                         channel="telegram",
                         external_update_id=external_update_id,
+                        bot_key=bot_key,
                         message_payload={
                             "kind": "telegram_inbound",
                             "payload": payload,
@@ -1306,9 +1345,10 @@ async def handle_telegram_update(
             # but Codex follow-up (2026-05-25 MAJOR-3) flagged that as a
             # double-process risk: if INSERT did commit on this side AND
             # we fall to inline, the same inbound gets handled twice.
-            # Defensive: re-query (channel, external_update_id) — if a
-            # row already exists, the queue ate the message even though
-            # we got an exception, so we ack instead of double-handling.
+            # Defensive: re-query (channel, external_update_id, bot_key)
+            # — if a row already exists, the queue ate the message even
+            # though we got an exception, so we ack instead of
+            # double-handling.
             logger.exception(
                 "queue: enqueue failed for update_id=%s tenant=%s — "
                 "verifying whether the row landed before fallback",
@@ -1322,6 +1362,7 @@ async def handle_telegram_update(
                     _select(_MessageJob).where(
                         _MessageJob.channel == "telegram",
                         _MessageJob.external_update_id == external_update_id,
+                        _MessageJob.bot_key == bot_key,
                     )
                 ).scalar_one_or_none()
             if existing is not None:

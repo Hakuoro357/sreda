@@ -43,6 +43,7 @@ from sreda.services.tool_schemas.common import (
     RecurrenceRule,
     ReminderId,
     ShortStr,
+    TitleMatch,
     TriggerIso,
     validate_rrule_static,
     validate_rrule_with_trigger,
@@ -72,8 +73,9 @@ class ScheduleReminderInput(BaseModel):
       normalizes to UTC (offset-aware accepted; naive treated as
       UTC — see ``housewife_chat_tools.py:325-349``).
     - ``recurrence_rule``: optional ``RecurrenceRule`` — must start
-      with ``FREQ=``, single-line, ≤512. Runtime hands to
-      ``dateutil.rrule`` for full RFC-5545 validation.
+      with ``FREQ=``, single-line, ≤255 (cap matches the DB column
+      ``String(255)``). Runtime hands to ``dateutil.rrule`` for full
+      RFC-5545 validation.
 
     Codex Sub-A4 reminders R1 MAJOR #2 + #3: previously ``NonBlankStr``
     (unbounded, no shape constraint) — planner could emit huge or
@@ -109,7 +111,7 @@ class ListRemindersInput(BaseModel):
     #122: ``title_match`` — подстрока названия (регистр/ё неважны) для
     «отмени/перенеси напоминание про X» — дальше ``.only``."""
     model_config = ConfigDict(extra="forbid")
-    title_match: str | None = None
+    title_match: TitleMatch | None = None
 
 
 class UpdateReminderInput(BaseModel):

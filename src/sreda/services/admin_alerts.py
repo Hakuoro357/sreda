@@ -156,7 +156,12 @@ async def alert_admin_async(text: str) -> bool:
                 return True
             logger.warning("alert_admin: MAX failed, falling back to Telegram")
         except Exception as exc:  # noqa: BLE001
-            logger.warning("alert_admin: MAX exception: %s, fallback to TG", exc)
+            # SECURITY: только класс исключения (см. политику _post_*_sync —
+            # repr ошибки может нести URL с chat_id — PII в логах).
+            logger.warning(
+                "alert_admin: MAX exception: %s, fallback to TG",
+                type(exc).__name__,
+            )
 
     # Fallback (or primary if MAX unconfigured) — Telegram.
     if tg_ok:
@@ -168,9 +173,11 @@ async def alert_admin_async(text: str) -> bool:
                 logger.info("alert_admin: delivered via Telegram")
                 return True
         except Exception as exc:  # noqa: BLE001
+            # SECURITY: без chat_id (ПД-личный id чата владельца) и без
+            # repr(exc) — PII/URL в логах (см. политику _post_*_sync).
             logger.warning(
-                "alert_admin: Telegram exception (chat=%s): %s",
-                tg_chat_id, exc,
+                "alert_admin: Telegram exception: %s",
+                type(exc).__name__,
             )
 
     logger.warning("alert_admin: delivery failed across all channels")
@@ -354,8 +361,16 @@ def _post_max_sync(bot_token: str, chat_id: str, text: str) -> bool:
             resp.status_code, resp.text[:200],
         )
         return False
-    except Exception:  # noqa: BLE001 — must never crash caller
-        logger.exception("admin_alerts: MAX POST failed")
+    except Exception as exc:  # noqa: BLE001 — must never crash caller
+        # SECURITY (audit-fix 2026-07-18, svc-ops MINOR #8 — зеркало
+        # Telegram-ветки выше): логируем ТОЛЬКО класс исключения.
+        # logger.exception() печатал бы traceback + repr httpx-ошибки, а
+        # в него встраивается request URL с ``chat_id`` в query-string
+        # (ПД-личный id чата владельца) — PII в логах. Токен здесь в
+        # Authorization-header (в repr не попадает), но chat_id — попадает.
+        logger.warning(
+            "admin_alerts: MAX POST failed: %s", type(exc).__name__
+        )
         return False
 
 

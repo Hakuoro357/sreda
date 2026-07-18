@@ -90,6 +90,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 
@@ -105,25 +106,84 @@ _logger = logging.getLogger(__name__)
 _fallback_warned = False
 
 
+def _resolve_primary_key_material() -> str:
+    """Raw key material для dedup-HMAC (audit-fix 2026-07-18).
+
+    Порядок: 1) ``os.environ["SREDA_ENCRYPTION_KEY"]``, 2)
+    ``settings.encryption_key``. Env — первым сознательно: ``get_settings``
+    lru_cached, поэтому (а) тесты monkeypatch'ят env и ждут немедленного
+    эффекта, (б) prod-деплой всё равно передаёт ключ именно через этот env
+    var — settings читает его же, значения совпадают. ``encryption_key_id``
+    и ``encryption_legacy_keys`` при этом берутся ИЗ settings (см.
+    ``_get_legacy_hmac_keys``) — ротационная механика через get_settings
+    сохранена (svc-ops MINOR #4).
+    """
+    raw = os.environ.get("SREDA_ENCRYPTION_KEY", "")
+    if raw:
+        return raw
+    try:
+        from sreda.config.settings import get_settings
+
+        return get_settings().encryption_key or ""
+    except Exception:  # noqa: BLE001 — settings недоступны (утилиты) → пусто
+        return ""
+
+
 def _get_hmac_key() -> bytes:
-    """Resolve the HMAC secret for normalized_title_hash.
+    """Resolve the primary HMAC secret for normalized_title_hash.
 
     Preference order:
-      1. ``SREDA_ENCRYPTION_KEY`` env var (the same key that's used for
-         ``EncryptedString`` at-rest encryption; safe to reuse — HMAC
-         and Fernet have non-overlapping domains).
+      1. ``SREDA_ENCRYPTION_KEY`` env var, затем ``settings.encryption_key``
+         (тот же ключ, что у ``EncryptedString`` at-rest encryption; safe to
+         reuse — HMAC и Fernet имеют non-overlapping domains). Порядок
+         env→settings — см. ``_resolve_primary_key_material``.
       2. Empty bytes → fall back to plain SHA-256 in development /
          test environments where the key isn't set. Logs a warning
-         once via the caller; we don't import logging here to keep
-         the module dependency-free.
+         once via the caller.
 
     Codex Sub-A10 R1 MAJOR #4 — Production code paths that compute
     this hash MUST have the env var configured; missing key produces
     a usable-but-weaker hash that's still safe for SQL equality
     lookups, just dictionary-attackable.
+
+    Ротация (audit-fix 2026-07-18): хеш привязан к key material, поэтому
+    смена ``SREDA_ENCRYPTION_KEY`` молча меняет ВСЕ новые хеши — старые
+    строки перестанут находиться lookup'ами. Механика: старый ключ
+    переносится в ``SREDA_ENCRYPTION_LEGACY_KEYS`` (``{"key_id": raw}``),
+    а lookup-site'ы используют ``compute_normalized_title_hash_candidates``
+    (primary + legacy) вместо одиночного хеша. Текущий ``encryption_key_id``
+    виден в логе fallback'а/доступен через settings для диагностики.
     """
-    raw = os.environ.get("SREDA_ENCRYPTION_KEY", "")
-    return raw.encode("utf-8")
+    return _resolve_primary_key_material().encode("utf-8")
+
+
+def _get_legacy_hmac_keys() -> list[tuple[str, bytes]]:
+    """``(key_id, raw_key)`` из ``SREDA_ENCRYPTION_LEGACY_KEYS`` — кандидаты
+    для lookup при ротации. Пустой список, если ротация не настроена.
+    Raw-bytes (НЕ normalized 32-byte, как в encryption.py): исторические
+    dedup-хеши считались HMAC'ом от raw env-строки — совпадаем с ними."""
+    try:
+        from sreda.config.settings import get_settings
+
+        raw_map = get_settings().encryption_legacy_keys
+    except Exception:  # noqa: BLE001 — settings недоступны → нет legacy
+        return []
+    if not raw_map:
+        return []
+    try:
+        legacy = json.loads(raw_map)
+    except ValueError:
+        _logger.error(
+            "operation_id: SREDA_ENCRYPTION_LEGACY_KEYS is not valid JSON — "
+            "legacy dedup-hash candidates unavailable"
+        )
+        return []
+    keys: list[tuple[str, bytes]] = []
+    if isinstance(legacy, dict):
+        for kid, material in legacy.items():
+            if isinstance(material, str) and material:
+                keys.append((str(kid), material.encode("utf-8")))
+    return keys
 
 
 def compute_operation_id_create(
@@ -199,23 +259,13 @@ def compute_normalized_title_hash(
     normalized = normalize_for_dedup(title)
     if not normalized:
         return ""
-    # Use \x1f (Unit Separator) between fields so values containing
-    # ``|`` / ``:`` / spaces can't cross boundaries.
-    sep = "\x1f"
-    fields = [
-        f"v{NORMALIZATION_VERSION}",
-        entity_type,
-        tenant_id,
-        user_id,
-        normalized,
-    ]
-    # #163 Фаза 2а: time-aware семантический ключ (для напоминаний trigger+rrule, для задач
-    # date+time). Аппендим ТОЛЬКО если extra непуст → хеш title-only вызывающих (shopping) НЕ
-    # меняется (обратная совместимость; иначе сдвинулись бы существующие dedup-хеши).
-    if extra:
-        fields.append(extra)
-    payload = sep.join(fields)
-    msg = payload.encode("utf-8")
+    msg = _dedup_payload(
+        entity_type=entity_type,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        normalized=normalized,
+        extra=extra,
+    )
     key = _get_hmac_key()
     if key:
         return hmac.new(key, msg, hashlib.sha256).hexdigest()
@@ -234,7 +284,83 @@ def compute_normalized_title_hash(
     return hashlib.sha256(msg).hexdigest()
 
 
+def _dedup_payload(
+    *,
+    entity_type: str,
+    tenant_id: str,
+    user_id: str,
+    normalized: str,
+    extra: str,
+) -> bytes:
+    """Scoped payload для dedup-хеша (общий для primary/legacy кандидатов)."""
+    # Use \x1f (Unit Separator) between fields so values containing
+    # ``|`` / ``:`` / spaces can't cross boundaries.
+    sep = "\x1f"
+    fields = [
+        f"v{NORMALIZATION_VERSION}",
+        entity_type,
+        tenant_id,
+        user_id,
+        normalized,
+    ]
+    # #163 Фаза 2а: time-aware семантический ключ (для напоминаний trigger+rrule, для задач
+    # date+time). Аппендим ТОЛЬКО если extra непуст → хеш title-only вызывающих (shopping) НЕ
+    # меняется (обратная совместимость; иначе сдвинулись бы существующие dedup-хеши).
+    if extra:
+        fields.append(extra)
+    return sep.join(fields).encode("utf-8")
+
+
+def compute_normalized_title_hash_candidates(
+    title: str,
+    *,
+    entity_type: str = "",
+    tenant_id: str = "",
+    user_id: str = "",
+    extra: str = "",
+) -> list[str]:
+    """Хеши-кандидаты для LOOKUP при ротации ключа (audit-fix 2026-07-18).
+
+    Первый элемент — текущий primary-хеш (ровно тот, что возвращает
+    ``compute_normalized_title_hash`` и что пишется в новые строки); далее —
+    хеши под каждым legacy-ключом из ``SREDA_ENCRYPTION_LEGACY_KEYS``
+    (``{"key_id": raw}``). Без настроенной ротации список одноэлементный —
+    поведение совпадает с одиночным хешем.
+
+    Lookup-site'ы (``WHERE normalized_title_hash = ?``) при ротации должны
+    матчить по ``IN (candidates)``: иначе после смены
+    ``SREDA_ENCRYPTION_KEY`` строки, записанные под старым ключом, перестанут
+    находиться — тихая деградация semantic-dedup (svc-ops MINOR #4).
+    """
+    normalized = normalize_for_dedup(title)
+    if not normalized:
+        return []
+    primary = compute_normalized_title_hash(
+        title,
+        entity_type=entity_type,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        extra=extra,
+    )
+    out = [primary]
+    seen = {primary}
+    msg = _dedup_payload(
+        entity_type=entity_type,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        normalized=normalized,
+        extra=extra,
+    )
+    for _key_id, legacy_key in _get_legacy_hmac_keys():
+        digest = hmac.new(legacy_key, msg, hashlib.sha256).hexdigest()
+        if digest not in seen:
+            seen.add(digest)
+            out.append(digest)
+    return out
+
+
 __all__ = [
+    "compute_normalized_title_hash_candidates",
     "compute_operation_id_create",
     "compute_operation_id_update",
     "compute_normalized_title_hash",

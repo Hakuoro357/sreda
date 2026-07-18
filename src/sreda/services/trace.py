@@ -261,9 +261,7 @@ def deserialize_from_outbox(payload_trace: dict[str, Any]) -> TraceContext:
         channel=str(payload_trace.get("channel") or "telegram"),
         started_at=_parse_iso_utc(payload_trace.get("started_at")),
         # Monotonic clocks are per-process — once crossed, we can't resume
-        # them. Anchor at 0 so any new events written to this context in
-        # the worker land AFTER the last event (which still has its
-        # original at_ms from the uvicorn side).
+        # them. Placeholder; re-anchored below after events are rebuilt.
         started_monotonic=time.monotonic(),
         # #140: переносим исход хода (поломка), иначе воркер затрёт его 'ok'.
         outcome=str(payload_trace.get("outcome") or "ok"),
@@ -277,6 +275,14 @@ def deserialize_from_outbox(payload_trace: dict[str, Any]) -> TraceContext:
                 meta=dict(raw.get("meta") or {}),
             )
         )
+    # audit-fix 2026-07-18 (svc-ops MINOR #2): re-anchor так, чтобы новое
+    # событие воркера (``outbox.delivered``) легло сразу ПОСЛЕ последнего
+    # десериализованного (last_at_ms + реально прошедшее время), а не на
+    # ≈0 ms — раньше ``started_monotonic = time.monotonic()`` давал финальному
+    # событию at_ms≈0 и в блоке трейса оно рендерилось «0ms outbox.delivered»
+    # ДО событий uvicorn-процесса, ломая хронологию разбора латентности.
+    last_at_ms = max((e.at_ms for e in ctx.events), default=0)
+    ctx.started_monotonic = time.monotonic() - (last_at_ms / 1000.0)
     return ctx
 
 

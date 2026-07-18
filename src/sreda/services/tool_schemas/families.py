@@ -410,9 +410,10 @@ that the planner might mistake for a family name.
 # ---------------------------------------------------------------------------
 # Tool family manifest — every implemented tool name → exactly one family.
 # Source: ``plans/mellow-discovering-conway.md`` section "Реестр
-# инструментов". Total 55 implemented tools.
+# инструментов". Total 60 implemented tools (56 with plan-execute
+# ToolSpec + 4 REACT_ONLY_TOOLS).
 # Codex R1 MAJOR #4 — proves taxonomy completeness against the real
-# 55-tool universe before any ToolSpec is migrated to declare family.
+# tool universe before any ToolSpec is migrated to declare family.
 # Codex Sub-A4 recipes R1 MAJOR #6: ``get_recipe_any_source``
 # (architecture-map TODO-2) is intentionally NOT in this manifest
 # until the runtime function ships — restore in the commit that adds
@@ -636,6 +637,13 @@ def _validate_tool_op_metadata() -> None:
     for n in _TOOL_WRITE_DOMAIN_OVERRIDES:
         if TOOL_OP_CLASS[n] != "write":
             raise RuntimeError(f"write-override для не-write инструмента: {n!r} ({TOOL_OP_CLASS[n]})")
+    # Audit 2026-07-18 MINOR: REACT_ONLY_TOOLS ⊆ манифест. Опечатка там
+    # не сломала бы прод (имя всплывёт как missing в
+    # ``assert_manifest_matches_specs``), но тихо расширила бы
+    # exclusion-set — ловим на import-time, как остальные рассинхроны.
+    unknown_react_only = sorted(set(REACT_ONLY_TOOLS) - set(TOOL_FAMILY_MANIFEST))
+    if unknown_react_only:
+        raise RuntimeError(f"REACT_ONLY_TOOLS вне манифеста: {unknown_react_only}")
     # R1-ревью MINOR: токены доменов в оверрайдах — реальные семьи (опечатка «shoping» иначе = тихий fail-closed).
     bad_tokens = {tok for vals in (*_TOOL_READ_DOMAIN_OVERRIDES.values(), *_TOOL_WRITE_DOMAIN_OVERRIDES.values())
                   for tok in vals if tok not in FAMILIES}

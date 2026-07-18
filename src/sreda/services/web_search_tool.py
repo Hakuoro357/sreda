@@ -128,7 +128,6 @@ def _extract_article(html_text: str) -> tuple[str, str]:
 
 _TAVILY_URL = "https://api.tavily.com/search"
 _TAVILY_TIMEOUT_SECONDS = 8.0
-_QUOTA_EXHAUSTED_MSG = "error: Достигнут лимит поиска"
 
 # Машинный статус для free-исчерпания per-user (LLM формулирует апсейл).
 # Форма как у no-results/error — `error:<machine_code>:<copy>` (#200 Фаза 1).
@@ -141,6 +140,17 @@ _FREE_QUOTA_EXHAUSTED_MSG = (
 _WEB_SEARCH_UNAVAILABLE_MSG = (
     "error: веб-поиск временно недоступен, попробуйте позже"
 )
+
+
+def _query_log_ref(query: str) -> str:
+    """PII-safe ref запроса для WARNING-логов.
+
+    Аудит 2026-07-18 (svc-features #8 / cross-security П4): сырой поисковый
+    запрос — персональный след (медицина, адреса, финансы) и при хэшировании
+    chat_id в БД (152-ФЗ) не должен открыто храниться в логах. Логируем
+    только длину — для диагностики провайдерских сбоев контент не нужен.
+    """
+    return f"len={len((query or '').strip())}"
 
 
 def _format_results(items: list[tuple[str, str, str]]) -> str:
@@ -187,12 +197,12 @@ def _call_tavily(query: str, api_key: str) -> list[tuple[str, str, str]] | None:
         data = r.json()
     except httpx.HTTPStatusError as exc:
         logger.warning(
-            "tavily search HTTP %s for %r: %s",
-            exc.response.status_code, query, exc,
+            "tavily search HTTP %s (query %s): %s",
+            exc.response.status_code, _query_log_ref(query), exc,
         )
         return None
     except (httpx.HTTPError, ValueError) as exc:
-        logger.warning("tavily search failed for %r: %s", query, exc)
+        logger.warning("tavily search failed (query %s): %s", _query_log_ref(query), exc)
         return None
     results = data.get("results") or []
     return [
@@ -218,7 +228,7 @@ def _call_ddg_fallback(query: str) -> list[tuple[str, str, str]] | None:
                 query, region=_REGION, max_results=_MAX_RESULTS, backend="api",
             ))
     except Exception as exc:  # noqa: BLE001
-        logger.warning("ddg fallback failed for %r: %s", query, exc)
+        logger.warning("ddg fallback failed (query %s): %s", _query_log_ref(query), exc)
         return None
 
     return [
@@ -424,7 +434,10 @@ def _ddg_fallback(
     """
     results = _call_ddg_fallback(q)
     if results is None:
-        return _QUOTA_EXHAUSTED_MSG
+        # Аудит 2026-07-18 (svc-features #7): DDG недоступен/не установлен —
+        # ТРАНЗИЕНТНЫЙ фейл сети/пакета, а не исчерпание лимита. Старая копия
+        # «Достигнут лимит поиска» вела к ложным апсейлам от LLM.
+        return _WEB_SEARCH_UNAVAILABLE_MSG
     if session is not None and tenant_id and user_id:
         try:
             from sreda.services.web_search_usage import WebSearchUsageCounter

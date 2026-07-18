@@ -1,4 +1,4 @@
-"""Tool output schemas + parsers for top-5 housewife tools (Sub-A4, Epic #74).
+"""Tool output schemas + parsers for the housewife tool registry (Sub-A4, Epic #74).
 
 Wraps legacy ``str`` outputs from ``services/housewife_chat_tools.py`` into
 typed pydantic discriminated unions the planner / validator / executor
@@ -11,16 +11,9 @@ Unknown patterns return ``ToolOutputContractViolation`` (the executor
 halts the plan and writes to ``planner_gaps(gap_type='contract_violation')``
 per Group 6.5 — fail-closed, no silent acceptance).
 
-Top-5 chosen per Sub-A4 issue and frequency in production traces:
-
-  add_shopping_items   most-used write — driver of the recipe pipeline
-  schedule_reminder    most-used reminder write
-  list_shopping        most-used read
-  list_reminders       second most-used read
-  get_recipe           recipe-read driver for cooking flow
-
-Other 50 tools migrate in subsequent commits — wrapper falls through
-to ``raw_text`` pass-through until each has a parser registered.
+Sub-A4 is complete: 56 parsers registered in ``PARSERS`` (one per
+migrated ToolSpec; the 60-tool manifest also carries 4 ReAct-only
+tools without a plan-execute spec — see ``families.REACT_ONLY_TOOLS``).
 """
 
 from __future__ import annotations
@@ -40,7 +33,11 @@ from pydantic import (
 )
 
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
-from sreda.services.tool_schemas.display_summary import build_display_summary, sanitize_name
+from sreda.services.tool_schemas.display_summary import (
+    MAX_NAMES,
+    build_display_summary,
+    sanitize_name,
+)
 from sreda.services.tool_schemas.tool_ok_codec import (
     ToolOkParseError,
     is_okv2,
@@ -547,7 +544,18 @@ class ScheduleReminderScheduled(BaseModel):
     reminder_id: ReminderId
     """Codex R2 MAJOR #4: was ``str(min_length=1)`` — accepted any
     non-empty token. Now uses the tight ``rem_<24 hex>`` pattern."""
-    trigger_at_iso: str = Field(min_length=1)
+    trigger_at_iso: TriggerIso
+    """Audit 2026-07-18 MINOR: was ``str(min_length=1)`` — a malformed
+    legacy output like ``ok:scheduled:rem_<24hex>:garbage`` would have
+    surfaced as typed success. Now uses ``TriggerIso`` (ISO-shape regex
+    + ≤64 chars), same alias as ``UpdateReminderOk.next_trigger_at_iso``.
+    Live emission is always ``<aware UTC datetime>.isoformat()``
+    (housewife_chat_tools.py — ``DateTime(timezone=True)`` column), so
+    the tighten only affects the legacy path; the parser catches the
+    ValidationError and routes to ``ToolOutputContractViolation``
+    (fail-closed). ``ScheduleReminderSkippedPast.trigger_at_iso``
+    intentionally stays loose: legacy echoes the RAW planner-supplied
+    trigger_iso there (may be naive/short ISO)."""
 
 
 class ScheduleReminderSkippedPast(BaseModel):
@@ -4076,8 +4084,13 @@ class ListChecklistItemsOk(BaseModel):
         # #141: id-free, РАЗЛИЧИМЫЕ метки — каждый пункт показываем как
         # «пункт» в списке «список», чтобы юзер мог выбрать ровно один,
         # когда совпадений несколько (фильтр-оставить-всех, не top-1).
-        # Через build_display_summary: пользовательские части (title/list_title)
-        # сами оборачиваем в «» (sanitize_name), метка статична.
+        # Audit 2026-07-18 MINOR: build_display_summary здесь НЕ
+        # используем — его name-path прогоняет sanitize_name повторно
+        # и стирает внутренние «»-границы (комментарий обещал их
+        # сохранение). Рендерим вручную: обе пользовательские части
+        # уже санитизированы (« » вырезаны sanitize_name — границу
+        # подделать нельзя), метка статична. Cap + «и ещё N» повторяют
+        # контракт builder'а; порядок ввода сохраняется (preserve_order).
         _MARK = {"done": " ✓", "cancelled": " ✗"}
         labels: list[str] = []
         seen: dict[str, int] = {}
@@ -4096,8 +4109,11 @@ class ListChecklistItemsOk(BaseModel):
             else:
                 seen[base] = 1
             labels.append(base)
-        return build_display_summary(
-            [("Пункты", labels)], preserve_order=True)
+        shown = labels[:MAX_NAMES]
+        rendered = ", ".join(shown)
+        if len(labels) > MAX_NAMES:
+            rendered += f" и ещё {len(labels) - MAX_NAMES}"
+        return f"Пункты: {rendered}."
 
 
 ListChecklistItemsOutput = Annotated[

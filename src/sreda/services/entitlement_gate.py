@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -71,9 +72,17 @@ class EntitlementGate:
 
     def check(self, tenant_id: str) -> GateResult:
         """Two-step query: prefer active, fallback к suspended."""
-        # Step 1: active sub (max 1 per partial unique index 0042)
+        # Step 1: active sub (max 1 per partial unique index 0042).
+        # 2026-07-18 audit fix: окно подписки проверяется ЯВНО — раньше гейт
+        # смотрел только status='active', и подписка с истёкшим active_until
+        # давала доступ бессрочно (свипера истёкших в системе нет — см.
+        # BillingService.sweep_expired_subscriptions). Контракт окна =
+        # billing._is_subscription_active: quantity>0 И active_until в будущем;
+        # active_until IS NULL = бессрочная (auto-grant sreda_free,
+        # onboarding.py). Сравнение — в Python: SQLite хранит naive-строки,
+        # сырое SQL-сравнение с aware-datetime было бы диалект-зависимым.
         row = self.session.execute(text("""
-            SELECT sp.plan_key, ts.grandfathered_at
+            SELECT sp.plan_key, ts.grandfathered_at, ts.active_until, ts.quantity
             FROM tenant_subscriptions ts
             JOIN subscription_plans sp ON ts.plan_id = sp.id
             WHERE ts.tenant_id = :t
@@ -81,7 +90,7 @@ class EntitlementGate:
               AND ts.status = 'active'
             LIMIT 1
         """), {"t": tenant_id, "f": self.FEATURE_KEY}).first()
-        if row:
+        if row and self._within_active_window(row.active_until, row.quantity):
             return GateResult(
                 allowed=True,
                 reason="ok",
@@ -111,3 +120,24 @@ class EntitlementGate:
             tenant_id, self.FEATURE_KEY,
         )
         return GateResult(allowed=False, reason="no_active_subscription")
+
+    @staticmethod
+    def _within_active_window(active_until: datetime | None, quantity: int | None) -> bool:
+        """Окно действия подписки (контракт billing._is_subscription_active).
+
+        quantity<=0 — подписка фактически выключена. active_until IS NULL —
+        бессрочная (auto-grant бесплатных планов). Истёкший active_until —
+        не активна, даже если status='active' (свипер мог ещё не дойти).
+        """
+        if not quantity or quantity <= 0:
+            return False
+        if active_until is None:
+            return True
+        if isinstance(active_until, str):
+            # Сырой text()-SQL: SQLite отдаёт DATETIME строкой («YYYY-MM-DD
+            # HH:MM:SS.ffffff»), PG — datetime'ом. Парсим дефенсивно.
+            active_until = datetime.fromisoformat(active_until)
+        if active_until.tzinfo is None:
+            # SQLite возвращает naive — хранимое значение UTC.
+            active_until = active_until.replace(tzinfo=timezone.utc)
+        return active_until > datetime.now(timezone.utc)

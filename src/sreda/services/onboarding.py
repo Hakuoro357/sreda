@@ -314,8 +314,24 @@ def _serve_existing_bundle_reads(
             .first()
             is not None
         )
+        # Аудит 2026-07-18 (svc-features #9): была ли ЯВНАЯ отмена юзером
+        # (billing cancel → status="cancelled"). Отличает opt-out от
+        # paid→expired (status="expired") и legacy no-sub.
+        has_cancelled_sub = (
+            ts.query(TenantSubscription)
+            .filter(
+                TenantSubscription.tenant_id == tid,
+                TenantSubscription.feature_key == "housewife_assistant",
+                TenantSubscription.status == "cancelled",
+            )
+            .first()
+            is not None
+        )
     # Репаир pending/no-sub — редкий legacy-случай (тенанты до approved_at-в-INSERT).
-    if resolved.approved_at is None or not has_active_sub:
+    # Аудит 2026-07-18 (svc-features #9): НЕ пересоздаём подписку молча после явной
+    # отмены юзером — следующий inbound раньше молча ре-грантил sreda_free, отменяя
+    # волю юзера. paid→expired fallback (status="expired") сохраняется.
+    if (resolved.approved_at is None or not has_active_sub) and not has_cancelled_sub:
         with privileged_session("admin") as ps:
             _auto_approve_and_grant_free_tier(ps, tid)
     return workspace_id, assistant_id, effective_max_chat_id

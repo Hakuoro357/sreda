@@ -395,7 +395,13 @@ class HousewifeRecipeService:
             if source not in RECIPE_SOURCES:
                 result.invalid.append(title)  # #115: nameable validation drop
                 continue
-            servings = max(1, int(raw.get("servings") or 2))
+            # Tolerant servings parse (audit 2026-07-18 MAJOR): LLM шлёт мусор
+            # («4 порции», dict, …) — ValueError/TypeError из середины цикла убивал
+            # ВЕСЬ batch. Дефолт 2, как и у `or 2` (эталон — ctm-парсинг ниже).
+            try:
+                servings = max(1, int(raw.get("servings") or 2))
+            except (ValueError, TypeError):
+                servings = 2
 
             normal_key = _normalise_title(title)
 
@@ -496,21 +502,35 @@ class HousewifeRecipeService:
                 operation_id=op_id_value,  # #202: key-policy (ctx) / None (легаси)
                 normalized_title_hash=nhash_value,
             )
-            self.session.add(recipe)
-            self.session.flush()
-
-            for idx, ing in enumerate(normalised_ings):
-                self.session.add(
-                    RecipeIngredient(
-                        id=f"ring_{uuid4().hex[:20]}",
-                        recipe_id=recipe.id,
-                        tenant_id=recipe.tenant_id,  # #138 Ф3-a: денорм из родителя
-                        title=ing.title,
-                        quantity_text=ing.quantity_text,
-                        is_optional=ing.is_optional,
-                        sort_order=idx,
-                    )
+            try:
+                # SAVEPOINT на элемент (audit 2026-07-18 MAJOR; эталон —
+                # begin_nested в housewife_shopping.add_items): IntegrityError на
+                # flush одного рецепта откатывает ТОЛЬКО его savepoint — остальной
+                # batch и общая сессия хода остаются целы (docstring: один мусорный
+                # элемент не должен ронять весь batch).
+                with self.session.begin_nested():
+                    self.session.add(recipe)
+                    for idx, ing in enumerate(normalised_ings):
+                        self.session.add(
+                            RecipeIngredient(
+                                id=f"ring_{uuid4().hex[:20]}",
+                                recipe_id=recipe.id,
+                                tenant_id=recipe.tenant_id,  # #138 Ф3-a: денорм из родителя
+                                title=ing.title,
+                                quantity_text=ing.quantity_text,
+                                is_optional=ing.is_optional,
+                                sort_order=idx,
+                            )
+                        )
+                    self.session.flush()
+            except IntegrityError:
+                logger.warning(
+                    "save_recipes_batch: flush failed tenant=%s user=%s "
+                    "title=%r — item skipped, batch continues",
+                    tenant_id, user_id, title,
                 )
+                result.invalid.append(title)  # #115: nameable drop
+                continue
             result.created.append(recipe)
             # Keep index current so later items in this batch see the
             # newly-inserted row (further in-batch dup protection).

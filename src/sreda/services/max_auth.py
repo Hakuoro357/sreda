@@ -129,6 +129,13 @@ def validate_max_init_data(
     except ValueError as exc:
         raise MaxInitDataError("invalid auth_date") from exc
     age = time.time() - auth_date
+    # audit-fix 2026-07-18 (svc-security MINOR #3, зеркало telegram_auth):
+    # auth_date ИЗ БУДУЩЕГО (отрицательный age) раньше проходил freshness-
+    # гейт бессрочно. Допускаем лишь небольшой clock skew клиента (300s).
+    if age < -300:
+        raise MaxInitDataError(
+            f"initData auth_date in future ({int(-age)}s ahead)"
+        )
     if age > max_age_seconds:
         raise MaxInitDataError(
             f"initData expired ({int(age)}s > {max_age_seconds}s)"

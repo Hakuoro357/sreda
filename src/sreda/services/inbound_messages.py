@@ -77,10 +77,32 @@ def persist_telegram_inbound_event(
         if workspace is not None:
             workspace_id = workspace.id
 
+    update_id = _extract_update_id(payload)
+
+    # M8: idempotency — if we already persisted an inbound message for
+    # this (channel_type, bot_key, update_id) triple, return the existing
+    # record instead of creating a duplicate.  Keying on the triple (not
+    # just update_id) prevents cross-bot collisions: Telegram update_id
+    # counters are independent per-bot, so bot-A's update 42 and bot-B's
+    # update 42 are distinct events.
+    #
+    # Аудит 2026-07-18 svc-inbound #2: dedup-проверка ДО создания SecureRecord
+    # (зеркало MAX-версии ниже — «не платим encryption на duplicate retries»).
+    # Иначе каждый retry/ределивери (long-poll crash-loop, webhook retry)
+    # добавлял сиротскую зашифрованную PII-строку без привязки к inbound.
+    if update_id is not None:
+        existing = _find_duplicate_inbound(session, "telegram", bot_key, update_id)
+        if existing is not None:
+            return TelegramInboundPersistResult(
+                inbound_message_id=existing.id,
+                contains_sensitive_data=existing.contains_sensitive_data,
+                is_duplicate=True,
+            )
+
     secure_record = store_secure_json(
         session,
         record_type="telegram_webhook_raw",
-        record_key=str(_extract_update_id(payload) or uuid4().hex),
+        record_key=str(update_id or uuid4().hex),
         value=payload,
         tenant_id=tenant_id,
         workspace_id=workspace_id,
@@ -94,23 +116,6 @@ def persist_telegram_inbound_event(
         if sanitization is not None:
             sanitized_text = sanitization.sanitized_text
             contains_sensitive_data = sanitization.contains_sensitive_data
-
-    update_id = _extract_update_id(payload)
-
-    # M8: idempotency — if we already persisted an inbound message for
-    # this (channel_type, bot_key, update_id) triple, return the existing
-    # record instead of creating a duplicate.  Keying on the triple (not
-    # just update_id) prevents cross-bot collisions: Telegram update_id
-    # counters are independent per-bot, so bot-A's update 42 and bot-B's
-    # update 42 are distinct events.
-    if update_id is not None:
-        existing = _find_duplicate_inbound(session, "telegram", bot_key, update_id)
-        if existing is not None:
-            return TelegramInboundPersistResult(
-                inbound_message_id=existing.id,
-                contains_sensitive_data=existing.contains_sensitive_data,
-                is_duplicate=True,
-            )
 
     inbound = InboundMessage(
         id=f"in_{uuid4().hex[:24]}",
@@ -376,6 +381,11 @@ def _extract_max_sender_user_id(payload: dict) -> int | str | None:
                 uid = cb_user.get("user_id")
                 if uid is not None:
                     return uid
+        # Аудит 2026-07-18 svc-inbound #5: callback БЕЗ callback.user — явный
+        # fail (None → caller безопасно дропнет update, max_inbound.py), а НЕ
+        # fallthrough в message.sender, где для callback-событий сидит БОТ
+        # (путь инцидента tenant_max_290524257 из docstring выше).
+        return None
 
     # bot_started: user.user_id top-level
     user = payload.get("user")

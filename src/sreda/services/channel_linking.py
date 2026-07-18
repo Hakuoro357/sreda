@@ -51,7 +51,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sreda.config.constants import TELEGRAM_WEB_DOMAIN
@@ -182,6 +183,17 @@ def start_link(
 
     target_channel = "max" if source_channel == "telegram" else "telegram"
 
+    # Аудит 2026-07-18 svc-inbound #8: check-then-insert квоты сериализуем
+    # cross-process PG advisory xact-локом (освобождается на commit/rollback
+    # этой транзакции; на SQLite — корректный no-op single-writer). Мягкая
+    # anti-abuse квота, не money-path. Образец: signup_abuse.try_record.
+    bind = session.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+            {"k": f"channel_link_start:{tenant_id}"},
+        )
+
     if _count_recent_starts(session, tenant_id) >= RATE_LIMIT_MAX:
         raise ChannelLinkRateLimitedError(
             f"tenant {tenant_id} exceeded {RATE_LIMIT_MAX} starts "
@@ -269,7 +281,15 @@ def consume_link(
     target_chat_id: str | None = None,
 ) -> ConsumeOutcome:
     """MVP happy-path. No destructive merge."""
-    _validate_token_format(raw_token)
+    # Аудит 2026-07-18 svc-inbound #6: outcome вместо raise — MAX call-site
+    # (``_handle_max_link_confirm_cb``) вызывает consume_link без try/except,
+    # искажённый токен раньше уходил в необработанное исключение → 500 на
+    # вебхуке → retry-loop MAX. Miniapp-роут валидирует формат сам ДО вызова
+    # (HTTP 400) — его контракт не меняется.
+    try:
+        _validate_token_format(raw_token)
+    except ValueError:
+        return ConsumeOutcome(success=False, error="invalid_token_format")
     token_hash = _hash_token(raw_token)
     now = _utcnow()
 
@@ -402,7 +422,41 @@ def consume_link(
         }),
     ))
 
-    session.commit()
+    # Аудит 2026-07-18 svc-inbound #1 / FC-4: collision-SELECT выше — без
+    # блокировки; DB-unique на identity-колонке (``tg_account_hash`` — есть;
+    # ``max_account_id`` — partial unique index накатывает воркер db-uniques)
+    # превращает проигранную гонку (consume параллельно с ensure_*_user_bundle
+    # или вторым consume) в ГРОМКИЙ IntegrityError вместо тихого дубля. Откат
+    # снимает и сжигание токена (used_at) → легитимный retry возможен.
+    # Перечитываем коллизию на чистой транзакции и отдаём штатный outcome
+    # вместо 500. Коллизии нет → чужая integrity-ошибка, НЕ маскируем.
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        racer = session.execute(
+            select(User).where(
+                User.id != source_user.id,
+                collision_filter,
+            )
+        ).scalar_one_or_none()
+        if racer is None:
+            raise
+        logger.warning(
+            "channel_link consume lost race: target=%s tenant=%s — "
+            "concurrent attach won (IntegrityError → outcome)",
+            target_channel, source_tenant,
+        )
+        if racer.tenant_id != source_tenant:
+            return ConsumeOutcome(
+                success=False,
+                error="account_already_registered_separately",
+                tenant_id=source_tenant,
+            )
+        return ConsumeOutcome(
+            success=False,
+            error="account_belongs_to_other_family_member",
+        )
     return ConsumeOutcome(
         success=True,
         tenant_id=source_tenant,

@@ -929,7 +929,11 @@ def save_pb_tour_display_name(
     raw_name: str,
 ) -> str:
     """Persist the post-tour name answer and clear the waiting flag."""
-    clean = (raw_name or "").strip()
+    # audit 2026-07-18 MINOR: тот же санитайзер, что и в ``_set_display_name``
+    # (``_extract_short_name`` + cap) — сюда попадает сыроя LLM-вывод
+    # ``extract_pb_tour_display_name_with_llm`` («Пользователя зовут Борис.» и т.п.),
+    # а display_name уходит в секцию профиля КАЖДОГО system prompt'а.
+    clean = _extract_short_name(raw_name)[:120]
     if not clean:
         raise ValueError("empty display name")
 

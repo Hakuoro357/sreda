@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+from typing import Any, Final
 
 
 @dataclass(slots=True)
@@ -217,8 +217,7 @@ _RULES: list[tuple[re.Pattern[str], Any]] = [
 
 def _replace_url(match: re.Match[str], entities: list[SensitiveEntity]) -> str:
     value = match.group(0)
-    lowered = value.lower()
-    if "?" not in value and not any(marker in lowered for marker in ("token", "key", "secret", "sig", "password")):
+    if "?" not in value and not _has_secret_url_token(value):
         return value
     entities.append(
         SensitiveEntity(
@@ -228,6 +227,24 @@ def _replace_url(match: re.Match[str], entities: list[SensitiveEntity]) -> str:
         )
     )
     return "[url]"
+
+
+# audit-fix 2026-07-18 (svc-security MINOR #2): маркеры — ТОЧНЫЕ токены,
+# не подстроки. Раньше substring-проверка «sig»/«key» маскировала
+# легитимные URL («design», «monkey», «keyboard») — over-redaction на
+# разговорном hot-path деградировал контент, уходящий в LLM.
+_SECRET_URL_MARKERS: Final = frozenset(
+    {"token", "key", "secret", "sig", "signature", "password", "pwd"}
+)
+_URL_TOKEN_SPLIT_RE: Final = re.compile(r"[^a-z0-9]+")
+
+
+def _has_secret_url_token(url: str) -> bool:
+    """True если в URL (без query) есть отдельный токен из markers —
+    путь/хост вида ``/sig/track`` или ``/token/...``. «design»/«monkey»
+    не матчатся: их токены целиком не равны маркерам."""
+    tokens = {t for t in _URL_TOKEN_SPLIT_RE.split(url.lower()) if t}
+    return bool(tokens & _SECRET_URL_MARKERS)
 
 
 @lru_cache(maxsize=1)

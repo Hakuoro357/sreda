@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sreda.db.models.billing import (
@@ -329,6 +330,18 @@ class BillingService:
         current_time = _utcnow(now)
         cycle = self._get_cycle(tenant_id)
         if cycle is None:
+            # 2026-07-18 audit (#3): ветка СЕЙЧАС недостижима в обе стороны —
+            # TenantBillingCycle нигде не создаётся (grep INSERT/конструктор:
+            # только DDL миграции 0004), поэтому renew_cycle всегда отвечает
+            # «Пока нечего продлевать», а next_payment_for_display → (0, None).
+            # Контур продлений ДЕАКТИВИРОВАН по продуктовому решению (все планы
+            # 0 ₽). Оставлен как задел: оживление = создавать цикл при старте
+            # платной подписки + зашедулить sweep_expired_subscriptions.
+            logger.info(
+                "renew_cycle: tenant=%s has no billing cycle — renewal "
+                "contour dormant (TenantBillingCycle is never created)",
+                tenant_id,
+            )
             return SubscriptionActionResult(
                 message_text="Пока нечего продлевать.",
                 reply_markup=_inline_keyboard([[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]),
@@ -377,7 +390,17 @@ class BillingService:
                 reply_markup=_inline_keyboard([[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]),
             )
 
-        new_due_date = cycle.next_payment_due_at + timedelta(days=30)
+        # 2026-07-18 audit fix (#4 money-path): продление анкорится к
+        # max(now, due) — раньше new_due считался от прошлого due, и при
+        # просрочке >периода active_until оставался В ПРОШЛОМ (деньги списаны
+        # stub-ордером, подписка не активна). Период — из плана
+        # (billing_period_days), не захардкоженные 30 дней; при нескольких
+        # планах берём максимум, чтобы ни один не был недопокрыт.
+        anchor_date = max(current_time, _coerce_utc(cycle.next_payment_due_at))
+        period_days = max(
+            (plan.billing_period_days or 30) for _, plan, _ in renewable_items
+        )
+        new_due_date = anchor_date + timedelta(days=period_days)
         order = self._create_paid_stub_order(
             tenant_id=tenant_id,
             cycle=cycle,
@@ -395,12 +418,17 @@ class BillingService:
                     plan_id=plan.id,
                     amount_rub=plan.price_rub * quantity,
                     quantity=quantity,
-                    period_start=cycle.next_payment_due_at,
+                    period_start=anchor_date,
                     period_end=new_due_date,
                     calculation_type="full_cycle",
                 )
             )
             subscription.status = "active"
+            # 2026-07-18 audit fix (#2): starts_at двигается вместе с окном —
+            # budget.get_quota_status суммирует кредиты ОТ starts_at; без
+            # сдвига monthly-квота после первого продления становилась
+            # lifetime-квотой (used >= quota навсегда).
+            subscription.starts_at = anchor_date
             subscription.active_until = new_due_date
             subscription.quantity = quantity
             subscription.next_cycle_quantity = quantity
@@ -416,7 +444,7 @@ class BillingService:
             subscription.next_cycle_quantity = 0
             subscription.updated_at = current_time
 
-        cycle.billing_anchor_at = cycle.next_payment_due_at
+        cycle.billing_anchor_at = anchor_date
         cycle.next_payment_due_at = new_due_date
         cycle.status = "active"
         cycle.updated_at = current_time
@@ -447,6 +475,38 @@ class BillingService:
                 ]
             ),
         )
+
+    def sweep_expired_subscriptions(self, *, now: datetime | None = None) -> int:
+        """Свипер истёкших подписок (2026-07-18 audit, entitlement_gate #1).
+
+        status='active' с active_until в прошлом → status='expired' (+ quantity
+        обнуляются, как в expire-цикле renew_cycle). До появления этого метода
+        единственным писателем 'expired' был renew_cycle, а его контур спит
+        (#3) — истёкшие подписки навсегда оставались 'active'.
+
+        Гейт (EntitlementGate) и budget окно active_until проверяют сами и без
+        свипера; этот метод — гигиена статусов. В системе пока НЕ зашедулен
+        (все планы 0 ₽ / бессрочные): подключать к scheduler'у вместе с
+        первым платным планом. Возвращает число переведённых подписок.
+        """
+        current_time = _utcnow(now)
+        expired = (
+            self.session.query(TenantSubscription)
+            .filter(
+                TenantSubscription.status == "active",
+                TenantSubscription.active_until.isnot(None),
+                TenantSubscription.active_until <= current_time,
+            )
+            .all()
+        )
+        for sub in expired:
+            sub.status = "expired"
+            sub.quantity = 0
+            sub.next_cycle_quantity = 0
+            sub.updated_at = current_time
+        if expired:
+            self.session.commit()
+        return len(expired)
 
     def start_voice_subscription(self, tenant_id: str, *, now: datetime | None = None) -> SubscriptionActionResult:
         """Activate the free voice_transcription plan for a tenant."""
@@ -579,6 +639,24 @@ class BillingService:
                     [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
                 ),
             )
+        # 2026-07-18 audit fix (#9): проверка только по (tenant, plan_key)
+        # недостаточна — active-подписка на ДРУГОЙ план той же фичи при flush
+        # роняла partial unique index ux_tenant_subs_active_per_feature →
+        # IntegrityError/500 вместо дружелюбного ответа. Pre-check в окне +
+        # IntegrityError-recovery ниже как страховка от гонки.
+        other_active = self._get_other_active_feature_subscription(
+            tenant_id, plan.feature_key, exclude_plan_id=plan.id
+        )
+        if other_active is not None:
+            return SubscriptionActionResult(
+                message_text=(
+                    f"Уже подключён другой тариф ({other_active.title}) — "
+                    f"сначала отключите его."
+                ),
+                reply_markup=_inline_keyboard(
+                    [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
+                ),
+            )
         if sub is None:
             sub = TenantSubscription(
                 id=f"sub_{uuid4().hex[:24]}",
@@ -601,7 +679,27 @@ class BillingService:
         sub.updated_at = current_time
         self._ensure_feature_enabled(tenant_id, plan.feature_key, True)
         self._schedule_onboarding_if_needed(tenant_id, plan.feature_key)
-        self.session.commit()
+        try:
+            self.session.commit()
+        except IntegrityError:
+            # Гонка с параллельной активацией плана той же фичи (unique index
+            # ux_tenant_subs_active_per_feature). Эталон: откат + replay-read
+            # (checklists.py / audit_feed.py) — здесь достаточно дружелюбного
+            # ответа, состояние в БД уже консистентно (победил racer).
+            self.session.rollback()
+            logger.info(
+                "start_simple_subscription: race on (tenant=%s, feature=%s) — "
+                "parallel activation won", tenant_id, plan.feature_key,
+            )
+            return SubscriptionActionResult(
+                message_text=(
+                    f"{plan.title} уже подключается параллельно — "
+                    f"проверьте список подписок."
+                ),
+                reply_markup=_inline_keyboard(
+                    [[{"text": "Подписки", "callback_data": SUBSCRIPTIONS_CALLBACK}]]
+                ),
+            )
         if plan.price_rub == 0:
             message_text = f"{plan.title} подключено."
         else:
@@ -685,6 +783,35 @@ class BillingService:
             )
             .one_or_none()
         )
+
+    def _get_other_active_feature_subscription(
+        self,
+        tenant_id: str,
+        feature_key: str,
+        *,
+        exclude_plan_id: str,
+    ) -> SubscriptionPlan | None:
+        """Plan of ANOTHER status='active' subscription on the same feature.
+
+        2026-07-18 audit fix (#9): pre-check против partial unique index
+        ux_tenant_subs_active_per_feature (tenant_id, feature_key) WHERE
+        status='active'. Индекс срабатывает по СТАТУСУ, не по окну — поэтому
+        здесь тоже статусная семантика (истёкшую, но status='active' строку
+        чистит sweep_expired_subscriptions; до того — дружелюбный ответ вместо
+        IntegrityError/500).
+        """
+        rows: list[tuple[TenantSubscription, SubscriptionPlan]] = (
+            self.session.query(TenantSubscription, SubscriptionPlan)
+            .join(SubscriptionPlan, TenantSubscription.plan_id == SubscriptionPlan.id)
+            .filter(
+                TenantSubscription.tenant_id == tenant_id,
+                TenantSubscription.status == "active",
+                SubscriptionPlan.feature_key == feature_key,
+                SubscriptionPlan.id != exclude_plan_id,
+            )
+            .all()
+        )
+        return rows[0][1] if rows else None
 
     def _create_paid_stub_order(
         self,

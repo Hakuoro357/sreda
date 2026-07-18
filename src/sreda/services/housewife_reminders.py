@@ -280,7 +280,10 @@ class HousewifeReminderService:
                 raise ValueError(f"invalid recurrence_rule: {exc}") from exc
         next_trigger_at = _initial_next_trigger_at(trigger_at, recurrence_rule)
 
-        clean_title = title.strip()
+        # audit 2026-07-18 MINOR: cap под String(500) (эталон [:200]/[:500]-капов
+        # по scope — housewife_family:158, housewife_recipes:287) — иначе title >500
+        # от LLM давал DataError на flush вместо тихой обрезки.
+        clean_title = title.strip()[:500]
         embedding_json, embedding_model = self._embed_title(clean_title)
 
         from sreda.config.bot_registry import LEGACY_NULL_BOT_KEY
@@ -548,10 +551,15 @@ class HousewifeReminderService:
         if title is not None:
             clean = title.strip()
             if clean and clean != rem.title:
-                rem.title = clean
-                emb_json, emb_model = self._embed_title(clean)
-                rem.embedding_json = emb_json
-                rem.embedding_model = emb_model
+                rem.title = clean[:500]
+                # audit 2026-07-18 MINOR: сервис без embedding_client (react-путь,
+                # react_loop.py:2582/2750) — _embed_title вернул бы (None, None) и
+                # молча затёр существующий embedding в NULL. Не трогаем embedding;
+                # backfill подхватит позже.
+                if self._embedding_client is not None:
+                    emb_json, emb_model = self._embed_title(clean[:500])
+                    rem.embedding_json = emb_json
+                    rem.embedding_model = emb_model
 
         if new_trigger_at is not None:
             rem.trigger_at = new_trigger_at

@@ -58,6 +58,49 @@ def _combine_local(d: date, t: time) -> datetime:
     return datetime.combine(d, t, tzinfo=timezone.utc)
 
 
+# Аудит 2026-07-18 (svc-features #4): whitelist-валидация RRULE на service-границе.
+# LLM контролирует строку recurrence_rule (add/update — раньше без проверок);
+# валидная, но плотная FREQ (SECONDLY/MINUTELY) заставляла list_range
+# материализовать сотни тысяч occurrences на каждый вызов списка (CPU/память
+# в read hot-path). SECONDLY/MINUTELY не имеют смысла для семейного расписания.
+_RRULE_ALLOWED_FREQ = frozenset({"HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY"})
+_RRULE_MAX_INTERVAL = 366
+
+
+def _validate_recurrence_rule(rule: str) -> None:
+    """Fail-fast whitelist FREQ/INTERVAL на входе сервиса (add/update).
+
+    ValueError ДО любой мутации сессии → tool-обёртка отвечает error и
+    окна частичного состояния нет вовсе. Полный синтаксис не парсим —
+    остальной мусор (BYDAY=XX и т.п.) ловит rollback-guard на rrulestr.
+    """
+    freq: str | None = None
+    interval = 1
+    for part in rule.split(";"):
+        name, _, value = part.partition("=")
+        name = name.strip().upper()
+        if name.startswith("RRULE:"):  # iCalendar-форма «RRULE:FREQ=…»
+            name = name[len("RRULE:"):]
+        if name == "FREQ":
+            freq = value.strip().upper()
+        elif name == "INTERVAL":
+            try:
+                interval = int(value.strip())
+            except ValueError:
+                raise ValueError(
+                    f"recurrence_rule: bad INTERVAL {value!r}"
+                ) from None
+    if freq not in _RRULE_ALLOWED_FREQ:
+        raise ValueError(
+            "recurrence_rule: FREQ must be one of "
+            f"{sorted(_RRULE_ALLOWED_FREQ)}, got {freq!r}"
+        )
+    if not 1 <= interval <= _RRULE_MAX_INTERVAL:
+        raise ValueError(
+            f"recurrence_rule: INTERVAL {interval} out of 1..{_RRULE_MAX_INTERVAL}"
+        )
+
+
 class TaskService:
     """Task CRUD + reminder-link management.
 
@@ -101,6 +144,9 @@ class TaskService:
         title_clean = (title or "").strip()
         if not title_clean:
             raise ValueError("title required")
+        # Аудит 2026-07-18 (svc-features #4): RRULE валидируем на границе, ДО вставки.
+        if recurrence_rule:
+            _validate_recurrence_rule(recurrence_rule)
 
         now = _utcnow()
 
@@ -273,10 +319,19 @@ class TaskService:
         # trigger to. Silently skip if offset is set but we can't
         # compute a trigger (LLM should have caught this upstream).
         if reminder_offset_minutes is not None and scheduled_date and time_start:
-            self._attach_reminder_inner(
-                task=task,
-                offset_minutes=reminder_offset_minutes,
-            )
+            # Аудит 2026-07-18 (svc-features #1 / FC-1): rollback-guard по эталону
+            # ctx-ветки add() выше. task уже flushed; падение _attach_reminder_inner
+            # (мусорная RRULE от LLM — rrulestr ValueError) без отката оставляло бы
+            # сессию с частичным состоянием → поздний commit чужого тула сохранил бы
+            # задачу БЕЗ напоминания при ответе «error».
+            try:
+                self._attach_reminder_inner(
+                    task=task,
+                    offset_minutes=reminder_offset_minutes,
+                )
+            except Exception:  # noqa: BLE001 — сбой attach → откат всей операции
+                self.session.rollback()
+                raise
         else:
             self.session.commit()
         return task
@@ -329,6 +384,9 @@ class TaskService:
         title_clean = (title or "").strip()
         if not title_clean:
             raise ValueError("title required")
+        # Аудит 2026-07-18 (svc-features #4): та же RRULE-валидация на composite-пути.
+        if recurrence_rule:
+            _validate_recurrence_rule(recurrence_rule)
 
         now = _utcnow()
         # #163 scope: композит-путь — легаси-чат (не ReAct) → БЕЗ semantic_key/дедупа (план #163:
@@ -515,6 +573,10 @@ class TaskService:
         field call ``detach_reminder`` / use a dedicated clearer.
         ``recurrence_rule=""`` clears recurrence (task becomes one-shot;
         a linked reminder is recreated as one-shot — #166)."""
+        # Аудит 2026-07-18 (svc-features #4): RRULE валидируем ДО любой мутации —
+        # мусорная FREQ падает здесь, а не в _attach_reminder_inner после flush'а.
+        if recurrence_rule:
+            _validate_recurrence_rule(recurrence_rule)
         task = self._get(tenant_id, user_id, task_id)
         if task is None:
             return None
@@ -557,16 +619,26 @@ class TaskService:
             old_bot_key = old_rem.bot_key if old_rem is not None else self._bot_key
             # #163 Фаза 3: sub-операции БЕЗ своего commit — весь update атомарен одним commit ниже
             # (раньше cancel+attach коммитили по отдельности; теперь единая per-op граница).
-            self.reminders.cancel(
-                tenant_id=tenant_id, reminder_id=task.reminder_id, commit=False,
-            )
-            task.reminder_id = None
-            if task.scheduled_date and task.time_start:
-                self._attach_reminder_inner(
-                    task=task, offset_minutes=old_offset, bot_key=old_bot_key, commit=False,
+            # Аудит 2026-07-18 (svc-features #1 / FC-1): rollback-guard по эталону add().
+            # cancel(commit=False) — это flush ВСЕЙ сессии (вкл. уже изменённые поля задачи);
+            # если _attach_reminder_inner бросит (мусорная RRULE, прошедшая whitelist —
+            # rrulestr ValueError), исключение уходит в tool-обёртку БЕЗ отката → поздний
+            # commit чужого тула зафиксировал бы частичное состояние: старое напоминание
+            # cancelled, reminder_id=None, новое не создано — при ответе «error».
+            try:
+                self.reminders.cancel(
+                    tenant_id=tenant_id, reminder_id=task.reminder_id, commit=False,
                 )
-            else:
-                task.reminder_offset_minutes = None
+                task.reminder_id = None
+                if task.scheduled_date and task.time_start:
+                    self._attach_reminder_inner(
+                        task=task, offset_minutes=old_offset, bot_key=old_bot_key, commit=False,
+                    )
+                else:
+                    task.reminder_offset_minutes = None
+            except Exception:  # noqa: BLE001 — сбой cancel/attach → откат всей операции
+                self.session.rollback()
+                raise
         # Единый commit (per-op атомарность). commit=False → владеет durable-helper (ctx-путь).
         if commit:
             self.session.commit()
@@ -687,13 +759,23 @@ class TaskService:
                 "task has no scheduled datetime — can't compute reminder trigger"
             )
 
-        if task.reminder_id:
-            self.reminders.cancel(
-                tenant_id=tenant_id, reminder_id=task.reminder_id,
-            )
-            task.reminder_id = None
+        # Аудит 2026-07-18 (svc-features #1 / FC-1): тот же rollback-guard, что в update().
+        # cancel переведён на commit=False (#163 Фаза 3 — часть этой операции): раньше он
+        # коммитил ВСЮ сессию посередине, а падение _attach_reminder_inner (мусорная RRULE)
+        # оставляло reminder_id=None незакоммиченным → поздний чужой commit фиксировал
+        # задачу без напоминания при ответе «error». Теперь вся замена атомарна: единый
+        # commit — в конце _attach_reminder_inner; сбой → откат (старое напоминание живо).
+        try:
+            if task.reminder_id:
+                self.reminders.cancel(
+                    tenant_id=tenant_id, reminder_id=task.reminder_id, commit=False,
+                )
+                task.reminder_id = None
 
-        self._attach_reminder_inner(task=task, offset_minutes=offset_minutes)
+            self._attach_reminder_inner(task=task, offset_minutes=offset_minutes)
+        except Exception:  # noqa: BLE001 — сбой cancel/attach → откат всей операции
+            self.session.rollback()
+            raise
         return task
 
     def detach_reminder(
@@ -917,12 +999,19 @@ class TaskService:
             )
             .all()
         )
+        # Аудит 2026-07-18 (svc-features #3): окно и бакеты — в ЛОКАЛЬНЫХ сутках юзера.
+        # По контракту RRULE кодирует UTC-часы (docstring _attach_reminder_inner:
+        # LLM converts MSK→UTC before writing BYHOUR): occurrence 21:00 UTC — это
+        # 00:00 МСК СЛЕДУЮЩЕГО локального дня. Раньше окно резалось по UTC-полуночи
+        # и бакетом был occ.date() (UTC) → задача «в 00:30 МСК» всплывала в
+        # week-view на предыдущий локальный день (и пропадала из list_today).
+        user_tz = self._user_timezone(tenant_id, user_id)
         window_start_dt = datetime.combine(
-            from_date, time.min, tzinfo=timezone.utc,
-        )
-        window_end_dt = datetime.combine(
-            to_date, time.min, tzinfo=timezone.utc,
-        ) + timedelta(days=1)
+            from_date, time.min, tzinfo=user_tz,
+        ).astimezone(timezone.utc)
+        window_end_dt = (
+            datetime.combine(to_date, time.min, tzinfo=user_tz) + timedelta(days=1)
+        ).astimezone(timezone.utc)
 
         for t in recurring:
             try:
@@ -934,7 +1023,7 @@ class TaskService:
                 for occ in rule.between(
                     window_start_dt, window_end_dt, inc=True,
                 ):
-                    occ_date = occ.date()
+                    occ_date = occ.astimezone(user_tz).date()
                     if occ_date not in result:
                         continue
                     if t.scheduled_date == occ_date:

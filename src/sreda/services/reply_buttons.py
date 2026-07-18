@@ -26,7 +26,11 @@ from sreda.db.models.reply_buttons import ReplyButtonCache
 logger = logging.getLogger(__name__)
 
 TOKEN_TTL_SECONDS = 3600  # 1 час
-TOKEN_LENGTH_HEX = 8  # 32 бита — пренебрежимо редкие коллизии на TTL 1h
+# audit-fix 2026-07-18 (svc-ops MINOR #10): 32→64 бита. Коллизия по PK на
+# insert — необработанный IntegrityError на commit в середине tool-flow;
+# при 32 битах ожидались единицы падений в год. 64 бита → вероятность
+# коллизии пренебрежима (N/2^64). Колонка String(16) вмещает ровно 16 hex.
+TOKEN_LENGTH_HEX = 16  # 64 бита
 MAX_BUTTONS_PER_REPLY = 4
 MAX_LABEL_LENGTH = 128
 
@@ -78,7 +82,7 @@ class ReplyButtonService:
 
         result: list[tuple[str, str]] = []
         for label in clean:
-            token = secrets.token_hex(TOKEN_LENGTH_HEX // 2)  # 8 hex chars
+            token = secrets.token_hex(TOKEN_LENGTH_HEX // 2)  # 16 hex chars
             row = ReplyButtonCache(
                 token=token,
                 tenant_id=tenant_id,

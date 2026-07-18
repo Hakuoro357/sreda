@@ -18,14 +18,16 @@ Sources of truth:
   ``{url, final_url, status, extractor, truncated, length, text}``
   (web_search_tool.py:419) — NOT raw text. Schema must reflect.
 - Codex R1 MAJOR (medium): fetch_url runtime rejects localhost /
-  private / link-local hosts (web_search_tool.py:73 _validate_url).
+  private / link-local hosts. Post-#244 the authoritative
+  early-reject policy lives in ``services/ssrf_guard.py``
+  (``validate_fetch_url``) — the schema validator below delegates
+  to it directly (audit 2026-07-18 MINOR: no separate mirror logic
+  to drift).
 """
 
 from __future__ import annotations
 
-from ipaddress import ip_address
 from typing import Annotated, Literal
-from urllib.parse import urlparse
 
 from pydantic import (
     AfterValidator,
@@ -36,6 +38,7 @@ from pydantic import (
     model_validator,
 )
 
+from sreda.services.ssrf_guard import validate_fetch_url
 from sreda.services.tool_schemas.base import ToolSpec
 from sreda.services.tool_schemas.housewife import (
     FetchUrlToolOutput,
@@ -63,29 +66,22 @@ SearchQuery = Annotated[
 
 
 def _validate_safe_url(value: str) -> str:
-    """Codex R1 MAJOR: mirror runtime SSRF guard from
-    web_search_tool.py:73. Reject localhost / private / link-local
-    /reserved hosts at planner-input time so the planner sees the
-    constraint instead of waiting for runtime to fail."""
-    parsed = urlparse(value)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"only http/https URLs allowed, got {parsed.scheme!r}")
-    if not parsed.hostname:
-        raise ValueError("URL has no hostname")
-    host = parsed.hostname.lower()
-    if host in ("localhost", "0.0.0.0", "::1"):
-        raise ValueError(f"localhost host {host!r} is blocked (SSRF guard)")
-    # IPv4 literal check
-    try:
-        ip = ip_address(host)
-    except ValueError:
-        pass
-    else:
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            raise ValueError(
-                f"IP {host!r} is in a blocked range (SSRF guard: "
-                f"private/loopback/link-local/reserved)"
-            )
+    """SSRF early-reject at planner-input time.
+
+    Audit 2026-07-18 MINOR: previously a hand-rolled mirror of the
+    pre-#244 runtime guard (``web_search_tool.py:73``) — it only caught
+    canonical IP literals and silently passed obfuscated numeric hosts
+    (``http://127.1/``, ``http://2130706433/``, ``http://0x7f.0.0.1/``).
+    Now delegates to ``services/ssrf_guard.validate_fetch_url`` — the
+    SAME policy function the runtime fetch path uses (#244): scheme,
+    userinfo, port (80/443 only), localhost family, numeric/obfuscated
+    hosts, denylisted IP literals (incl. NAT64/6to4/Teredo). The
+    authoritative SSRF boundary stays the runtime guard + egress
+    nftables; this layer just lets the planner see the constraint
+    early instead of waiting for the runtime to fail."""
+    ok, reason = validate_fetch_url(value)
+    if not ok:
+        raise ValueError(f"URL rejected (SSRF guard): {reason}")
     return value
 
 

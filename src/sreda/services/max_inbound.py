@@ -248,6 +248,18 @@ async def handle_max_update(
                 session, bot_key=bot_key, payload=payload,
             )
 
+            # Аудит 2026-07-18 svc-inbound #3: duplicate short-circuit ПЕРЕД
+            # welcome-consume (зеркало TG-порядка в telegram_inbound.py). На
+            # дубликате result.inbound_message_id — id СУЩЕСТВУЮЩЕЙ строки:
+            # прежний порядок (welcome раньше) стомпил бы её processing_status
+            # в 'ignored', которую выигравший ход уже мог перевести дальше.
+            if result.is_duplicate:
+                logger.info(
+                    "max inbound: duplicate update %s for bot %s — no-op",
+                    result.inbound_message_id, bot_key,
+                )
+                return result.inbound_message_id
+
             # 2026-05-09 fix (Boris feedback): если welcome ТОЛЬКО ЧТО отправлен
             # этой inbound-message — НЕ передаём её дальше в chat handler.
             # Иначе юзер получает double-reply на /start: welcome (с кнопкой)
@@ -262,13 +274,6 @@ async def handle_max_update(
                 )
                 _set_processing_status(
                     session, result.inbound_message_id, "ignored",
-                )
-                return result.inbound_message_id
-
-            if result.is_duplicate:
-                logger.info(
-                    "max inbound: duplicate update %s for bot %s — no-op",
-                    result.inbound_message_id, bot_key,
                 )
                 return result.inbound_message_id
 
@@ -770,9 +775,12 @@ async def _maybe_transcribe_max_voice(
 
     # --- Phase 2C: voice quota reserve via ffprobe duration ---
     if _is_free and _ledger and _llm_periods and _voice_periods:
-        from sreda.services.audio_probe import FfprobeError, ffprobe_duration
+        from sreda.services.audio_probe import FfprobeError, probe_audio_async
         try:
-            _duration_seconds = ffprobe_duration(audio_bytes)
+            # Аудит 2026-07-18 cross-latency NEW-1: ffprobe через async-обёртку
+            # (asyncio.to_thread) — sync subprocess блокировал event loop на
+            # время probe (до 10с), кладя чужие ходы/webhook'и/доставку.
+            _duration_seconds = await probe_audio_async(audio_bytes)
         except FfprobeError as exc:
             logger.warning("max voice ffprobe failed: %s — refunding LLM", exc)
             _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
@@ -1084,7 +1092,13 @@ async def _process_approved_max_turn(
                     _tc_r = trace.current()
                     if _tc_r is not None:
                         trace.emit_block(_tc_r)
-                    _set_processing_status(bg_session, inbound_message_id, "processed")
+                    # FC-1 (аудит 2026-07-18, cross-concurrency Н1): resume-ход,
+                    # завершившийся внутренним сбоем (safe-fallback), НЕ
+                    # помечаем processed — статус остаётся для monitor probe.
+                    if not getattr(_reply_r, "had_internal_error", False):
+                        _set_processing_status(
+                            bg_session, inbound_message_id, "processed",
+                        )
                     return
                 if settings.max_bot_token:
                     max_client_cb = MaxClient(token=settings.max_bot_token)
@@ -1297,9 +1311,13 @@ async def _process_approved_max_turn(
                     _tc = trace.current()
                     if _tc is not None:
                         trace.emit_block(_tc)
-                    _set_processing_status(
-                        bg_session, inbound_message_id, "processed",
-                    )
+                    # FC-1 (аудит 2026-07-18, cross-concurrency Н1): react-ход,
+                    # завершившийся внутренним сбоем (safe-fallback), НЕ
+                    # помечаем processed — статус остаётся для monitor probe.
+                    if not getattr(_reply, "had_internal_error", False):
+                        _set_processing_status(
+                            bg_session, inbound_message_id, "processed",
+                        )
                     return
 
             # Ack message — UX parity с TG: показываем «⏳ Работаю…» как
@@ -1378,7 +1396,12 @@ async def _process_approved_max_turn(
                 ack_progress_controller=ack_progress_controller,
             )
             queued = runtime.enqueue_action(action)
-            await runtime.process_job(queued.job_id)
+            # FC-1 (аудит 2026-07-18, cross-concurrency Н1): process_job НЕ
+            # бросает — возвращает 'completed'/'failed'/'claimed_by_other'.
+            # Исход решает post-turn commit «processed» ниже (failed-джоб
+            # раньше всё равно помечал inbound 'processed', пряча сбой от
+            # unprocessed_inbound monitor'а).
+            _job_outcome = await runtime.process_job(queued.job_id)
 
             # После main turn — спавним cleanup'у ack message.
             # Polls outbox для tenant_id+since (start of turn), max 15s,
@@ -1399,7 +1422,13 @@ async def _process_approved_max_turn(
                     name=f"max_ack_del:{inbound_message_id}",
                 )
 
-        _set_processing_status(bg_session, inbound_message_id, "processed")
+        # FC-1 (аудит 2026-07-18, cross-concurrency Н1): 'processed' ТОЛЬКО
+        # при успешном джобе. При 'failed'/'claimed_by_other' строка остаётся
+        # 'processing_started' и подхватывается unprocessed_inbound monitor'ом
+        # (та же семантика, что у exception-пути ниже), вместо ложного
+        # «обработано» на упавшем ходе.
+        if _job_outcome == "completed":
+            _set_processing_status(bg_session, inbound_message_id, "processed")
     except Exception:  # noqa: BLE001
         # Symmetry с TG ``_process_approved_turn_locked``:
         # processing_status НЕ помечается 'failed' on exception — row

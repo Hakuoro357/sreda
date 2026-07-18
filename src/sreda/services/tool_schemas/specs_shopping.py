@@ -33,6 +33,7 @@ from sreda.services.tool_schemas.common import (
     QuantityText,
     ShoppingItemId,
     ShoppingTitle,
+    TitleMatch,
 )
 from sreda.services.tool_schemas.housewife import (
     AddShoppingItemsOutput,
@@ -79,7 +80,11 @@ class ShoppingItemInput(BaseModel):
 
 class AddShoppingItemsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    items: list[ShoppingItemInput] = Field(min_length=1)
+    # Audit 2026-07-18 MINOR: единственный batch-вход был без верхней
+    # границы — cap 100 по эталону соседних batch-моделей
+    # (AddChecklistItemsInput.items ≤100, specs_checklists.py;
+    # AddFamilyMembersInput.members ≤20; SaveRecipesBatchInput.recipes ≤50).
+    items: list[ShoppingItemInput] = Field(min_length=1, max_length=100)
 
 
 class MarkShoppingBoughtInput(BaseModel):
@@ -181,7 +186,7 @@ class ListShoppingInput(BaseModel):
     «удали/отметь X по имени»: список возвращается уже отфильтрованным,
     дальше ``${sN.items.only.item_id}`` берёт ровно-один."""
     model_config = ConfigDict(extra="forbid")
-    title_match: str | None = None
+    title_match: TitleMatch | None = None
 
 
 class ClearBoughtShoppingInput(BaseModel):

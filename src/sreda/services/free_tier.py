@@ -24,11 +24,12 @@ import logging
 from datetime import date, datetime, timezone
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sreda.db.models.free_tier import FreeTierUsage
 from sreda.services.agent_capabilities import active_feature_keys
-from sreda.services.usage_ledger import SREDA_FREE_LLM_DAILY
+from sreda.services.usage_ledger import SREDA_FREE_LLM_DAILY, msk_period_keys
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +46,15 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _today_utc() -> date:
-    return _utcnow().date()
+def _today() -> date:
+    """«Сегодня» в Europe/Moscow (2026-07-18 audit #6).
+
+    Раньше день считался по _utcnow().date() (UTC), а основной usage_ledger —
+    по MSK (msk_period_keys): два лимита «10/день» сбрасывались в разные
+    полуночи (3 ч разницы). Источник периода теперь общий — msk_period_keys.
+    """
+    daily_key, _monthly_key = msk_period_keys()
+    return date.fromisoformat(daily_key)
 
 
 class FreeTierCounter:
@@ -88,7 +96,7 @@ class FreeTierCounter:
             # (это служебный путь, логов и без того много).
             return (0, False)
 
-        today = _today_utc()
+        today = _today()
         row = self._get_or_create(tenant_id, user_id, today)
         row.llm_calls = (row.llm_calls or 0) + 1
         row.updated_at = _utcnow()
@@ -96,11 +104,36 @@ class FreeTierCounter:
         new_count = row.llm_calls
         return (new_count, new_count > FREE_TIER_DAILY_LIMIT)
 
+    def refund(self, *, tenant_id: str, user_id: str) -> None:
+        """Откат последнего инкремента сегодняшнего дня (2026-07-18 audit #6).
+
+        Паритет с voice-путём usage_ledger.refund: если LLM-вызов упал ПОСЛЕ
+        increment_and_check, caller обязан вернуть ход — иначе юзер платит
+        лимитом за failed turn. Floor at 0 — дефенсивно. Caller сам
+        commit'ит свой error-path (счётчик живёт в handler-session).
+        """
+        if not tenant_id or not user_id:
+            return
+        row = (
+            self.session.query(FreeTierUsage)
+            .filter(
+                FreeTierUsage.tenant_id == tenant_id,
+                FreeTierUsage.user_id == user_id,
+                FreeTierUsage.day == _today(),
+            )
+            .one_or_none()
+        )
+        if row is None or not row.llm_calls:
+            return
+        row.llm_calls = max(0, row.llm_calls - 1)
+        row.updated_at = _utcnow()
+        self.session.flush()
+
     def usage_today(
         self, *, tenant_id: str, user_id: str,
     ) -> int:
         """Текущий счётчик на сегодня (для дебага / для pre-paywall digest)."""
-        today = _today_utc()
+        today = _today()
         row = (
             self.session.query(FreeTierUsage)
             .filter(
@@ -116,10 +149,10 @@ class FreeTierCounter:
     # Internals
     # ------------------------------------------------------------------
 
-    def _get_or_create(
+    def _find(
         self, tenant_id: str, user_id: str, day: date,
-    ) -> FreeTierUsage:
-        row = (
+    ) -> FreeTierUsage | None:
+        return (
             self.session.query(FreeTierUsage)
             .filter(
                 FreeTierUsage.tenant_id == tenant_id,
@@ -128,6 +161,11 @@ class FreeTierCounter:
             )
             .one_or_none()
         )
+
+    def _get_or_create(
+        self, tenant_id: str, user_id: str, day: date,
+    ) -> FreeTierUsage:
+        row = self._find(tenant_id, user_id, day)
         if row is not None:
             return row
         row = FreeTierUsage(
@@ -139,5 +177,24 @@ class FreeTierCounter:
             updated_at=_utcnow(),
         )
         self.session.add(row)
-        self.session.flush()
+        # Аудит 2026-07-18 FC-4: SELECT выше — без блокировки; unique
+        # ``ix_free_tier_usage_unique`` (tenant_id, user_id, day) уже есть
+        # в БД → проигранная гонка двух первых запросов дня даёт
+        # IntegrityError на flush вместо тихого дубля. Откатываемся,
+        # перечитываем на чистой транзакции и возвращаем строку
+        # победителя. Строки нет → чужая integrity-ошибка, НЕ маскируем
+        # (паттерн channel_linking.consume_link).
+        try:
+            self.session.flush()
+        except IntegrityError:
+            self.session.rollback()
+            racer = self._find(tenant_id, user_id, day)
+            if racer is None:
+                raise
+            logger.info(
+                "free_tier: lost create race for tenant=%s user=%s day=%s — "
+                "re-resolved after IntegrityError",
+                tenant_id, user_id, day,
+            )
+            return racer
         return row

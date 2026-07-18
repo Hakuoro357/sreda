@@ -222,15 +222,30 @@ class HousewifeMenuService:
         if not 0 <= day_of_week <= 6:
             raise ValueError(f"day_of_week must be 0-6, got {day_of_week}")
 
-        existing = (
+        existing_rows = (
             self.session.query(MenuPlanItem)
             .filter(
                 MenuPlanItem.menu_plan_id == plan.id,
                 MenuPlanItem.day_of_week == day_of_week,
                 MenuPlanItem.meal_type == meal_type,
             )
-            .one_or_none()
+            .order_by(MenuPlanItem.id)
+            .all()
         )
+        existing = existing_rows[0] if existing_rows else None
+        if len(existing_rows) > 1:
+            # audit 2026-07-18 MAJOR: легаси-дубли слота (unique-констрейнт
+            # uq_menu_plan_items_plan_day_meal появился только в этой миграции —
+            # в старых БД дубли уже могли накопиться) — one_or_none() бросал
+            # MultipleResultsFound и точечная правка ячейки была сломана.
+            # Лечим: первая строка выживает, дубли удаляются в том же commit'е.
+            logger.warning(
+                "update_item: healing %d duplicate rows for slot plan=%s "
+                "day=%s meal=%s",
+                len(existing_rows), plan.id, day_of_week, meal_type,
+            )
+            for dup in existing_rows[1:]:
+                self.session.delete(dup)
 
         text_empty = not (free_text or "").strip()
         if recipe_id is None and text_empty:
@@ -502,30 +517,41 @@ def _normalise_cells(
     if not raw:
         return []
     out: list[MenuCellInput] = []
+    seen_keys: set[tuple[int, str]] = set()
     for item in raw:
         if isinstance(item, MenuCellInput):
-            out.append(item)
-            continue
-        if not isinstance(item, dict):
-            continue
-        try:
-            day = int(item["day_of_week"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if not 0 <= day <= 6:
-            continue
-        meal = str(item.get("meal_type") or "").strip()
-        if meal not in MEAL_TYPES:
-            continue
-        out.append(
-            MenuCellInput(
+            cell = item
+        elif isinstance(item, dict):
+            try:
+                day = int(item["day_of_week"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not 0 <= day <= 6:
+                continue
+            meal = str(item.get("meal_type") or "").strip()
+            if meal not in MEAL_TYPES:
+                continue
+            cell = MenuCellInput(
                 day_of_week=day,
                 meal_type=meal,
                 recipe_id=(item.get("recipe_id") or None),
                 free_text=(item.get("free_text") or None),
                 notes=(item.get("notes") or None),
             )
-        )
+        else:
+            continue
+        key = (cell.day_of_week, cell.meal_type)
+        if key in seen_keys:
+            # audit 2026-07-18 MAJOR: LLM (Gemma/MiMo) присылает два раза один слот
+            # (day_of_week, meal_type) — без дедупа вставлялись две строки MenuPlanItem
+            # и update_item падал с MultipleResultsFound. Берём ПЕРВУЮ ячейку.
+            logger.info(
+                "_normalise_cells: duplicate slot day=%s meal=%s — first wins",
+                key[0], key[1],
+            )
+            continue
+        seen_keys.add(key)
+        out.append(cell)
     return out
 
 

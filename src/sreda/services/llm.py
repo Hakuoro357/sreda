@@ -29,6 +29,7 @@ import json
 import logging
 import re
 import threading
+import time
 from typing import Any, Callable, Iterator
 
 import httpx
@@ -225,6 +226,28 @@ def _message_has_tool_calls(message: Any) -> bool:
     )
 
 
+def _provider_requires_reasoning_passthrough(provider: str | None) -> bool:
+    """True только для провайдеров с reasoning_content round-trip контрактом
+    (mimo thinking mode, ``MimoChatOpenAI``): streaming-ветка теряет
+    ``reasoning_content`` из chunk'ов, а mimo API требует вернуть его на
+    следующей итерации (400 «must be passed back») — для них после стрима
+    с tool_calls нужен delegated re-invoke (коммит 4a280b9).
+
+    Для всех остальных провайдеров (qwen-flash с reasoning OFF, gemini,
+    groq, mercury и т.д.) повторный полный invoke — чистый дубль стоимости
+    и до +timeout_seconds хвоста латентности: stream уже собрал валидные
+    tool_calls (аудит 2026-07-18, llm-core MAJOR #2).
+
+    ``provider=None`` (bench/legacy call-site без явного провайдера) →
+    консервативно сохраняем прежнее поведение: цена ошибки в сторону
+    пропуска re-invoke — сломанный mimo-ход (400, data-loss класс
+    инцидента 2026-05-12→14), в сторону лишнего — только токены.
+    """
+    if provider is None:
+        return True
+    return provider in _MIMO_MODEL_BY_PROVIDER
+
+
 async def ainvoke_with_streaming_timeout(
     runnable: Any,
     messages: list,
@@ -411,6 +434,7 @@ async def ainvoke_with_streaming_timeout(
                 _message_has_tool_calls(result)
                 and not _message_reasoning_content(result)
                 and hasattr(runnable, "invoke")
+                and _provider_requires_reasoning_passthrough(provider)
             ):
                 result = await asyncio.to_thread(
                     invoke_with_per_call_timeout,
@@ -1398,11 +1422,9 @@ def detect_unbacked_claim(text: str, called_tools: set[str]) -> bool:
 # Pattern for checklist item lines в text-ответе бота.
 # Matches: «— ☐ X» / «- ☑ X» / «☐ X» / «☑ X» / «✗ X» с любыми
 # whitespace вокруг.
-import re as _re
-
-_CHECKLIST_ITEM_LINE_RE = _re.compile(
+_CHECKLIST_ITEM_LINE_RE = re.compile(
     r"^[\s\-—•*]*([☐☑☒✓✗])\s+(.+?)\s*$",
-    _re.MULTILINE,
+    re.MULTILINE,
 )
 
 
@@ -1904,6 +1926,28 @@ def _provider_key_is_available(provider: str, settings: Settings) -> bool:
     return False
 
 
+# 2026-07-18 audit (llm-core MINOR #4): без-провайдерные get_chat_llm()
+# вызовы (housewife_shopping_llm, housewife_onboarding — разговорный
+# hot-path) раньше платили свежей DB-сессией + двумя чтениями
+# runtime_config КАЖДЫЙ вызов. Короткий TTL-кэш снимает DB round-trip;
+# admin-switcher propagation задерживается максимум на TTL (приемлемо
+# для ops-инструмента) + есть invalidate_provider_overrides_cache()
+# для явного сброса после записи runtime_config.
+_PROVIDER_OVERRIDES_CACHE_TTL_SECONDS = 10.0
+# (monotonic_ts, env_primary, env_fallback, resolved_primary, resolved_fallback)
+_provider_overrides_cache: tuple[float, str, str | None, str, str | None] | None = None
+_provider_overrides_cache_lock = threading.Lock()
+
+
+def invalidate_provider_overrides_cache() -> None:
+    """Сбросить кэш admin-switcher overrides. Вызывать после записи
+    ``runtime_config.chat_primary_provider`` / ``chat_fallback_provider``
+    чтобы переключение применилось немедленно, не дожидаясь TTL."""
+    global _provider_overrides_cache
+    with _provider_overrides_cache_lock:
+        _provider_overrides_cache = None
+
+
 def _resolve_provider_overrides(settings: Settings) -> tuple[str, str | None]:
     """Consult the admin-switcher DB table for live overrides, falling
     back to env-var-based Settings when a key isn't set. Returns
@@ -1915,7 +1959,39 @@ def _resolve_provider_overrides(settings: Settings) -> tuple[str, str | None]:
 
     DB errors (missing table, locked db, etc.) degrade silently to
     env defaults so a half-migrated install still serves turns.
+
+    Результат кэшируется на ``_PROVIDER_OVERRIDES_CACHE_TTL_SECONDS``
+    (см. комментарий у кэша выше). Кэш ключуется env-значениями
+    ``settings.chat_provider`` / ``chat_fallback_provider`` — смена env
+    (или иной Settings-объект в тестах) автоматически мимо кэша.
     """
+    global _provider_overrides_cache
+
+    env_primary = settings.chat_provider
+    env_fallback = settings.chat_fallback_provider
+    now = time.monotonic()
+    with _provider_overrides_cache_lock:
+        entry = _provider_overrides_cache
+    if (
+        entry is not None
+        and now - entry[0] < _PROVIDER_OVERRIDES_CACHE_TTL_SECONDS
+        and entry[1] == env_primary
+        and entry[2] == env_fallback
+    ):
+        return entry[3], entry[4]
+
+    resolved = _resolve_provider_overrides_uncached(settings)
+    with _provider_overrides_cache_lock:
+        _provider_overrides_cache = (
+            now, env_primary, env_fallback, resolved[0], resolved[1],
+        )
+    return resolved
+
+
+def _resolve_provider_overrides_uncached(
+    settings: Settings,
+) -> tuple[str, str | None]:
+    """DB-lookup часть ``_resolve_provider_overrides`` (без кэша)."""
     global _RUNTIME_CONFIG_WARNED
 
     try:
@@ -1998,6 +2074,18 @@ def get_chat_llm(
         replays the same message list against the backup transparently.
         One level deep on purpose; three-tier would hide the freshly-
         interesting failure mode.
+
+        .. warning::
+            Breaker-атрибуция ломается (аудит 2026-07-18, llm-core
+            MINOR #5): fallback исполняется внутри
+            ``RunnableWithFallbacks`` в той же worker-нити и той же
+            breaker-попытке с ``provider=primary`` — зависший fallback
+            засчитает timeout PRIMARY-провайдеру и может открыть его
+            breaker (mis-attribution, противоположная той, от которой
+            страхует комментарий в ``invoke_with_per_call_timeout``).
+            Прод-путь — НЕ этот параметр, а ручной per-provider
+            fallback в ``runtime/llm_caller.py``. Не включать на
+            hot-path без отдельного breaker-дизайна.
     """
     settings = settings or get_settings()
     if provider is not None:

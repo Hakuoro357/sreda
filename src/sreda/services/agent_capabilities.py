@@ -44,13 +44,19 @@ class VoiceAccessResult:
     reason: str
 
 
-def active_feature_keys(session: Session, tenant_id: str) -> set[str]:
-    """Return feature_keys of agents the tenant currently has an active
-    subscription on. "Active" = status in {active, scheduled_for_cancel}
-    and ``active_until`` still in the future.
+def _iter_active_subscriptions(session: Session, tenant_id: str):
+    """Единый entitlement-фильтр подписок (audit-fix 2026-07-18,
+    svc-ops MINOR #9 — раньше критерий дублировался в
+    ``active_feature_keys`` и ``_active_voice_carrier_keys`` с
+    комментарием-костылём «Mirror active_feature_keys»; рассинхрон давал
+    voice-гейт, расходящийся с меню Mini App).
 
-    Public — the Mini App menu endpoint uses this to decide which
-    agents to poll for ``get_miniapp_sections``."""
+    Yield'ит ``(sub, plan)`` для подписок, которые считаются АКТИВНЫМИ:
+    status in {active, scheduled_for_cancel}, quantity > 0,
+    ``active_until`` в будущем ИЛИ NULL (= бессрочная free/grandfathered
+    подписка — Phase 2 fix 2026-05-08, Codex MAJOR-5: раньше NULL
+    ИСКЛЮЧАЛ такие подписки → voice пропадал для новых sreda_free юзеров).
+    """
     now = datetime.now(UTC)
     rows = (
         session.query(TenantSubscription, SubscriptionPlan)
@@ -58,25 +64,31 @@ def active_feature_keys(session: Session, tenant_id: str) -> set[str]:
         .filter(TenantSubscription.tenant_id == tenant_id)
         .all()
     )
-
-    active: set[str] = set()
     for sub, plan in rows:
         if not sub.quantity or sub.quantity <= 0:
             continue
         if sub.status not in {"active", "scheduled_for_cancel"}:
             continue
-        # Phase 2 fix 2026-05-08 (Codex MAJOR-5): active_until=NULL означает
-        # бессрочную подписку — free/grandfathered подписки создаются без срока
-        # (#200: после слияния все на sreda_free). Раньше `if not sub.active_until: continue` эти подписки
-        # ИСКЛЮЧАЛ из active_keys → has_voice_access возвращал False для
-        # каждого нового sreda_free юзера → «голосовые недоступны». Теперь
-        # NULL = unlimited, пропускаем temporal-check, добавляем feature_key.
+        # NULL active_until = unlimited (sreda_free), пропускаем
+        # temporal-check; иначе дата должна быть в будущем.
         if sub.active_until is not None:
             active_until = sub.active_until
             if active_until.tzinfo is None:
                 active_until = active_until.replace(tzinfo=UTC)
             if active_until <= now:
                 continue
+        yield sub, plan
+
+
+def active_feature_keys(session: Session, tenant_id: str) -> set[str]:
+    """Return feature_keys of agents the tenant currently has an active
+    subscription on. "Active" = status in {active, scheduled_for_cancel}
+    and ``active_until`` still in the future.
+
+    Public — the Mini App menu endpoint uses this to decide which
+    agents to poll for ``get_miniapp_sections``."""
+    active: set[str] = set()
+    for _sub, plan in _iter_active_subscriptions(session, tenant_id):
         if plan.feature_key:
             active.add(plan.feature_key)
     return active
@@ -86,35 +98,15 @@ def _active_voice_carrier_keys(session: Session, tenant_id: str) -> list[str]:
     """Return feature_keys of the tenant's ACTIVE subscriptions whose agent
     manifest declares ``includes_voice=True`` (the voice "carriers").
 
-    Uses the SAME entitlement criterion as ``active_feature_keys`` (status in
-    {active, scheduled_for_cancel}, ``active_until`` future-or-NULL, positive
-    quantity) but preserves a deterministic order: the returned list is
-    ``sorted`` by feature_key so the first element is a stable choice across
-    runs. We deliberately do NOT reuse ``active_feature_keys`` — it returns a
-    ``set`` and loses ordering (#204 Решение 1)."""
-    now = datetime.now(UTC)
-    rows = (
-        session.query(TenantSubscription, SubscriptionPlan)
-        .join(SubscriptionPlan, TenantSubscription.plan_id == SubscriptionPlan.id)
-        .filter(TenantSubscription.tenant_id == tenant_id)
-        .all()
-    )
-
+    Uses the SAME entitlement criterion as ``active_feature_keys`` (общий
+    ``_iter_active_subscriptions``) but preserves a deterministic order:
+    the returned list is ``sorted`` by feature_key so the first element is
+    a stable choice across runs. We deliberately do NOT reuse
+    ``active_feature_keys`` — it returns a ``set`` and loses ordering
+    (#204 Решение 1)."""
     registry = get_feature_registry()
     carriers: set[str] = set()
-    for sub, plan in rows:
-        if not sub.quantity or sub.quantity <= 0:
-            continue
-        if sub.status not in {"active", "scheduled_for_cancel"}:
-            continue
-        # Mirror active_feature_keys: NULL active_until = unlimited (sreda_free),
-        # otherwise must still be in the future.
-        if sub.active_until is not None:
-            active_until = sub.active_until
-            if active_until.tzinfo is None:
-                active_until = active_until.replace(tzinfo=UTC)
-            if active_until <= now:
-                continue
+    for _sub, plan in _iter_active_subscriptions(session, tenant_id):
         feature_key = plan.feature_key
         if not feature_key:
             continue

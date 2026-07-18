@@ -78,6 +78,7 @@ class HousewifeFamilyService:
         birth_year: int | None = None,
         age_hint: str | None = None,
         notes: str | None = None,
+        _existing_snapshot: list[tuple[FamilyMember, str]] | None = None,
     ) -> FamilyMember:
         clean_name = (name or "").strip()
         if not clean_name:
@@ -96,8 +97,20 @@ class HousewifeFamilyService:
         # should be considered a duplicate (the LLM just guessed the
         # role differently the second time).
         key = _normalise_name(clean_name)
-        for existing in self.list_members(tenant_id=tenant_id, user_id=user_id):
-            if _normalise_name(existing.name) == key:
+        # audit 2026-07-18 MINOR (N+1): batch передаёт snapshot — пары
+        # (member, normalised_name). Без него каждый add_member батча дёргал
+        # полный SELECT; с ORM-объектами вместо пар — refresh-SELECT на каждый
+        # expired атрибут после commit'ов (expire_on_commit).
+        existing_snapshot = (
+            _existing_snapshot
+            if _existing_snapshot is not None
+            else [
+                (m, _normalise_name(m.name))
+                for m in self.list_members(tenant_id=tenant_id, user_id=user_id)
+            ]
+        )
+        for existing, existing_key in existing_snapshot:
+            if existing_key == key:
                 # #202 (Codex medium R1 MAJOR): НЕ логируем имя (ПД) — на ctx-пути (ReAct) это нарушает
                 # PII-правило проекта. Достаточно tenant/user/id существующей строки.
                 logger.info(
@@ -167,6 +180,17 @@ class HousewifeFamilyService:
         )
         self.session.add(row)
         try:
+            self.session.flush()
+            # audit 2026-07-18 MINOR (N+1): detach ДО commit — ТОЛЬКО в batch-пути
+            # (snapshot передан): иначе expire_on_commit обнуляет атрибуты
+            # возвращаемой строки, и batch-caller дёргает refresh-SELECT на
+            # каждый row.id. INSERT уже во flush'е; чтение полей с
+            # detached-объекта с загруженными атрибутами бесплатно.
+            # Одиночный вызов (snapshot=None) сохраняет session-bound контракт:
+            # возвращённая строка refresh'абельна — контракт #202 (эталон
+            # recipes/checklists: add_* возвращают persistent-объект).
+            if _existing_snapshot is not None:
+                self.session.expunge(row)
             self.session.commit()
         except IntegrityError:
             # Гонка по operation_id — на сингл-тенанте ReAct не ожидается, fail-safe: откат + replay.
@@ -283,6 +307,9 @@ class HousewifeFamilyService:
         seen_in_batch: set[str] = set()
         existing_members = self.list_members(tenant_id=tenant_id, user_id=user_id)
         existing_keys = {_normalise_name(m.name) for m in existing_members}
+        # audit 2026-07-18 MINOR (N+1): snapshot пар (member, normalised_name) —
+        # add_member не перечитывает БД и не трогает expired-атрибуты ORM.
+        existing_snapshot = [(m, _normalise_name(m.name)) for m in existing_members]
         # #202: id уже-существующих + созданных В ЭТОМ батче — для by-name классификации МОРФО-дубля
         # (одна лемма, мимо whitespace-_normalise_name): add_member на ctx-пути вернёт РАНЕЕ созданную
         # строку (op_id/hash pre-check схлопнул) → НЕ считать «созданным» дважды (контракт #115).
@@ -311,6 +338,7 @@ class HousewifeFamilyService:
                     birth_year=raw.get("birth_year"),
                     age_hint=raw.get("age_hint"),
                     notes=raw.get("notes"),
+                    _existing_snapshot=existing_snapshot,
                 )
             except (ValueError, TypeError):
                 result.invalid.append(name)  # #115 nameable validation drop
@@ -323,6 +351,7 @@ class HousewifeFamilyService:
                 result.duplicates_in_batch.append(name)  # морфо-дубль в этом же батче
             else:
                 created_ids.add(row.id)
+                existing_snapshot.append((row, key))  # snapshot актуален для след. элементов
                 result.created.append(row)
         return result
 

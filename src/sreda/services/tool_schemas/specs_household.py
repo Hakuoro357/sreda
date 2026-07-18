@@ -157,7 +157,7 @@ class UpdateFamilyMemberInput(BaseModel):
     - ``age_hint=""`` or ``notes=""`` clears the respective text
       field (clearable variants below allow empty string).
     - ``clear_birth_year=True`` clears the birth_year column —
-      explicit boolean instead of relying on ``birth_year=None``
+      explicit flag instead of relying on ``birth_year=None``
       which already means «no change». This avoids the «remove +
       re-add» destructive workaround (would change member_id and
       orphan notes/role).
@@ -167,9 +167,20 @@ class UpdateFamilyMemberInput(BaseModel):
     ``birth_year=N`` and ``clear_birth_year=True`` are mutually
     exclusive — set ONE or NEITHER; both raises.
 
-    At least ONE updatable field/flag must be non-None/non-False.
+    At least ONE updatable field/flag must be non-None.
     Empty update payload is a planner mistake (would be a no-op at
     runtime); reject so the planner notices.
+
+    Audit 2026-07-18 MAJOR #1 (same class as Codex Sub-A4 R4 MAJOR #1,
+    already fixed for shopping/reminders/tasks): the model_validator
+    below is skipped on the planner's refs-present validation path, so
+    the no-op guard is ALSO declared ToolSpec-side via
+    ``required_any_non_null_args`` (see ``UPDATE_FAMILY_MEMBER_SPEC``).
+    ``clear_birth_year`` is typed ``Literal[True] | None`` (pattern of
+    ``clear_recurrence`` in specs_reminders.py): ``False`` is rejected
+    at validation time — otherwise ``clear_birth_year=False`` would
+    count as a non-null provided field and slip past the no-op guard
+    while the runtime branches only on True.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -177,7 +188,7 @@ class UpdateFamilyMemberInput(BaseModel):
     name: FamilyMemberName | None = None
     role: FamilyRole | None = None
     birth_year: BirthYear | None = None
-    clear_birth_year: bool = False
+    clear_birth_year: Literal[True] | None = None
     age_hint: AgeHintClearable | None = None
     notes: FamilyNotesClearable | None = None
 
@@ -317,6 +328,24 @@ UPDATE_FAMILY_MEMBER_SPEC = ToolSpec(
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
+    # Audit 2026-07-18 MAJOR #1 (тот же класс, что Codex Sub-A4 R4
+    # MAJOR #1 в shopping/reminders/tasks): @model_validator
+    # `_validate_at_least_one_field` ловит полностью литеральный no-op,
+    # но refs-present путь план-валидатора пропускает model_validators.
+    # Декларация имён здесь закрывает no-op «только member_id=ref»
+    # статическим валидатором: минимум одно мутабельное поле non-null
+    # (refs и пустые строки-clear считаются non-null). Для
+    # ``clear_birth_year`` схемный тип ``Literal[True] | None`` отклоняет
+    # False ДО этого списка — здесь флаг лишь засчитывается как вклад,
+    # когда присутствует (паттерн specs_reminders.py:316-321).
+    required_any_non_null_args=[
+        "name",
+        "role",
+        "birth_year",
+        "clear_birth_year",
+        "age_hint",
+        "notes",
+    ],
 )
 
 

@@ -12,10 +12,11 @@ This module imports every per-family ``specs_<family>.py`` and exposes:
   ToolSpec. Codex Sub-A4 reminders R1 MINOR #10: previously a
   mutable list alias which let callers accidentally mutate either
   name. Tuple makes the «forward compatibility» contract
-  enforceable. Final count (post-migration) is **55 tools** (47
-  housewife + 4 memory + 3 web + 1 utility). The future
+  enforceable. Migration is complete: **56 typed ToolSpecs**
+  (the 60-tool manifest also carries 4 ReAct-only tools without a
+  plan-execute spec — see ``families.REACT_ONLY_TOOLS``). The future
   ``get_recipe_any_source`` (architecture-map TODO-2) will bump
-  this to 56 when the runtime function ships.
+  this to 57 when the runtime function ships.
 
 **ToolOutputContractViolation contract** (Codex Sub-A4 R1 MAJOR #6):
 
@@ -67,22 +68,21 @@ MIGRATED_TOOL_SPECS: list[ToolSpec] = [
     *UI_SPECS,
     *WEB_SPECS,
 ]
-"""All 12 families migrated to typed planner layer. 55 tools total
-(47 housewife + 4 memory/utility cross-skill + 3 web + 1
-reply_with_buttons UI). Sub-A4 100% complete after Codex review
-cycles for memory/utility/ui/web."""
-"""Every ToolSpec migrated to the typed registry so far. Initial set
-is the 7-tool shopping family; expand as each subsequent family ships."""
+"""All 12 families migrated to typed planner layer. 56 typed ToolSpecs
+total (60-tool manifest minus 4 REACT_ONLY_TOOLS). Sub-A4 100% complete
+after Codex review cycles for memory/utility/ui/web. Audit 2026-07-18
+MINOR: dropped the second, contradictory docstring block («Initial set
+is the 7-tool shopping family…») — stale since the first Sub-A4 PR."""
 
 
 ALL_TOOL_SPECS: tuple[ToolSpec, ...] = tuple(MIGRATED_TOOL_SPECS)
 """Read-only view of every migrated ToolSpec. Currently equals
 ``MIGRATED_TOOL_SPECS`` (as a tuple). Will diverge once incremental
 Sub-A4 work creates a distinction between «known to the planner»
-and «known to the migration plan». Final count post-migration is
-**55 tools** (47 housewife + 4 memory + 3 web + 1 utility), with the
-future ``get_recipe_any_source`` (architecture-map TODO-2) bumping
-this to 56 when the runtime function ships.
+and «known to the migration plan». Migration is complete at
+**56 typed ToolSpecs** (60-tool manifest minus 4 REACT_ONLY_TOOLS),
+with the future ``get_recipe_any_source`` (architecture-map TODO-2)
+bumping this to 57 when the runtime function ships.
 
 Codex Sub-A4 reminders R1 MINOR #10: was ``list[ToolSpec]`` aliasing
 ``MIGRATED_TOOL_SPECS`` directly — any mutation on either name would

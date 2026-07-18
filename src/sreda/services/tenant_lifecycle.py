@@ -9,10 +9,11 @@ plan `db-fix-tenant-deletion-plan.md`). Вызывается fail-closed во в
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 
 from sqlalchemy import create_engine, exists, select, text, update
@@ -156,6 +157,21 @@ def tenant_advisory_lock(session: Session, tenant_id: str) -> Iterator[None]:
         yield
         return
 
+    lock_conn = _acquire_lock_conn(bind, tenant_id)
+    try:
+        yield
+    finally:
+        _release_lock_conn(lock_conn, tenant_id)
+
+
+def _acquire_lock_conn(bind, tenant_id: str):
+    """Блокирующий захват lock-conn + ``pg_advisory_lock`` (обвязка барьера).
+
+    🔴 В async-контексте вызывать ТОЛЬКО через ``asyncio.to_thread``
+    (audit-fix 2026-07-18, svc-security MINOR #6): ``pg_advisory_lock`` —
+    синхронный блокирующий вызов psycopg; выполненный в потоке event loop,
+    он останавливает ВЕСЬ loop (все tenants/HTTP) на время ожидания лока.
+    """
     key = _tenant_advisory_lock_key(tenant_id)
     # КЭШИРОВАННЫЙ engine на URL рабочего engine (NullPool) — lock-conn полностью
     # изолирован от рабочего пула (зеркало _lock_conn в поллере), но Engine не
@@ -164,7 +180,7 @@ def tenant_advisory_lock(session: Session, tenant_id: str) -> Iterator[None]:
     # ключ кэша str() вычисляется ВНУТРИ _get_lock_engine.
     lock_engine = _get_lock_engine(bind.engine.url)
     # MINOR: если connect() упал — закрывать нечего (engine кэширован, не
-    # диспоузим). Поэтому connect ВНЕ внутреннего try/finally: исключение из
+    # диспоузим). Поэтому connect ВНЕ внутреннего try: исключение из
     # connect() прокидывается без попытки close на None-соединении.
     lock_conn = lock_engine.connect()
     try:
@@ -172,31 +188,76 @@ def tenant_advisory_lock(session: Session, tenant_id: str) -> Iterator[None]:
         # Закрыть autobegin-транзакцию: advisory-лок session-scoped, переживёт
         # commit; без commit соединение зависло бы в `idle in transaction`.
         lock_conn.commit()
+    except Exception:
+        # Захват/коммит не удался — закрываем conn сами (close рвёт
+        # физ.коннект → даже частично взятый лок гарантированно отпущен),
+        # исключение прокидываем вызывающему.
+        try:
+            lock_conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    return lock_conn
+
+
+def _release_lock_conn(lock_conn, tenant_id: str) -> None:
+    """Best-effort ``pg_advisory_unlock`` → close (зеркало finally sync-версии).
+
+    Блокирующий вызов — в async-контексте только через ``asyncio.to_thread``.
+    """
+    key = _tenant_advisory_lock_key(tenant_id)
+    # unlock (best-effort) → close. close физически рвёт коннект (NullPool) и
+    # отпускает session-scoped lock даже если unlock не прошёл. Engine НЕ
+    # диспоузим — он кэшируется/переиспользуется.
+    try:
+        lock_conn.execute(
+            text("SELECT pg_advisory_unlock(:k)"), {"k": key}
+        )
+        lock_conn.commit()
+    except Exception:  # noqa: BLE001
+        # unlock не прошёл — не страшно: close ниже физически рвёт соединение
+        # (NullPool), что гарантированно отпускает session-scoped lock.
+        # Логируем, не маскируем ход.
+        logger.exception(
+            "tenant_advisory_lock: pg_advisory_unlock failed for tenant %s "
+            "(connection close will release the lock)",
+            tenant_id,
+        )
+    finally:
+        try:
+            lock_conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@asynccontextmanager
+async def tenant_advisory_lock_async(
+    session: Session, tenant_id: str
+) -> AsyncIterator[None]:
+    """Async-вариант ``tenant_advisory_lock`` (audit-fix 2026-07-18,
+    svc-security MINOR #6) — для входа из корутины.
+
+    Захват и освобождение ``pg_advisory_lock`` — блокирующие psycopg-вызовы;
+    sync-версия, вошедшая из async-хода (``ExitStack.enter_context`` в
+    корутине), останавливала ВЕСЬ event loop на время ожидания лока
+    (все tenants/HTTP), если ``soft_delete_tenant`` держит тот же ключ.
+    Здесь оба блокирующих шага уносятся в ``asyncio.to_thread`` — loop
+    продолжает обслуживать остальные корутины, пока этот ход ждёт барьер.
+
+    Семантика (session-scoped lock на отдельном NullPool-conn, кэшированный
+    engine, SQLite no-op) — та же, что у sync-версии; см. её docstring.
+    """
+    bind = session.get_bind()
+    dialect = bind.dialect.name if bind is not None else ""
+    if dialect != "postgresql":
+        yield
+        return
+
+    lock_conn = await asyncio.to_thread(_acquire_lock_conn, bind, tenant_id)
+    try:
         yield
     finally:
-        # conn закрывается на ЛЮБОМ пути после успешного connect (вкл. провал
-        # pg_advisory_lock выше): unlock (best-effort) → close. close физически
-        # рвёт коннект (NullPool) и отпускает session-scoped lock даже если unlock
-        # не прошёл. Engine НЕ диспоузим — он кэшируется/переиспользуется.
-        try:
-            lock_conn.execute(
-                text("SELECT pg_advisory_unlock(:k)"), {"k": key}
-            )
-            lock_conn.commit()
-        except Exception:  # noqa: BLE001
-            # unlock не прошёл — не страшно: close ниже физически рвёт соединение
-            # (NullPool), что гарантированно отпускает session-scoped lock.
-            # Логируем, не маскируем ход.
-            logger.exception(
-                "tenant_advisory_lock: pg_advisory_unlock failed for tenant %s "
-                "(connection close will release the lock)",
-                tenant_id,
-            )
-        finally:
-            try:
-                lock_conn.close()
-            except Exception:  # noqa: BLE001
-                pass
+        await asyncio.to_thread(_release_lock_conn, lock_conn, tenant_id)
 
 
 def _write_lifecycle_audit(

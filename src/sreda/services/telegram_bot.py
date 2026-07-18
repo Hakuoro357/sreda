@@ -344,9 +344,12 @@ async def _maybe_transcribe_voice(
     # Free tier only. Refund LLM if ffprobe fails OR voice quota
     # exceeded (so юзер не charged за text fallback / upgrade rejection).
     if _is_free and _ledger and _llm_periods and _voice_periods:
-        from sreda.services.audio_probe import FfprobeError, ffprobe_duration
+        from sreda.services.audio_probe import FfprobeError, probe_audio_async
         try:
-            _duration_seconds = ffprobe_duration(audio_bytes)
+            # Аудит 2026-07-18 (svc-features #2 / cross-latency П5): ffprobe
+            # через async-обёртку (asyncio.to_thread) — sync subprocess.run
+            # блокировал event loop на время probe (до 10с на битом файле).
+            _duration_seconds = await probe_audio_async(audio_bytes)
         except FfprobeError as exc:
             logger.warning("ffprobe failed: %s — refunding LLM, sending text fallback", exc)
             _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
@@ -439,6 +442,7 @@ async def _handle_callback(
             telegram_client=telegram_client,
             callback_query=callback_query,
             data=data,
+            onboarding=onboarding,
         )
         return
 
@@ -882,6 +886,7 @@ async def _handle_reminder_callback(
     telegram_client: TelegramClient,
     callback_query: dict,
     data: str,
+    onboarding: TelegramOnboardingResult,
 ) -> None:
     """Handle the "Сделал ✅" / "Отложить ⏰" buttons on a housewife
     reminder message. Updates the FamilyReminder state, edits the
@@ -933,6 +938,27 @@ async def _handle_reminder_callback(
             try:
                 await telegram_client.answer_callback_query(
                     callback_id, text="Это напоминание уже выполнено."
+                )
+            except TelegramDeliveryError:
+                pass
+        return
+
+    # Cross-tenant defensive check (аудит 2026-07-18 svc-inbound #4; зеркало
+    # MAX-версии ``max_inbound._handle_max_reminder_callback``). id напоминаний
+    # непредсказуем, но это hardening-пробел и расхождение зеркал: чужой
+    # тенант обязан получить отказ БЕЗ мутации напоминания.
+    if reminder.tenant_id != onboarding.tenant_id:
+        logger.warning(
+            "tg reminder cb cross-tenant: caller=%s reminder=%s — refused",
+            onboarding.tenant_id, reminder.tenant_id,
+        )
+        # Отпускаем FOR UPDATE-лок строки ДО сетевого ответа (как MAX-эталон):
+        # тенант не наш — мутаций нет, rollback безопасен.
+        session.rollback()
+        if callback_id:
+            try:
+                await telegram_client.answer_callback_query(
+                    callback_id, text="Это напоминание не ваше."
                 )
             except TelegramDeliveryError:
                 pass

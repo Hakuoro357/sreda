@@ -353,7 +353,10 @@ class ChecklistService:
         for raw in items or []:
             s = (raw or "").strip()
             if s:
-                cleaned.append(s[:200] if len(s) > 200 else s)
+                # Аудит 2026-07-18 (svc-features #6): кап унифицирован с add_items
+                # (1000, safety cap под EncryptedString/Text) — раньше composite-путь
+                # молча резал до 200, обычный до 1000 → разное сохранение одного пункта.
+                cleaned.append(s[:1000] if len(s) > 1000 else s)
         if not cleaned:
             return [], []
 
@@ -405,6 +408,25 @@ class ChecklistService:
         cl = self._get_owned(tenant_id, user_id, list_id)
         if cl is None:
             return None
+        # Аудит 2026-07-18 (svc-features #5): R-33 unlink-семантика miniapp
+        # (miniapp.py: auto-unlink linked task перед archive) перенесена в
+        # сервис — LLM-путь (housewife_chat_tools.archive_checklist) раньше
+        # архивил без отвязки: task.checklist_id продолжал указывать на
+        # архивный список (📋-кнопка в архив, link_to_checklist →
+        # error:task_already_linked_to_other). Для miniapp-пути идемпотентно:
+        # там unlink уже сделан → запрос найдёт 0 строк.
+        from sreda.db.models.tasks import Task
+        linked_task = (
+            self.session.query(Task)
+            .filter(
+                Task.checklist_id == cl.id,
+                Task.tenant_id == tenant_id,
+                Task.user_id == user_id,
+            )
+            .one_or_none()
+        )
+        if linked_task is not None:
+            linked_task.checklist_id = None
         cl.status = "archived"
         cl.updated_at = _utcnow()
         self.session.commit()

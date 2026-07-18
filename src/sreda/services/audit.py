@@ -19,6 +19,14 @@ dict без записи) на реальный лог в БД.
 
 Best-effort: ошибки записи логируются но не пробрасываются — основной
 flow не должен падать из-за audit log issues.
+
+Транзакционный контракт (audit-fix 2026-07-18, svc-ops MINOR #3):
+по умолчанию хелпер НЕ коммитит и НЕ откатывает чужую сессию — только
+``add``+``flush``, жизненным циклом транзакции владеет вызывающий
+(rollback на failure-путях — тоже его обязанность, FC-1). ``commit=True``
+— явный opt-in для call-site'ов, которые сами владеют сессией и хотят
+немедленную durability; только в этом режиме хелпер делает ``commit()``
+и ``rollback()`` на ошибке (на Postgres транзакция всё равно aborted).
 """
 
 from __future__ import annotations
@@ -50,7 +58,7 @@ def audit_event(
     resource_type: str | None = None,
     resource_id: str | None = None,
     metadata: dict[str, Any] | None = None,
-    commit: bool = True,
+    commit: bool = False,
 ) -> AuditLog | None:
     """Запись события в audit_log.
 
@@ -62,8 +70,12 @@ def audit_event(
         resource_type: тип объекта («tenant», «user», «message»).
         resource_id: ID объекта.
         metadata: dict без PII (только технические поля).
-        commit: если True — commit'ит сразу. False для случаев когда
-            вызывающий код управляет транзакцией сам.
+        commit: False (default) — только add+flush, транзакцией владеет
+            вызывающий (хелпер НЕ коммитит чужую сессию и НЕ делает
+            rollback, который на SQLite молча отбросил бы pending-работу
+            caller'а). True — opt-in для caller'а, владеющего сессией:
+            commit сразу, а на ошибке — rollback (на Postgres транзакция
+            после ошибки всё равно aborted).
 
     Returns:
         Созданный AuditLog row или None если запись не удалась.
@@ -96,10 +108,16 @@ def audit_event(
             "audit_event failed: action=%s resource=%s/%s",
             action, resource_type, resource_id,
         )
-        try:
-            session.rollback()
-        except Exception:  # noqa: BLE001
-            pass
+        if commit:
+            # Мы владеем транзакцией (commit=True): на Postgres она всё
+            # равно aborted → rollback обязателен, чтобы сессия снова
+            # стала usable. При commit=False rollback — дело вызывающего
+            # (FC-1): здесь он молча отбросил бы чужую pending-работу
+            # (на SQLite транзакция после ошибки остаётся живой).
+            try:
+                session.rollback()
+            except Exception:  # noqa: BLE001
+                pass
         return None
 
 

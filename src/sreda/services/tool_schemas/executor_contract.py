@@ -49,6 +49,25 @@ from sreda.services.tool_schemas.base import ToolOutputContractViolation
 from sreda.services.tool_schemas.housewife import parse_tool_output
 
 
+# Audit 2026-07-18 MINOR: ``dispatch_typed_output`` is on the hot path
+# of EVERY tool call — building a fresh ``TypeAdapter`` for the
+# discriminated union each time costs repeated milliseconds in a system
+# whose main constraint is end-to-end latency. ``output_model`` objects
+# are module-level constants (``ToolSpec.output_model``), so a plain
+# dict keyed by the model object itself is safe (no id() reuse risk).
+# Benign race: two threads may build the same adapter once — the last
+# store wins, both adapters are equivalent.
+_ADAPTER_CACHE: dict[Any, TypeAdapter] = {}
+
+
+def _get_output_adapter(output_model: Any) -> TypeAdapter:
+    adapter = _ADAPTER_CACHE.get(output_model)
+    if adapter is None:
+        adapter = TypeAdapter(output_model)
+        _ADAPTER_CACHE[output_model] = adapter
+    return adapter
+
+
 class PlannerGapError(Exception):
     """Raised when a tool's raw output is unparseable (sentinel path).
 
@@ -124,7 +143,7 @@ def dispatch_typed_output(
     # executor's ``model_dump`` for the presenter) still carries them.
     computed = set(getattr(type(parsed), "model_computed_fields", {}))
     dumped = parsed.model_dump(exclude=computed) if computed else parsed.model_dump()
-    return TypeAdapter(output_model).validate_python(dumped)
+    return _get_output_adapter(output_model).validate_python(dumped)
 
 
 __all__ = [

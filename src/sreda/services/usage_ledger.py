@@ -39,6 +39,7 @@ Period semantics: `Europe/Moscow`. period_key format:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -125,35 +126,16 @@ class UsageLedgerService:
         attempts с 50ms exponential backoff.
         """
         periods_list = [self._normalize_period(p) for p in periods]
-
-        is_pg = self.engine.dialect.name == "postgresql"
-        # #331: изоляцию ставим через execution_options (уровень СОЕДИНЕНИЯ — драйвер применяет ДО BEGIN),
-        # а НЕ ручным `SET TRANSACTION ISOLATION LEVEL` внутри транзакции. Причина: #138 повесил на app-движок
-        # begin-событие (`set_config('sreda.tenant_id',…)`), которое теперь ПЕРВЫЙ запрос транзакции → Postgres
-        # роняет `SET TRANSACTION ISOLATION LEVEL must be called before any query` (ActiveSqlTransaction),
-        # крэшив ход нового юзера лендинга. execution_options ставит SERIALIZABLE на соединении → BEGIN уже
-        # сериализуемый, GUC-хук выполняется штатно. SQLite: изоляцию не трогаем (single-writer сериализация).
-        _engine = (self.engine.execution_options(isolation_level="SERIALIZABLE")
-                   if is_pg else self.engine)
+        _engine = self._serializable_engine()
         for attempt in range(3):
             try:
-                with _engine.begin() as conn:
-                    for spec in periods_list:
-                        if not self._try_consume_one(
-                            conn, tenant_id, metric, amount, spec,
-                        ):
-                            raise QuotaExhaustedError(
-                                f"{metric} {spec.period_type}={spec.period_key}"
-                            )
-                    return True
+                return self._consume_attempt(
+                    _engine, periods_list, tenant_id, metric, amount
+                )
             except QuotaExhaustedError:
                 return False
             except DBAPIError as exc:
-                sqlstate = (
-                    getattr(exc.orig, "sqlstate", None)
-                    or getattr(exc.orig, "pgcode", None)
-                )
-                if sqlstate == "40001":  # serialization_failure
+                if self._is_serialization_conflict(exc):
                     backoff = 0.05 * (attempt + 1)
                     logger.info(
                         "usage_ledger serialization conflict, "
@@ -166,6 +148,86 @@ class UsageLedgerService:
         raise RuntimeError(
             "Quota consume retried 3× — все serialization failures (SQLSTATE 40001)"
         )
+
+    async def try_consume_async(
+        self,
+        tenant_id: str,
+        metric: str,
+        amount: float | int | Decimal,
+        periods: list[PeriodSpec | tuple[str, str, float | int]],
+    ) -> bool:
+        """Async-вариант try_consume для async-handlers (2026-07-18 audit #5).
+
+        Sync try_consume при serialization conflict делал time.sleep(0.05–0.15)
+        — синхронную блокировку event loop'а на async hot-path (telegram_bot /
+        max_inbound вызывают его из async-обработчиков голоса/чата). Здесь и
+        DB-roundtrip, и backoff не блокируют цикл: попытка уходит в
+        asyncio.to_thread, ожидание — asyncio.sleep. Семантика (all-or-nothing,
+        3 попытки, QuotaExhaustedError → False) идентична sync-версии.
+        """
+        periods_list = [self._normalize_period(p) for p in periods]
+        _engine = self._serializable_engine()
+        for attempt in range(3):
+            try:
+                return await asyncio.to_thread(
+                    self._consume_attempt,
+                    _engine, periods_list, tenant_id, metric, amount,
+                )
+            except QuotaExhaustedError:
+                return False
+            except DBAPIError as exc:
+                if self._is_serialization_conflict(exc):
+                    backoff = 0.05 * (attempt + 1)
+                    logger.info(
+                        "usage_ledger serialization conflict (async), "
+                        "retry attempt=%d after %.0fms",
+                        attempt + 1, backoff * 1000,
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
+        raise RuntimeError(
+            "Quota consume retried 3× — все serialization failures (SQLSTATE 40001)"
+        )
+
+    def _serializable_engine(self) -> Engine:
+        # #331: изоляцию ставим через execution_options (уровень СОЕДИНЕНИЯ — драйвер применяет ДО BEGIN),
+        # а НЕ ручным `SET TRANSACTION ISOLATION LEVEL` внутри транзакции. Причина: #138 повесил на app-движок
+        # begin-событие (`set_config('sreda.tenant_id',…)`), которое теперь ПЕРВЫЙ запрос транзакции → Postgres
+        # роняет `SET TRANSACTION ISOLATION LEVEL must be called before any query` (ActiveSqlTransaction),
+        # крэшив ход нового юзера лендинга. execution_options ставит SERIALIZABLE на соединении → BEGIN уже
+        # сериализуемый, GUC-хук выполняется штатно. SQLite: изоляцию не трогаем (single-writer сериализация).
+        if self.engine.dialect.name == "postgresql":
+            return self.engine.execution_options(isolation_level="SERIALIZABLE")
+        return self.engine
+
+    @staticmethod
+    def _is_serialization_conflict(exc: DBAPIError) -> bool:
+        sqlstate = (
+            getattr(exc.orig, "sqlstate", None)
+            or getattr(exc.orig, "pgcode", None)
+        )
+        return sqlstate == "40001"  # serialization_failure
+
+    def _consume_attempt(
+        self,
+        engine: Engine,
+        periods_list: list[PeriodSpec],
+        tenant_id: str,
+        metric: str,
+        amount: float | int | Decimal,
+    ) -> bool:
+        """Одна попытка all-or-nothing consume (без retry) — общая для
+        sync/async retry-циклов."""
+        with engine.begin() as conn:
+            for spec in periods_list:
+                if not self._try_consume_one(
+                    conn, tenant_id, metric, amount, spec,
+                ):
+                    raise QuotaExhaustedError(
+                        f"{metric} {spec.period_type}={spec.period_key}"
+                    )
+            return True
 
     def _try_consume_one(
         self,

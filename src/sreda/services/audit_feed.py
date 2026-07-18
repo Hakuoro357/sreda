@@ -51,7 +51,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -522,24 +522,40 @@ def relay_outbox(
         # is expected to wrap the relay call in its own SAVEPOINT
         # if it wants per-row isolation. The pre-check above closes
         # the common race path (op_id already in feed) cheaply.
+        #
+        # audit-fix 2026-07-18 (svc-ops MAJOR #1): per-row SAVEPOINT
+        # вокруг INSERT+DELETE. Раньше generic-ветка ``except Exception``
+        # делала ``session.flush()`` retry-маркировки на УЖЕ «отравленной»
+        # Postgres-транзакции («current transaction is aborted, commands
+        # ignored until end of transaction block») — маркировка сама
+        # падала, исключение всплывало и роняло весь батч, а
+        # attempts/last_error не сохранялись (застрявшая строка крутилась
+        # бы вечно без диагностики). Теперь savepoint откатывает только
+        # сломанную строку, транзакция остаётся рабочей и маркировка
+        # ретрая реально ложится — как и обещает docstring. IntegrityError
+        # по-прежнему пробрасывается (контракт R3 MAJOR #1 не меняется).
+        outbox_id = outbox_event.id
+        op_id = outbox_event.operation_id
+        feed_event: UserDataChangeFeedEvent | None = None
         try:
-            feed_event = UserDataChangeFeedEvent(
-                operation_id=outbox_event.operation_id,
-                tenant_id=outbox_event.tenant_id,
-                user_id=outbox_event.user_id,
-                source=outbox_event.source,
-                entity_type=outbox_event.entity_type,
-                entity_id=outbox_event.entity_id,
-                action=outbox_event.action,
-                payload=outbox_event.payload,
-                payload_hash=outbox_event.payload_hash,
-                caused_by=outbox_event.caused_by,
-                occurred_at=outbox_event.occurred_at,
-            )
-            session.add(feed_event)
-            session.flush()
-            session.delete(outbox_event)
-            session.flush()
+            with session.begin_nested():
+                feed_event = UserDataChangeFeedEvent(
+                    operation_id=outbox_event.operation_id,
+                    tenant_id=outbox_event.tenant_id,
+                    user_id=outbox_event.user_id,
+                    source=outbox_event.source,
+                    entity_type=outbox_event.entity_type,
+                    entity_id=outbox_event.entity_id,
+                    action=outbox_event.action,
+                    payload=outbox_event.payload,
+                    payload_hash=outbox_event.payload_hash,
+                    caused_by=outbox_event.caused_by,
+                    occurred_at=outbox_event.occurred_at,
+                )
+                session.add(feed_event)
+                session.flush()
+                session.delete(outbox_event)
+                session.flush()
             relayed += 1
         except IntegrityError:
             # Codex R3 MAJOR #1 — propagate so the caller's
@@ -554,19 +570,35 @@ def relay_outbox(
             _logger.warning(
                 "relay_outbox: race on op_id=%s (concurrent relay?); "
                 "raising for caller's savepoint to handle.",
-                outbox_event.operation_id,
+                op_id,
             )
             raise
         except Exception as exc:  # noqa: BLE001
             _logger.exception(
                 "relay_outbox: failed to move op_id=%s; will retry next tick",
-                outbox_event.operation_id,
+                op_id,
             )
-            # Mark the row for retry — UPDATE lands in same txn.
-            outbox_event.attempts += 1
-            outbox_event.last_attempt_at = when
-            outbox_event.last_error = repr(exc)[:1000]
-            session.flush()
+            # Savepoint уже откатился при выходе из begin_nested —
+            # транзакция снова usable. ORM-объекты могли зафиксировать
+            # частичное состояние (feed_event — flushed-then-rolled-back,
+            # outbox_event — помечен deleted): отцепляем то, что ещё в
+            # сессии (SQLAlchemy при savepoint-rollback часть состояния
+            # ревертит сама), чтобы commit вызывающего НЕ переудалил/не
+            # пересоздал строки по stale ORM-state, и маркируем ретрай
+            # Core-UPDATE'ом — теперь он легален на живой транзакции.
+            if feed_event is not None and feed_event in session:
+                session.expunge(feed_event)
+            if outbox_event in session:
+                session.expunge(outbox_event)
+            session.execute(
+                update(AuditOutboxEvent)
+                .where(AuditOutboxEvent.id == outbox_id)
+                .values(
+                    attempts=AuditOutboxEvent.attempts + 1,
+                    last_attempt_at=when,
+                    last_error=repr(exc)[:1000],
+                )
+            )
 
     return relayed
 

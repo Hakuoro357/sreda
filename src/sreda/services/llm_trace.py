@@ -60,7 +60,6 @@ import dataclasses
 import json
 import logging
 import os
-import re
 import stat
 import threading
 import time
@@ -312,16 +311,6 @@ def _open_trace_file(path: Path) -> int:
     return fd
 
 
-def _trace_path(envelope: dict) -> Path:
-    """Resolve absolute path для envelope, midnight-safe via _TRACE_DATES."""
-    trace_id = envelope["trace_id"]
-    with _TRACE_STATE_GUARD:
-        if trace_id not in _TRACE_DATES:
-            _TRACE_DATES[trace_id] = datetime.now(timezone.utc).date().isoformat()
-        folder_date = _TRACE_DATES[trace_id]
-    return _TRACE_ROOT / folder_date / f"{trace_id}.jsonl"
-
-
 def _write_envelope(envelope: dict) -> None:
     """Sync write of one envelope row. Called by writer thread.
 
@@ -411,6 +400,20 @@ async def _writer_loop() -> None:
     while True:
         item = await _WRITE_QUEUE.get()
         envelope, caller_future = item
+        if caller_future is not None and caller_future.cancelled():
+            # persist_request_envelope отдал вызывающему TIMEOUT —
+            # asyncio.wait_for отменил его future. По контракту
+            # «WRITTEN ⇔ можно звонить» (require_persist) envelope
+            # НЕ должен появиться на диске: иначе останется request-
+            # строка для LLM-вызова, который никогда не выполнялся
+            # (аудит 2026-07-18, llm-core MINOR #10). Race с уже
+            # in-flight записью в executor неизбежен и безопасен.
+            logger.debug(
+                "llm-trace skipping envelope with timed-out caller trace_id=%s",
+                envelope.get("trace_id"),
+            )
+            _WRITE_QUEUE.task_done()
+            continue
         try:
             loop = asyncio.get_running_loop()
             write_future = loop.run_in_executor(
@@ -464,7 +467,9 @@ async def persist_request_envelope(envelope: dict) -> PersistResult:
 
     - WRITTEN — envelope persisted (or no-op success when feature disabled)
     - DROPPED — queue full / writer not ready / shutdown
-    - TIMEOUT — write didn't complete within 2s
+    - TIMEOUT — write didn't complete within 2s; ещё не записанный
+      envelope отбрасывается writer'ом (см. ``_writer_loop``), чтобы
+      TIMEOUT не оставлял request-строку для отменённого LLM-вызова
     - FAILED — internal exception (defensive)
 
     Caller checks result + sends admin alert если != WRITTEN. Если

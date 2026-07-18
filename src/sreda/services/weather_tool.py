@@ -40,6 +40,7 @@ from __future__ import annotations
 import datetime as _datetime_module
 import logging
 import threading
+import time as _time_module
 from collections.abc import Callable
 from datetime import (
     date as _date,
@@ -68,6 +69,31 @@ _HOURLY_CAP_HOURS = 48  # max часов в hourly output (даже если day
 _GEO_CACHE: dict[str, tuple[float, float, str, str]] = {}
 # Lock-protected чтобы Phase B parallel dispatch не race'ил на dict write.
 _GEO_CACHE_LOCK = threading.Lock()
+
+# Аудит 2026-07-18 (svc-features #11): негативный кэш геокодинга. Без него
+# неудачный город или лежащий Open-Meteo (timeout=8с) повторно бился в сеть на
+# каждый retry LLM внутри хода — серийные 8-секундные таймауты на hot-path.
+# key → monotonic-expiry; TTL короткий (60с): ход длится секунды, а восстановление
+# провайдера не маскируется надолго. Success-кэш без TTL (координаты не меняются),
+# негатив — транзиентен, поэтому с TTL.
+_GEO_NEG_CACHE: dict[str, float] = {}
+_GEO_NEG_TTL_SECONDS = 60.0
+_GEO_NEG_CACHE_MAX = 1024  # bound против мусорных уникальных городов (П2-гигиена)
+
+# Дефолт per-turn storm-cap для get_weather (svc-features #11; как
+# react_web_search_per_turn_cap=4 в #211). Переопределяется параметром
+# build_weather_tool(per_turn_cap=...).
+_WEATHER_DEFAULT_PER_TURN_CAP = 4
+
+
+def _geo_neg_remember(key: str) -> None:
+    """Записать негативный результат с TTL; при переполнении — purge протухших."""
+    with _GEO_CACHE_LOCK:
+        if len(_GEO_NEG_CACHE) >= _GEO_NEG_CACHE_MAX:
+            now = _time_module.monotonic()
+            for k in [k for k, exp in _GEO_NEG_CACHE.items() if exp <= now]:
+                del _GEO_NEG_CACHE[k]
+        _GEO_NEG_CACHE[key] = _time_module.monotonic() + _GEO_NEG_TTL_SECONDS
 
 
 # WMO weathercode → emoji (https://open-meteo.com/en/docs)
@@ -447,8 +473,14 @@ def _geocode(location: str) -> tuple[float, float, str, str] | None:
     # Read под lock (Codex Phase B finding — concurrent dispatch может race).
     with _GEO_CACHE_LOCK:
         cached = _GEO_CACHE.get(key)
+        neg_expiry = _GEO_NEG_CACHE.get(key)
     if cached is not None:
         return cached
+    # Аудит 2026-07-18 (svc-features #11): негативный кэш — повторный сетевой
+    # вызов в пределах TTL не делаем (лежачий провайдер/неудачный город не
+    # штурмуем на каждый retry LLM внутри хода).
+    if neg_expiry is not None and neg_expiry > _time_module.monotonic():
+        return None
 
     # Network call ВНЕ lock — long, не держим pool.
     try:
@@ -460,11 +492,17 @@ def _geocode(location: str) -> tuple[float, float, str, str] | None:
         r.raise_for_status()
         data = r.json()
     except (httpx.HTTPError, ValueError) as exc:
-        logger.warning("weather geocode failed for %r: %s", location, exc)
+        # Аудит 2026-07-18 (svc-features #8 / cross-security П4): город юзера —
+        # PII (фактическая геолокация), в лог открыто не пишем — только длина.
+        logger.warning(
+            "weather geocode failed (location len=%d): %s", len(location or ""), exc,
+        )
+        _geo_neg_remember(key)
         return None
 
     results = data.get("results") or []
     if not results:
+        _geo_neg_remember(key)  # город не найден — в пределах хода не переспрашиваем
         return None
     first = results[0]
     try:
@@ -541,15 +579,34 @@ def _fetch_forecast(
         r.raise_for_status()
         return r.json()
     except (httpx.HTTPError, ValueError) as exc:
+        # Аудит 2026-07-18 (svc-features #8 / cross-security П4): lat/lon с
+        # точностью 3 знака — фактическая геолокация юзера (PII), в лог не пишем.
         logger.warning(
-            "weather forecast failed for %.3f,%.3f granularity=%s: %s",
-            lat, lon, granularity, exc,
+            "weather forecast failed granularity=%s: %s",
+            granularity, exc,
         )
         return None
 
 
-def build_weather_tool() -> Callable:
-    """Return LangChain tool ``get_weather(location, day_offset, days_count, granularity)``."""
+def build_weather_tool(*, per_turn_cap: int | None = None) -> Callable:
+    """Return LangChain tool ``get_weather(location, day_offset, days_count, granularity)``.
+
+    Аудит 2026-07-18 (svc-features #11): per-turn storm-cap по образцу #211
+    (web_search/fetch_url). build_weather_tool пересобирается КАЖДЫЙ ход
+    (build_slice_tools per-turn) → счётчик в замыкании сам сбрасывается.
+    Дефолт 4 (как react_web_search_per_turn_cap); <=0 = выкл. Настройки в
+    config нет — параметр для будущего knob'а и тестов.
+    """
+    if per_turn_cap is None:
+        per_turn_cap = _WEATHER_DEFAULT_PER_TURN_CAP
+    try:
+        per_turn_cap = max(0, int(per_turn_cap or 0))  # клампим (<=0 = выкл)
+    except (ValueError, TypeError):
+        per_turn_cap = 0
+    _turn_weather_calls = [0]
+    # Lock — корректный инкремент при конкурентных read-шагах plan-execute
+    # (asyncio.gather + thread-pool), как в web_search (#211, Codex R1 MAJOR).
+    _turn_weather_lock = threading.Lock()
 
     @lc_tool
     def get_weather(
@@ -596,6 +653,20 @@ def build_weather_tool() -> Callable:
         # Validate inputs
         if not (location or "").strip():
             return "error: empty location"
+
+        # Аудит 2026-07-18 (svc-features #11): жёсткая отсечка шторма — не более
+        # per_turn_cap погодных запросов за ОДИН ход, ДО geocode (экономим и
+        # 8-секундные таймауты лежачего Open-Meteo, и время hot-path). #211-паттерн.
+        if per_turn_cap > 0:
+            with _turn_weather_lock:
+                _turn_weather_calls[0] += 1
+                over_cap = _turn_weather_calls[0] > per_turn_cap
+            if over_cap:
+                return (
+                    "error:weather_turn_limit: достигнут предел погодных запросов "
+                    "за один ответ — ответь тем, что уже получено; новые запросы "
+                    "погоды в этом ходе не выполняются"
+                )
 
         # Granularity normalization (fail-loud — explicit error для unknown).
         canonical_granularity = _normalize_granularity(granularity)

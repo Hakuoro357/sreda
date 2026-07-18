@@ -1444,6 +1444,10 @@ def build_housewife_tools(
             )
         except Exception:  # noqa: BLE001
             logger.exception("save_recipes_batch failed")
+            # Откатить возможную грязь сессии (audit 2026-07-18 MAJOR; эталон —
+            # update_recipe ниже): иначе частичные рецепты батча могли бы уехать
+            # в чужой commit следующего mutating tool'а хода.
+            session.rollback()
             return "error: internal"
         # #115: okv2 envelope carrying by-name outcome buckets so the live voice
         # can confirm what was saved / was already there / repeated / failed.

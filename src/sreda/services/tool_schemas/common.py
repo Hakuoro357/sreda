@@ -353,6 +353,19 @@ CategoryName = Annotated[
 meaningless on both single-item update and bulk re-category paths."""
 
 
+TitleMatch = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
+]
+"""Fuzzy title substring for the #122 ``title_match`` filter fields
+(list_shopping / list_reminders / list_tasks). Audit 2026-07-18 MINOR:
+those fields were bare ``str | None`` — the only unbounded match-inputs
+(siblings: ``ItemTitleMatch`` ≤200 in specs_checklists.py,
+``SearchQuery`` ≤200 in specs_recipes.py, ``RecallQuery`` ≤500 in
+specs_memory.py). Cap 200 mirrors the checklist sibling; the runtime
+match is a substring ILIKE with no smaller limit to honor."""
+
+
 # ---------------------------------------------------------------------------
 # ID shape constraints — Codex R2 MAJOR #1: tighten to match exact
 # runtime generation. All four families use the same factory pattern
@@ -597,8 +610,8 @@ RecurrenceRule = Annotated[
    strings at planner time.
 2. Runtime hands the validated string to ``dateutil.rrule`` which
    is the parameter-grammar gatekeeper.
-3. Capped at 512 chars — RRULEs longer than that are almost
-   certainly malformed.
+3. Capped at 255 chars — matches the DB column ``String(255)``;
+   longer RRULEs would be silently truncated on persist.
 
 Codex Sub-A4 reminders R2 MINOR #1: previously the pattern was the
 permissive ``^FREQ=[^\\r\\n]+$`` which accepted any payload. The
@@ -609,6 +622,8 @@ __all__ = [
     "AddQuantityText",
     "CategoryName",
     "ChecklistId",
+    "ChecklistItemId",
+    "FamilyMemberId",
     "IsoDateStr",
     "MenuItemId",
     "MenuPlanId",
@@ -621,6 +636,7 @@ __all__ = [
     "ShoppingTitle",
     "ShortStr",
     "TaskId",
+    "TitleMatch",
     "TriggerIso",
     "validate_rrule_static",
     "validate_rrule_with_trigger",

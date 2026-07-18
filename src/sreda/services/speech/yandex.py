@@ -44,7 +44,26 @@ class YandexSpeechKitRecognizer:
         except httpx.RequestError as exc:
             logger.warning("YandexSpeechKit request error: %s", exc)
             raise SpeechRecognitionError("SpeechKit request failed") from exc
+        except ValueError as exc:
+            # json.JSONDecodeError ⊂ ValueError: не-JSON тело с HTTP 200.
+            # Контракт SpeechRecognitionError обязателен — иначе исключение
+            # улетает мимо voice-хендлера и ветки refund квот
+            # (аудит 2026-07-18, llm-core MAJOR).
+            logger.warning("YandexSpeechKit invalid JSON body: %s", exc)
+            raise SpeechRecognitionError(
+                "SpeechKit returned invalid JSON"
+            ) from exc
 
+        if not isinstance(data, dict):
+            # JSON-список/скаляр вместо объекта — .get() бросил бы
+            # AttributeError вне контракта SpeechRecognitionError.
+            logger.warning(
+                "YandexSpeechKit unexpected payload type: %s",
+                type(data).__name__,
+            )
+            raise SpeechRecognitionError(
+                "SpeechKit returned unexpected payload shape"
+            )
         result = data.get("result")
         if not isinstance(result, str) or not result.strip():
             raise SpeechRecognitionError("SpeechKit returned empty result")

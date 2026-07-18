@@ -63,20 +63,33 @@ _RELATIVE_RE: Final = re.compile(
     r"\b(вчера|позавчера|сегодня|завтра|послезавтра)\b", re.IGNORECASE,
 )
 
+# audit-fix 2026-07-18 (svc-ops MINOR #7): слово → смещение от «сегодня».
+# Раньше ЛЮБОЕ из этих слов в user_text оправдывало ЛЮБУЮ прошедшую дату:
+# «напомни завтра про лекарство» + ответ бота со вчерашней датой НЕ
+# флаговался — а это ровно прод-инцидент 2026-05-18, ради которого модуль
+# написан. Теперь carve-out только когда target_date соответствует
+# конкретному слову.
+_RELATIVE_WORD_OFFSETS: Final = {
+    "позавчера": -2,
+    "вчера": -1,
+    "сегодня": 0,
+    "завтра": 1,
+    "послезавтра": 2,
+}
+
 
 # ─── Carve-out: user явно упомянул date ──────────────────────────────
 
 
-def _user_mentioned_date(user_text: str, target_date: date) -> bool:
+def _user_mentioned_date(user_text: str, target_date: date, today: date) -> bool:
     """True если user явно упомянул эту дату или её relative reference.
 
     Покрывает:
       - DD.MM, DD.MM.YYYY в user_text matching target
       - DD <месяц> в user_text
-      - «вчера»/«позавчера»/«сегодня»/«завтра»/«послезавтра» если target
-        соответствует относительной дате (we don't compute relative
-        here — мы just permissive: если user сказал «вчера», то bot
-        упомянуть вчерашнюю дату — ok)
+      - «вчера»/«позавчера»/«сегодня»/«завтра»/«послезавтра» — ТОЛЬКО когда
+        target_date равна конкретной относительной дате от ``today``
+        (audit-fix 2026-07-18: раньше любое слово оправдывало любую дату).
     """
     if not user_text:
         return False
@@ -102,9 +115,11 @@ def _user_mentioned_date(user_text: str, target_date: date) -> bool:
         except ValueError:
             pass
 
-    # Relative references — permissive
-    if _RELATIVE_RE.search(user_text):
-        return True
+    # Relative references — точное соответствие слова целевой дате.
+    for m in _RELATIVE_RE.finditer(user_text):
+        offset = _RELATIVE_WORD_OFFSETS.get(m.group(1).lower())
+        if offset is not None and target_date == today + timedelta(days=offset):
+            return True
 
     return False
 
@@ -146,7 +161,7 @@ def find_drifted_dates(
             continue
         if target >= today:
             continue  # сегодня или будущее — ok (reminder)
-        if _user_mentioned_date(user_text, target):
+        if _user_mentioned_date(user_text, target, today):
             continue
         findings.append({
             "date": target, "raw": m.group(0), "span": m.span(),
@@ -168,7 +183,7 @@ def find_drifted_dates(
             continue
         if target >= today:
             continue
-        if _user_mentioned_date(user_text, target):
+        if _user_mentioned_date(user_text, target, today):
             continue
         findings.append({
             "date": target, "raw": m.group(0), "span": m.span(),
