@@ -605,10 +605,17 @@ def expire(
     # Europe/Moscow) must be shifted to UTC first — naively stripping tzinfo
     # would compare the local wall-clock against a UTC instant and expire
     # early/late by the offset.
+    #
+    # 2026-07-18 audit fix: нормализация теперь СИММЕТРИЧНАЯ — обратный случай
+    # (expires_at aware, now naive) раньше не обрабатывался и бросал TypeError
+    # на сравнении. Naive `now` трактуем как UTC (конвенция budget._ensure_utc).
     expires_at = row.expires_at
     cmp_now = now
-    if expires_at is not None and expires_at.tzinfo is None and cmp_now.tzinfo is not None:
-        cmp_now = cmp_now.astimezone(timezone.utc).replace(tzinfo=None)
+    if expires_at is not None:
+        if expires_at.tzinfo is None and cmp_now.tzinfo is not None:
+            cmp_now = cmp_now.astimezone(timezone.utc).replace(tzinfo=None)
+        elif expires_at.tzinfo is not None and cmp_now.tzinfo is None:
+            cmp_now = cmp_now.replace(tzinfo=timezone.utc)
     if expires_at is None or expires_at >= cmp_now:
         raise ValueError(
             f"Cannot expire reservation for llm_call_id={llm_call_id!r}: "

@@ -18,6 +18,7 @@ Design constraints (mirrors emit_event() in sreda.services.audit_feed):
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
 
@@ -25,6 +26,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from sreda.db.models.planner import StepExecutionLedger
+
+
+logger = logging.getLogger(__name__)
 
 
 # Statuses that close a step.  'started' is NOT in this set — it can only
@@ -140,6 +144,20 @@ def mark_step_status(
             f"execution_id={execution_id!r}, step_id={step_id!r}. "
             "open_step() must be called before mark_step_status()."
         )
+
+    # audit 2026-07-18 (planner-exec MINOR): pin the invariant «a terminal
+    # status is never overwritten by a DIFFERENT terminal status». Today's
+    # call order makes a second writer impossible in practice, but a
+    # hypothetical late writer (scanner + belated _best_effort_mark in
+    # separate sessions) could otherwise flip committed → unknown with
+    # last-commit-wins. Same-status re-marks stay idempotent no-ops.
+    if row.status in _TERMINAL_STATUSES and row.status != status:
+        logger.warning(
+            "step_ledger: refusing to overwrite terminal status %r with %r "
+            "for execution_id=%r step_id=%r — first terminal write wins",
+            row.status, status, execution_id, step_id,
+        )
+        return row
 
     row.status = status
     row.updated_at = now

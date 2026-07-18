@@ -81,6 +81,7 @@ Known deferred limitations:
 from __future__ import annotations
 
 import collections.abc
+import json
 import types
 import typing
 from typing import Annotated, Any, Iterator, Mapping, Union, get_args, get_origin
@@ -566,11 +567,27 @@ def _reachable_producer_statuses(
     union-wide проверку (narrow_to_status=None) — сузить не по чему.
 
     Ветки без ``status`` в ``match`` (теоретически — catch-all) и ветки с
-    нестроковым статусом игнорируются: для них сужение неопределимо."""
-    statuses: set[str] = set()
+    нестроковым статусом игнорируются: для них сужение неопределимо.
+
+    audit 2026-07-18 (planner-core MINOR): если на ТОГО ЖЕ потребителя
+    ведёт ``next`` ещё одного шага (план с несколькими маршрутизаторами),
+    потребитель может запуститься при ЛЮБОМ статусе продюсера — сужение по
+    статусам собственного ``next`` продюсера тогда несостоятельно
+    (статически проходит, в рантайме arg_violation). В этом случае
+    возвращаем пустое множество → caller откатывается на union-wide
+    проверку (без ложной точности)."""
     producer = plan.actions.get(producer_step_id)
     if producer is None:
-        return statuses
+        return set()
+    for other_id, other in plan.actions.items():
+        if other_id == producer_step_id:
+            continue
+        for branch in other.expected_outcomes:
+            if branch.next == consumer_step_id:
+                # К consumer ведёт ещё один маршрутизатор — статус
+                # продюсера больше не определяет запуск consumer'а.
+                return set()
+    statuses: set[str] = set()
     for branch in producer.expected_outcomes:
         if branch.next != consumer_step_id:
             continue
@@ -680,7 +697,8 @@ def _phase1_check_refs(
 
     # ``depends_on`` integrity (self-reference, unknown target, cycles)
     # is already enforced by ``Plan`` schema at construction time —
-    # see ``schemas.py:_validate_actions``. No duplicate work here.
+    # see ``schemas.py: Plan._validate_graph`` (audit 2026-07-18: было
+    # устаревшее имя ``_validate_actions``). No duplicate work here.
 
 
 # ---------------------------------------------------------------------------
@@ -1526,7 +1544,47 @@ def validate_action_args(
     # Phase 3.b: structural branch-ordering — a catch-all (empty match)
     # must be the last branch, else later branches are unreachable (#26).
     violations.extend(_phase3_check_catch_all_position(step_id, action))
+    # Phase 3.c: duplicate match dicts — executor is first-match, so the
+    # second identical branch is dead code the planner never learns about
+    # (audit 2026-07-18, planner-core MINOR).
+    violations.extend(_phase3_check_duplicate_branch_matches(step_id, action))
     return violations
+
+
+def _phase3_check_duplicate_branch_matches(
+    step_id: str,
+    action: Action,
+) -> Iterator[Violation]:
+    """audit 2026-07-18 (planner-core MINOR): reject two branches of the
+    same step with an identical ``match`` dict.
+
+    ``_match_branch`` (executor) is first-match, so every branch after the
+    first identical one is unreachable dead code — and the planner got no
+    signal. Catching it here turns the silent quality degradation into a
+    normal invalid-plan retry. Catch-all branches (empty match) are
+    excluded: their ordering rule is owned by
+    ``_phase3_check_catch_all_position``."""
+    seen: dict[str, int] = {}
+    for idx, branch in enumerate(action.expected_outcomes):
+        match_dict = branch.match or {}
+        if not match_dict:
+            continue  # catch-all — позиционное правило выше
+        key = json.dumps(match_dict, sort_keys=True, default=str)
+        first_idx = seen.get(key)
+        if first_idx is None:
+            seen[key] = idx
+            continue
+        yield Violation(
+            step_id=step_id,
+            tool=action.tool,
+            code="duplicate_branch_match",
+            message=(
+                f"expected_outcomes[{idx}].match повторяет "
+                f"expected_outcomes[{first_idx}].match ({key}) — executor "
+                f"выбирает ПЕРВУЮ подошедшую ветку, поэтому ветка {idx} "
+                f"недостижима. Удали дубль или разведи условия."
+            ),
+        )
 
 
 def _output_union_members(output_model: Any) -> tuple[type, ...]:
@@ -1698,6 +1756,17 @@ def _annotation_path_status(annotation: Any, segments: list[str]) -> bool | None
 
     bare = _strip_optional_and_annotated(annotation)
 
+    # audit 2026-07-18 (planner-core MINOR): check a concrete BaseModel
+    # BEFORE the .only selector branch. The old order treated EVERY segment
+    # literally equal to 'only' as the PR-b selector — so a future
+    # output_model field actually NAMED 'only' (${s1.only}) would be
+    # statically rejected (BaseModel is not a list → False). Model fields
+    # win over the selector reading; the selector applies only where the
+    # value is not an introspectable model.
+    nested = _try_extract_basemodel(bare)
+    if nested is not None:
+        return _member_path_status(nested, segments)
+
     # PR-b rule 2h: if the next segment is the .only selector, it is valid
     # only when the current annotation is list[T] (NOT set/frozenset/tuple/dict).
     # Use _peel_list_element_annotation (FIX 4) instead of the broader
@@ -1711,9 +1780,6 @@ def _annotation_path_status(annotation: Any, segments: list[str]) -> bool | None
         # Consume the .only segment and recurse with the element type.
         return _annotation_path_status(elem_annotation, segments[1:])
 
-    nested = _try_extract_basemodel(bare)
-    if nested is not None:
-        return _member_path_status(nested, segments)
     if _is_sequence_origin(get_origin(bare)):
         # Runtime cannot project a remaining plain segment through a sequence.
         return False
@@ -1750,8 +1816,21 @@ def _member_path_status(model: Any, segments: list[str]) -> bool | None:
     # should be a list-typed value — indeterminate (the model is a BaseModel
     # instance, not a list — runtime will fail, but that's a type-level
     # mismatch caught elsewhere).
+    #
+    # audit 2026-07-18 (planner-core MINOR): if the model has a REAL field
+    # named 'only', it is ordinary member access, not the selector — fall
+    # through to the regular field walk. (Since _annotation_path_status now
+    # delegates models here BEFORE the selector branch, a model WITHOUT an
+    # 'only' field keeps the old definitive rejection: .only on a non-list
+    # value can never resolve.)
     if first == _ONLY_SELECTOR:
-        return None  # indeterminate — defer
+        try:
+            _only_fields = model.model_fields
+        except Exception:  # noqa: BLE001
+            return None  # not introspectable — skip
+        if first not in _only_fields:
+            return False  # selector on a non-list model — cannot resolve
+        # else: real field named 'only' — handled by the normal path below
     if first.startswith("_"):
         return True  # dunder/private — runtime owns this (separate guard)
     try:
@@ -2065,6 +2144,29 @@ def _phase1_check_show_template_sources(plan: Plan) -> Iterator[Violation]:
         ref = items_val.strip()
         if not (ref.startswith("${") and ref.endswith("}")):
             continue
+        # audit 2026-07-18 (planner-core MINOR): startswith/endswith alone
+        # accepted a MULTI-ref string ("${s1.items} ${s2.items}") as one ref —
+        # `inner` became garbage and the violation message named a phantom
+        # field ('items} ${s2'). A non-fullmatch ref string interpolates to a
+        # plain str at executor time, so items can never be a real list:
+        # reject it explicitly with a clean message instead.
+        if not is_full_ref_string(ref):
+            allowed_str = ", ".join(
+                f"${{sN.{f}}} из {t}" for t, f in sorted(allowed)
+            )
+            yield Violation(
+                step_id=host_step_id,
+                tool=None,
+                code="show_template_source_mismatch",
+                message=(
+                    f"{location}: шаблон {compose.template_id!r} ожидает "
+                    f"items как ОДНУ ссылку {allowed_str}; получена "
+                    f"составная строка {ref!r} — она интерполируется в "
+                    f"строку и отрендерится посимвольно. Оставь один ref "
+                    f"на родное поле-список."
+                ),
+            )
+            continue
         inner = ref[2:-1]
         target = extract_step_id(inner)
         action = plan.actions.get(target)
@@ -2077,8 +2179,11 @@ def _phase1_check_show_template_sources(plan: Plan) -> Iterator[Violation]:
                 f"${{sN.{f}}} из {t}" for t, f in sorted(allowed)
             )
             yield Violation(
+                # audit 2026-07-18: tool=None — нарушение привязано к
+                # host_step_id, а action.tool здесь был инструментом
+                # TARGET-шага и ломал маршрутизацию фидбека по (step, tool).
                 step_id=host_step_id,
-                tool=action.tool,
+                tool=None,
                 code="show_template_source_mismatch",
                 message=(
                     f"{location}: шаблон {compose.template_id!r} ожидает "
@@ -2123,6 +2228,14 @@ def _phase1_check_only_in_compose(plan: Plan) -> Iterator[Violation]:
     for host_step_id, location, compose in _iter_all_composes(plan):
         for ref_path in iter_refs(compose.template_data):
             if _ref_path_contains_only(ref_path):
+                # audit 2026-07-18 (planner-core MINOR): build the hint by
+                # DROPPING the 'only' segments — the old
+                # ``ref_path.replace('.only.', '.')`` left a trailing
+                # '.only' (${s1.items.only}) untouched and suggested the
+                # same forbidden form it was warning about.
+                _suggested = ".".join(
+                    seg for seg in ref_path.split(".") if seg != "only"
+                )
                 yield Violation(
                     step_id=host_step_id,
                     tool=None,
@@ -2134,7 +2247,7 @@ def _phase1_check_only_in_compose(plan: Plan) -> Iterator[Violation]:
                         f"(after writes are committed); a '.only' ambiguity "
                         f"there cannot be recovered safely. Use '.only' only "
                         f"in action args, and reference the resolved field "
-                        f"directly in compose (e.g. '${{{ref_path.replace('.only.', '.')}}}'). "
+                        f"directly in compose (e.g. '${{{_suggested}}}'). "
                         f"See plan §PR-b rule 2f."
                     ),
                 )

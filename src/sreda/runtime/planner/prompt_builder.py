@@ -464,6 +464,55 @@ _jinja_env = Environment(
 )
 
 
+# Audit 2026-07-18 (planner-core MINOR): memoize the rendered prefix.
+# build_cached_prefix used to re-compile the jinja template and re-render
+# the whole registry (~56 ToolSpec with model_fields/get_args introspection,
+# ~3.6 ms, ~62k chars) on EVERY build_prompt. The output is a pure function
+# of the inputs, so a small bounded cache keyed by a deterministic
+# fingerprint is exact. Maxsize keeps memory bounded if tests render many
+# distinct registries.
+_PREFIX_CACHE_MAXSIZE = 8
+_prefix_cache: dict[int, str] = {}
+_compiled_template_cache: dict[int, object] = {}
+
+
+def _prefix_fingerprint(
+    tool_specs: Iterable[ToolSpec],
+    composer_template_ids: Iterable[str],
+    composer_llm_prompt_keys: Iterable[str],
+    few_shot_block: str,
+) -> int:
+    """Deterministic content key for the cached prefix.
+
+    The render consumes exactly: per-spec (name, family, effect,
+    description, mutex_notes, input_model, output_model), the template-id
+    and llm-key sets, and the few-shot block. Class reprs capture model
+    identity within the process (models are import-time stable); the
+    template text itself is import-time constant."""
+    spec_key = tuple(
+        sorted(
+            (
+                s.name,
+                s.family or "",
+                s.effect or "",
+                s.description,
+                tuple(s.mutex_notes or ()),
+                repr(s.input_model),
+                repr(s.output_model),
+            )
+            for s in tool_specs
+        )
+    )
+    return hash(
+        (
+            spec_key,
+            tuple(sorted(set(composer_template_ids))),
+            tuple(sorted(set(composer_llm_prompt_keys))),
+            few_shot_block,
+        )
+    )
+
+
 def build_cached_prefix(
     *,
     tool_specs: Iterable[ToolSpec],
@@ -476,9 +525,21 @@ def build_cached_prefix(
     Deterministic given identical inputs — prompt caching hits. Stable
     across all tenants for a given (tool_registry, template_registry,
     few_shot) snapshot."""
-    template = _jinja_env.from_string(_get_prompt_template())
-    return template.render(
-        tool_registry_block=render_tool_registry_block(tool_specs),
+    specs = list(tool_specs)
+    key = _prefix_fingerprint(
+        specs, composer_template_ids, composer_llm_prompt_keys, few_shot_block,
+    )
+    cached = _prefix_cache.get(key)
+    if cached is not None:
+        return cached
+    template_src = _get_prompt_template()
+    t_key = hash(template_src)
+    template = _compiled_template_cache.get(t_key)
+    if template is None:
+        template = _jinja_env.from_string(template_src)
+        _compiled_template_cache[t_key] = template
+    rendered = template.render(
+        tool_registry_block=render_tool_registry_block(specs),
         composer_template_ids_block=render_composer_template_ids_block(
             composer_template_ids
         ),
@@ -487,6 +548,10 @@ def build_cached_prefix(
         ),
         few_shot_block=few_shot_block,
     )
+    if len(_prefix_cache) >= _PREFIX_CACHE_MAXSIZE:
+        _prefix_cache.clear()  # bounded; cheap full rebuild on miss
+    _prefix_cache[key] = rendered
+    return rendered
 
 
 # ---------------------------------------------------------------------------
@@ -497,9 +562,16 @@ def build_cached_prefix(
 def _trim(text: str, max_chars: int, marker: str = "…") -> str:
     """Hard-trim text to max_chars with trailing marker. Single-line
     safe — does not cut inside a `[...]` ref by construction (callers
-    do not rely on cuts inside structured content)."""
+    do not rely on cuts inside structured content).
+
+    Audit 2026-07-18 (planner-core MINOR): when ``max_chars`` is smaller
+    than the marker itself the old formula returned a string LONGER than
+    the budget (negative slice + full marker). Fall back to a marker-less
+    plain cut so the ``max_chars`` contract always holds."""
     if len(text) <= max_chars:
         return text
+    if max_chars <= len(marker):
+        return text[: max(max_chars, 0)]
     return text[: max_chars - len(marker)] + marker
 
 
@@ -536,6 +608,21 @@ def _render_memories(
     return "\n".join(lines)
 
 
+def _short_ts(ts: str) -> str:
+    """Render an ISO timestamp as ``HH:MM`` for the history block.
+
+    Audit 2026-07-18 (planner-core MINOR): the old ``ts[-8:-3]`` slice was
+    correct only for NAIVE ISO; the live producer (planner_chat) writes
+    ``datetime.now(_MSK).isoformat(timespec="seconds")`` →
+    ``"2026-07-18T12:47:59+03:00"``, and the slice yielded garbage like
+    ``59+03``. Parse with ``fromisoformat`` (handles both naive and
+    offset-aware); fall back to the raw string on unexpected formats."""
+    try:
+        return datetime.fromisoformat(ts).strftime("%H:%M")
+    except (ValueError, TypeError):
+        return ts
+
+
 def _render_turn_messages(
     msgs: list[TurnMessage], *, max_messages: int,
 ) -> str:
@@ -548,8 +635,7 @@ def _render_turn_messages(
     if skipped > 0:
         parts.append(f"[… ещё {skipped} сообщений в этом ходе ранее …]")
     for m in shown:
-        ts_short = m.ts[-8:-3] if len(m.ts) >= 8 else m.ts  # HH:MM
-        parts.append(f"[{ts_short}] {m.role}: {m.text}")
+        parts.append(f"[{_short_ts(m.ts)}] {m.role}: {m.text}")
     return "\n".join(parts)
 
 
@@ -658,12 +744,22 @@ def build_variable_suffix(
     now: NowMoment,
     user_message: str,
     voice_meta: VoiceMeta | None = None,
+    retry_feedback: str | None = None,
     budget: PromptBudget = PromptBudget(),
 ) -> str:
     """Build per-request suffix. Dynamic blocks fenced as UNTRUSTED_DATA.
 
     Raises ``PromptBudgetExceeded`` if user_message alone exceeds its
-    cap — caller should reject the message before LLM call."""
+    cap — caller should reject the message before LLM call.
+
+    ``retry_feedback`` (audit 2026-07-18, planner-core MAJOR): invalid-plan
+    retry feedback renders as its OWN fenced section inside the suffix
+    budget — NOT concatenated into ``user_message``. The old design capped
+    message+feedback together at ``max_user_message_chars`` (4096), so any
+    message longer than ~2950 chars could never get a retry (guaranteed
+    PromptBudgetExceeded on attempt 2). The feedback section is trimmed to
+    the remaining suffix room and omitted only if even an empty fence no
+    longer fits — it can never be the cause of PromptBudgetExceeded."""
     if len(user_message) > budget.max_user_message_chars:
         raise PromptBudgetExceeded(
             f"user_message={len(user_message)} chars > "
@@ -713,6 +809,26 @@ def build_variable_suffix(
         _required.append(_voice_block)
         _sep_count += 1
     _used = sum(len(b) for b in _required) + (_sep_count) * len("\n\n")
+    # audit 2026-07-18 (planner-core MAJOR): retry-фидбек — отдельная
+    # fenced-секция, бюджетируется из ОСТАТКА суффикса (см. docstring).
+    # Секция уступает обязательным блокам и обрезается под оставшееся
+    # место; если места нет даже под пустую рамку — опускается целиком
+    # (ретрай всё равно состоится, просто без фидбека).
+    retry_block = None
+    if retry_feedback:
+        _retry_fence_overhead = len(fence_untrusted("РЕТРАЙ_ФИДБЕК", ""))
+        _retry_room = (
+            budget.max_suffix_chars - _used - _retry_fence_overhead - len("\n\n")
+        )
+        if _retry_room > 0:
+            retry_block = fence_untrusted(
+                "РЕТРАЙ_ФИДБЕК",
+                _trim(retry_feedback, _retry_room,
+                      marker="\n[… фидбек обрезан по бюджету …]"),
+            )
+            _required.append(retry_block)
+            _sep_count += 1
+            _used = sum(len(b) for b in _required) + (_sep_count) * len("\n\n")
     # точный оверхед собственной рамки (R2: было 64, реально ~159)
     _fence_overhead = len(fence_untrusted("ПОСЛЕДНИЕ_РЕПЛИКИ_ЮЗЕРА", ""))
     _room = budget.max_suffix_chars - _used - _fence_overhead - len("\n\n")
@@ -743,6 +859,8 @@ def build_variable_suffix(
     if _voice_block is not None:
         sections.append(_voice_block)
     sections.append(user_block)
+    if retry_block is not None:
+        sections.append(retry_block)
     suffix = "\n\n".join(sections)
     if len(suffix) > budget.max_suffix_chars:
         raise PromptBudgetExceeded(
@@ -772,6 +890,7 @@ class PromptBuildArgs:
     now: NowMoment
     user_message: str
     voice_meta: VoiceMeta | None = None
+    retry_feedback: str | None = None
     budget: PromptBudget = field(default_factory=PromptBudget)
 
 
@@ -809,6 +928,7 @@ def build_prompt(args: PromptBuildArgs) -> str:
         now=args.now,
         user_message=args.user_message,
         voice_meta=args.voice_meta,
+        retry_feedback=args.retry_feedback,
         budget=args.budget,
     )
     total = f"{prefix}\n\n{suffix}"

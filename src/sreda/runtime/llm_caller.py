@@ -97,12 +97,29 @@ class LlmCaller:
             self.per_call_timeout,
         )
         _t_primary_started = time.monotonic()
+        # Audit 2026-07-18 (runtime-core #6): если primary успел
+        # отстримить часть текста в ack и затем упал по таймауту,
+        # fallback с тем же ``on_text_update`` видимо «откатывает»
+        # ack и пишет его заново с начала (другой моделью — текст
+        # не совпадёт с частичным). Отслеживаем факт частичного
+        # стрима; если он был — fallback идёт без streaming-callback,
+        # ack остаётся на месте и финальный ответ придёт одним edit'ом.
+        _primary_streamed_text = False
+
+        def _track_primary_stream(text_so_far: str) -> None:
+            nonlocal _primary_streamed_text
+            if text_so_far:
+                _primary_streamed_text = True
+            on_text_update(text_so_far)
+
         try:
             ai_msg = await ainvoke_with_streaming_timeout(
                 self.primary_llm,
                 messages,
                 timeout_seconds=self.per_call_timeout,
-                on_text_update=on_text_update,
+                on_text_update=(
+                    _track_primary_stream if on_text_update is not None else None
+                ),
                 provider=self.primary_provider,
             )
             # Issue #68: fire-and-forget response envelope (primary OK).
@@ -175,7 +192,11 @@ class LlmCaller:
                     self.fallback_llm,
                     messages,
                     timeout_seconds=self.per_call_timeout,
-                    on_text_update=on_text_update,
+                    # primary уже показал частичный текст в ack →
+                    # не ре-стримим поверх (см. комментарий выше).
+                    on_text_update=(
+                        None if _primary_streamed_text else on_text_update
+                    ),
                     provider=self.fallback_provider,
                 )
                 _lat_ms_fallback = int((time.monotonic() - _t_fallback_started) * 1000)

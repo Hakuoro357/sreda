@@ -35,13 +35,24 @@ from langgraph.checkpoint.base import (
 from langgraph.checkpoint.serde.base import SerializerProtocol
 from langgraph.checkpoint.serde.encrypted import EncryptedSerializer
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 
 from sreda.db.models.react_checkpoint import ReactCheckpoint, ReactCheckpointWrite
 from sreda.db.session import get_session_factory, privileged_session, tenant_ctx
 from sreda.services.encryption import get_encryption_service
 
 logger = logging.getLogger(__name__)
+
+# аудит 2026-07-18 (runtime-react #5 / cross-latency NEW-3): обрезка АКТИВНОГО треда.
+# Retention-GC (maintenance/retention_cleanup.py:438+) сносит только треды с MAX(created_at)
+# старше 30д — ежедневно активный тред владельца (самый горячий) рос бессрочно, а при
+# 1-blob layout каждый put переписывает полный state. put оставляет последние N checkpoint'ов
+# на (thread_id, checkpoint_ns) атомарно с upsert'ом (одна транзакция). Hot-path читает только
+# ПОСЛЕДНИЙ checkpoint (aget_state) — удаление хвоста цепочки безопасно; parent_config — просто
+# config-указатель, не резолвится. 0/отрицательное → OFF (байт-идентичный откат).
+# NB: llm_calls-канал внутри checkpoint осознанно НЕ режем — len-дельта _turn_outcome
+# (react_loop.handle_turn) сломалась бы; см. аудит-отчёт.
+PRUNE_KEEP_PER_THREAD = 25
 
 
 def _dialect_insert(bind):
@@ -249,8 +260,44 @@ class EncryptedSqlCheckpointSaver(BaseCheckpointSaver):
                 set_=set_,
             )
             s.execute(stmt)
+            self._prune_thread_locked(s, thread_id, ns)  # ретенция активного треда (см. константу)
             s.commit()
         return self._cfg(thread_id, ns, cp_id)
+
+    @staticmethod
+    def _prune_thread_locked(session, thread_id: str, ns: str) -> None:
+        """Обрезать тред до последних ``PRUNE_KEEP_PER_THREAD`` checkpoint'ов (та же сессия/
+        транзакция, что upsert — атомарно). «Последний» = максимальный checkpoint_id (тот же
+        принцип сортировки, что в get_tuple). Writes удаляются первыми (как delete_thread).
+        Дёшево при росте ниже потолка: один LIMIT-SELECT, DELETE не исполняется."""
+        keep = PRUNE_KEEP_PER_THREAD
+        if keep <= 0:
+            return
+        keep_ids = session.execute(
+            select(ReactCheckpoint.checkpoint_id)
+            .where(
+                ReactCheckpoint.thread_id == thread_id,
+                ReactCheckpoint.checkpoint_ns == ns,
+            )
+            .order_by(ReactCheckpoint.checkpoint_id.desc())
+            .limit(keep)
+        ).scalars().all()
+        if len(keep_ids) < keep:
+            return  # строк меньше потолка — резать точно нечего
+        session.execute(
+            delete(ReactCheckpointWrite).where(
+                ReactCheckpointWrite.thread_id == thread_id,
+                ReactCheckpointWrite.checkpoint_ns == ns,
+                ~ReactCheckpointWrite.checkpoint_id.in_(keep_ids),
+            )
+        )
+        session.execute(
+            delete(ReactCheckpoint).where(
+                ReactCheckpoint.thread_id == thread_id,
+                ReactCheckpoint.checkpoint_ns == ns,
+                ~ReactCheckpoint.checkpoint_id.in_(keep_ids),
+            )
+        )
 
     def put_writes(
         self,
@@ -353,16 +400,29 @@ class EncryptedSqlCheckpointSaver(BaseCheckpointSaver):
 
     # ---- наш метод: гашение протухшей паузы ----------------------------
 
-    def clear_pending(self, thread_id: str, checkpoint_ns: str = "") -> int:
+    @staticmethod
+    def _tenant_guard(col, tenant_id: str | None):
+        """аудит 2026-07-18 (runtime-react #7): tenant-фильтр для delete-операций (hardening).
+        tenant_id задан → ``(col == tenant_id) OR (col IS NULL)``: свои строки (включая легаси
+        NULL-штамп — poison-recovery обязан их удалять) проходят, чужие NOT NULL — нет.
+        None → без фильтра (внутренние callers без контекста тенанта — прежнее поведение)."""
+        if tenant_id is None:
+            return True
+        return or_(col == tenant_id, col.is_(None))
+
+    def clear_pending(self, thread_id: str, checkpoint_ns: str = "",
+                      *, tenant_id: str | None = None) -> int:
         """Снять протухшую durable-паузу: удалить interrupt/resume-writes (idx<0) ПОСЛЕДНЕГО
         checkpoint, сохранив сам checkpoint и обычные writes (idx≥0). Возвращает число удалённых
-        строк. (R1-фикс gen: durable-ключ стабилен, паузу гасим явно, не сменой ключа.)"""
+        строк. (R1-фикс gen: durable-ключ стабилен, паузу гасим явно, не сменой ключа.)
+        tenant_id (#7): cross-tenant hardening — фильтр с NULL-толерантностью (см. _tenant_guard)."""
         with self._sf() as s:
             last_id = s.execute(
                 select(ReactCheckpoint.checkpoint_id)
                 .where(
                     ReactCheckpoint.thread_id == thread_id,
                     ReactCheckpoint.checkpoint_ns == checkpoint_ns,
+                    self._tenant_guard(ReactCheckpoint.tenant_id, tenant_id),
                 )
                 .order_by(ReactCheckpoint.checkpoint_id.desc())
                 .limit(1)
@@ -375,23 +435,27 @@ class EncryptedSqlCheckpointSaver(BaseCheckpointSaver):
                     ReactCheckpointWrite.checkpoint_ns == checkpoint_ns,
                     ReactCheckpointWrite.checkpoint_id == last_id,
                     ReactCheckpointWrite.idx < 0,
+                    self._tenant_guard(ReactCheckpointWrite.tenant_id, tenant_id),
                 )
             )
             s.commit()
             return res.rowcount or 0
 
-    def delete_thread(self, thread_id: str) -> None:
+    def delete_thread(self, thread_id: str, *, tenant_id: str | None = None) -> None:
         """Удалить ВЕСЬ тред (обе таблицы, все ns) — для GC и recovery от poison-checkpoint
-        (краш-луп: durable-ключ стабилен → сброс треда = аналог gen-bump для эфемерного пути)."""
+        (краш-луп: durable-ключ стабилен → сброс треда = аналог gen-bump для эфемерного пути).
+        tenant_id (#7): cross-tenant hardening — фильтр с NULL-толерантностью (см. _tenant_guard)."""
         with self._sf() as s:
             s.execute(delete(ReactCheckpointWrite).where(
-                ReactCheckpointWrite.thread_id == thread_id))
+                ReactCheckpointWrite.thread_id == thread_id,
+                self._tenant_guard(ReactCheckpointWrite.tenant_id, tenant_id)))
             s.execute(delete(ReactCheckpoint).where(
-                ReactCheckpoint.thread_id == thread_id))
+                ReactCheckpoint.thread_id == thread_id,
+                self._tenant_guard(ReactCheckpoint.tenant_id, tenant_id)))
             s.commit()
 
-    async def adelete_thread(self, thread_id: str) -> None:
-        return await asyncio.to_thread(self.delete_thread, thread_id)
+    async def adelete_thread(self, thread_id: str, *, tenant_id: str | None = None) -> None:
+        return await asyncio.to_thread(self.delete_thread, thread_id, tenant_id=tenant_id)
 
     # ---- async (to_thread обёртки; дефолтные методы базы RAISE) ---------
 

@@ -24,7 +24,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from sqlalchemy import update
@@ -38,7 +38,6 @@ from sreda.integrations.telegram.client import TelegramClient, TelegramDeliveryE
 from sreda.runtime.dispatcher import ActionEnvelope
 from sreda.runtime.graph import get_assistant_graph, sanitize_error_message
 from sreda.runtime.handlers import ActionRuntimeError, RuntimeReply  # re-export
-from sreda.services.privacy_guard import get_default_privacy_guard
 
 __all__ = [
     "ActionRuntimeError",
@@ -51,6 +50,31 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 AGENT_EXECUTE_ACTION_JOB = "agent.execute_action"
+
+# ---------------------------------------------------------------------
+# Stale-running reaper (audit 2026-07-18: runtime-core #2,
+# cross-concurrency П2/Н2). Процесс, умерший между CAS-claim и
+# финализацией (deploy-рестарт, OOM, SIGKILL), раньше оставлял Job и
+# AgentRun в ``running`` НАВСЕГДА — reaper'а в пакете не было, только
+# детекторы (crash_alert_monitor / reliability_report).
+#
+# Форма — по эталону ``workers/message_dispatcher.py`` (lease +
+# settle-window, НЕ мгновенная терминализация, Н2): запись терминализируется
+# только если она увидена застрявшей на ДВУХ sweep'ах с интервалом ≥
+# ``settle_seconds``. Это защищает медленный-но-живой job (чья sync
+# DB-работа может пережить asyncio wall-clock timeout) от убийства в
+# полёте — иначе «потерянное сообщение» превратилось бы в «дубль
+# сообщения» + двойное списание free-tier.
+
+_REAPER_FIRST_SEEN: dict[str, datetime] = {}
+"""job_id → когда sweep впервые увидел его застрявшим. Module-level
+нарочно: ``ActionRuntimeService`` пересоздаётся на каждый тик job_runner
+и на каждый webhook — instance-state не доживёт до второго sighting.
+Process-local by design: после рестарта settle-окно просто начинается
+заново (fail-safe в сторону НЕ reap'ить)."""
+
+_REAPER_MARKS_CAP = 1000
+"""Жёсткий потолок на settle-марки — сам dict тоже bounded."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,10 +164,16 @@ class ActionRuntimeService:
             inbound_message_id=action.inbound_message_id,
             action_type=action.action_type,
             status="pending",
-            input_json=json.dumps(
-                get_default_privacy_guard().sanitize_structure(action.as_dict()).sanitized_value,
-                ensure_ascii=False,
-            ),
+            # Audit 2026-07-18 (runtime-core #1): persist the ORIGINAL
+            # envelope and execute it as-is. Until this fix the row stored
+            # a privacy-guard-sanitized copy and ``process_job`` executed
+            # THAT — deterministic corruption of user input («прочитай
+            # https://site.ru/page?id=7» → «прочитай [url]» мёртвый
+            # fetch_url; «у меня аллергия…» → плейсхолдеры в core-памяти).
+            # Sanitization остаётся на путях, где она и проектировалась:
+            # error-тексты (``sanitize_error_message``) — не на hot-path
+            # исполнения action.
+            input_json=json.dumps(action.as_dict(), ensure_ascii=False),
         )
         self.session.add(run)
         job.payload_json = json.dumps({"run_id": run.id}, ensure_ascii=False)
@@ -154,6 +184,10 @@ class ActionRuntimeService:
     # --------------------------------------------------------- batch runner
 
     async def process_pending_jobs(self, *, limit: int = 20) -> int:
+        # Sweep застрявших ``running`` ПЕРЕД свежей работой, чтобы краш
+        # предшественника не ждал ручной правки БД (runtime-core #2).
+        # Reaper сам ловит свои исключения — тик не умирает.
+        await self.reap_stale_running_jobs()
         jobs = (
             self.session.query(Job)
             .filter(Job.job_type == AGENT_EXECUTE_ACTION_JOB, Job.status == "pending")
@@ -166,6 +200,139 @@ class ActionRuntimeService:
             await self.process_job(job.id)
             processed += 1
         return processed
+
+    # ----------------------------------------------------- stale reaper
+
+    async def reap_stale_running_jobs(
+        self,
+        *,
+        limit: int = 50,
+        stale_after_seconds: float | None = None,
+        settle_seconds: float | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        """Finalize ``agent.execute_action`` jobs застрявшие в ``running``.
+
+        Stale-анкер — ``AgentRun.started_at`` (проставляется при claim):
+        run в ``running`` со ``started_at`` старше ``stale_after_seconds``
+        (по умолчанию ``max(2 × job_max_runtime_seconds, 300)`` — живой
+        job ограничен wall-clock timeout'ом и не может быть старше).
+        Терминализация — только после settle-окна (второй sighting через
+        ≥ ``settle_seconds``, по умолчанию ``max(job_max_runtime_seconds,
+        300)``), по эталону message_dispatcher lease + Н2.
+
+        Возвращает число записей, реально терминализированных на ЭТОМ
+        sweep'е. Никогда не поднимает исключений — recovery не должен
+        ронять тик job_runner.
+        """
+        now = now or _utcnow()
+        timeout = max(get_settings().job_max_runtime_seconds, 0.001)
+        stale_after = (
+            stale_after_seconds
+            if stale_after_seconds is not None
+            else max(2.0 * timeout, 300.0)
+        )
+        settle = (
+            settle_seconds
+            if settle_seconds is not None
+            else max(timeout, 300.0)
+        )
+        cutoff = now - timedelta(seconds=stale_after)
+
+        try:
+            rows = (
+                self.session.query(Job, AgentRun)
+                .join(AgentRun, AgentRun.job_id == Job.id)
+                .filter(
+                    Job.job_type == AGENT_EXECUTE_ACTION_JOB,
+                    Job.status == "running",
+                    AgentRun.status == "running",
+                    AgentRun.started_at.is_not(None),
+                    AgentRun.started_at < cutoff,
+                )
+                .order_by(Job.id.asc())
+                .limit(limit)
+                .all()
+            )
+        except Exception:
+            self.session.rollback()
+            logger.exception("runtime: stale-running sweep query failed")
+            return 0
+
+        stale_ids = {job.id for job, _run in rows}
+        reaped = 0
+        for job, run in rows:
+            first_seen = _REAPER_FIRST_SEEN.get(job.id)
+            if first_seen is None:
+                _REAPER_FIRST_SEEN[job.id] = now
+                logger.warning(
+                    "runtime: stale running job %s (run %s, started_at=%s) — "
+                    "settle window opened; will reap if still running on a "
+                    "later sweep",
+                    job.id, run.id, run.started_at,
+                )
+                continue
+            if (now - first_seen).total_seconds() < settle:
+                continue
+            reaped += self._reap_stale_job(job_id=job.id, run_id=run.id, now=now)
+
+        # Марки записей, покинувших stale-set (поздний живой владелец
+        # финализировал сам или мы только что reap'нули) — снимаем, затем
+        # жёсткий потолок на размер dict'а.
+        for marked_id in list(_REAPER_FIRST_SEEN):
+            if marked_id not in stale_ids:
+                _REAPER_FIRST_SEEN.pop(marked_id, None)
+        if len(_REAPER_FIRST_SEEN) > _REAPER_MARKS_CAP:
+            oldest_first = sorted(
+                _REAPER_FIRST_SEEN.items(), key=lambda kv: kv[1]
+            )
+            for marked_id, _seen in oldest_first[
+                : len(_REAPER_FIRST_SEEN) - _REAPER_MARKS_CAP
+            ]:
+                _REAPER_FIRST_SEEN.pop(marked_id, None)
+        return reaped
+
+    def _reap_stale_job(self, *, job_id: str, run_id: str, now: datetime) -> int:
+        """Идемпотентная CAS-финализация одной застрявшей пары job/run.
+
+        Оба UPDATE условные (``status='running'``) — если поздний-живой
+        владелец или конкурентный sweeper финализировал первым, это no-op
+        (Н2: идемпотентная финализация с первого дня)."""
+        try:
+            claim = self.session.execute(
+                update(Job)
+                .where(Job.id == job_id)
+                .where(Job.status == "running")
+                .values(status="failed")
+            )
+            if claim.rowcount != 1:
+                self.session.rollback()
+                return 0
+            self.session.execute(
+                update(AgentRun)
+                .where(AgentRun.id == run_id)
+                .where(AgentRun.status == "running")
+                .values(
+                    status="failed",
+                    error_code="runtime_stale_reaped",
+                    error_message_sanitized=sanitize_error_message(
+                        "Действие не завершилось: обработчик был перезапущен."
+                    ),
+                    finished_at=now,
+                )
+            )
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            logger.exception("runtime: failed to reap stale job %s", job_id)
+            return 0
+        logger.error(
+            "runtime: reaped stale running job %s (run %s) — процесс умер "
+            "между claim и finalize; сообщение НЕ будет обработано "
+            "повторно автоматически (audit 2026-07-18 runtime-core #2)",
+            job_id, run_id,
+        )
+        return 1
 
     # ------------------------------------------------------------- process
 
@@ -276,17 +443,40 @@ class ActionRuntimeService:
     # ------------------------------------------------------------- helpers
 
     def _get_or_create_thread(self, action: ActionEnvelope) -> AgentThread:
-        thread = (
+        # Audit 2026-07-18 (runtime-core #5, cross-concurrency FC-2):
+        # раньше уникальности по (tenant_id, channel_type,
+        # external_chat_id) не было — конкурентный enqueue создавал
+        # дубль, после чего ``one_or_none()`` падал MultipleResultsFound
+        # на КАЖДОМ следующем enqueue (мёртвый чат до ручной чистки БД).
+        # DB-констрейнт теперь добавлен db-uniques (миграция
+        # 20260718_0085), но FC-2 требует tolerant readers вторым слоем:
+        # БД, мигрированная с УЖЕ существующими дублями, не должна
+        # умирать. Берём СТАРЕЙШИЙ thread (на него уже ссылаются
+        # существующие runs) + громкий alert на дубль.
+        threads = (
             self.session.query(AgentThread)
             .filter(
                 AgentThread.tenant_id == action.tenant_id,
                 AgentThread.channel_type == action.channel_type,
                 AgentThread.external_chat_id == action.external_chat_id,
             )
-            .one_or_none()
+            .order_by(AgentThread.created_at.asc(), AgentThread.id.asc())
+            .limit(2)
+            .all()
         )
-        if thread is not None:
-            return thread
+        if len(threads) > 1:
+            logger.error(
+                "runtime: duplicate AgentThread rows tenant=%s channel=%s "
+                "chat=%s ids=%s — using oldest %s; needs DB cleanup + "
+                "unique constraint (FC-2 / db-uniques)",
+                action.tenant_id,
+                action.channel_type,
+                action.external_chat_id,
+                [t.id for t in threads],
+                threads[0].id,
+            )
+        if threads:
+            return threads[0]
 
         thread = AgentThread(
             id=f"thread_{uuid4().hex[:24]}",

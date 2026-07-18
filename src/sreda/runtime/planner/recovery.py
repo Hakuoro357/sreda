@@ -154,10 +154,15 @@ def decide_recovery(
         Only semantically meaningful when ``is_durable_write=True``; for
         non-durable steps the scanner may pass any value — it is ignored.
     settle_window_elapsed:
-        ``True`` when the ``unknown_pending`` settle window has passed,
-        meaning the background tool thread can provably no longer commit
-        (its deadline is in the past).  Only relevant for
-        ``ledger_status == 'unknown_pending'``.
+        ``True`` when the settle window has passed, meaning the background
+        tool thread can provably no longer commit (its deadline is in the
+        past).  Relevant for ``ledger_status == 'unknown_pending'`` AND
+        (audit 2026-07-18, planner-exec MAJOR) ``ledger_status ==
+        'started'`` — a started-but-unterminated step may also have a live
+        ``asyncio.to_thread`` tool still in flight (worker alive but stuck
+        past its recovery lease), so terminalizing before the window
+        expires would declare «write did NOT commit» while the thread can
+        still land the write seconds later → user retry = duplicate write.
 
     Returns
     -------
@@ -189,13 +194,26 @@ def decide_recovery(
         not being updated to 'committed' (the worker crashed between the
         tool call and the ledger write).  Record the fact.
 
-    started, durable, probe==False
+    started, durable, probe==False, settle_window_elapsed==False
+        → re_probe
+        WHY (audit 2026-07-18, planner-exec MAJOR): symmetric to
+        unknown_pending.  probe==False only proves the write had not
+        committed AT PROBE TIME; a stuck-but-alive worker's
+        ``asyncio.to_thread`` tool (uncancellable by design,
+        executor.py) may still commit within the settle window.
+        Terminalizing now would create a false «write did NOT commit» →
+        the user retries → duplicate write.  Wait; the scanner revisits
+        after the window.
+
+    started, durable, probe==False, settle_window_elapsed==True
         → mark_failed_needs_manual
-        WHY: probe==False proves the write did NOT commit (same-txn
-        invariant).  The plan FORBIDS blind replay — we cannot know whether
-        the user's intent has changed, and auto-retrying a durable write
-        may cause duplicate side effects if any part of the system already
-        partially executed.  Surface to user (generic_tool_error) + admin.
+        WHY: probe==False after the settle window proves the write did
+        NOT commit (same-txn invariant + no live thread can remain).
+        The plan FORBIDS blind replay — we cannot know whether the
+        user's intent has changed, and auto-retrying a durable write
+        may cause duplicate side effects if any part of the system
+        already partially executed.  Surface to user (generic_tool_error)
+        + admin.
 
     unknown, non-durable
         → skip
@@ -240,6 +258,11 @@ def decide_recovery(
         # Durable write: authority is the audit probe.
         if probed_committed:
             return "mark_committed"
+        # audit 2026-07-18 (planner-exec MAJOR): same settle-window
+        # semantics as unknown_pending — a stuck worker's to_thread tool
+        # may still commit while the window is open.
+        if not settle_window_elapsed:
+            return "re_probe"
         return "mark_failed_needs_manual"
 
     if ledger_status == "unknown":

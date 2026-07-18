@@ -231,13 +231,17 @@ def _prioritize_for_feedback(violations: list) -> list:
 
 
 def _build_retry_feedback(previous_response: str, errors: str) -> str:
-    """Short error feedback appended to the user message for retry.
+    """Short error feedback for the retry attempt.
 
+    Rendered by prompt_builder as its OWN fenced section (РЕТРАЙ_ФИДБЕК)
+    inside the suffix budget — NOT concatenated into the capped
+    ``user_message`` (audit 2026-07-18, planner-core MAJOR: the old
+    in-message append made retry impossible for messages >~2950 chars).
     Kept short so retry input doesn't bloat the prompt budget."""
     excerpt = previous_response[:500]
     err_excerpt = errors[:500]
     return (
-        f"\n\n[АВТОМАТИЧЕСКИЙ РЕТРАЙ]\n"
+        f"[АВТОМАТИЧЕСКИЙ РЕТРАЙ]\n"
         f"Предыдущий ответ невалиден. Извлечение:\n"
         f"<<<\n{excerpt}\n>>>\n"
         f"Ошибки:\n{err_excerpt}\n"
@@ -530,12 +534,26 @@ async def run(
         # Stage 3: persist 'received' (own session) + audit provider/model
         try:
             if session_factory is not None:
+                # audit 2026-07-18 (planner-core MINOR): on retry, keep the
+                # PREVIOUS attempts' raw responses too — mark_received writes
+                # a single raw_planner_response column, so the old per-attempt
+                # overwrite destroyed attempt-1's raw (the key post-mortem
+                # evidence for "why was attempt 1 rejected"). Concatenate
+                # with attempt markers; a separate table would need a
+                # migration (out of scope here).
+                if len(raw_responses) == 1:
+                    raw_for_persist = raw_responses[0]
+                else:
+                    raw_for_persist = "\n\n".join(
+                        f"=== planner attempt {i} ===\n{raw}"
+                        for i, raw in enumerate(raw_responses, 1)
+                    )
                 with session_factory() as s:
                     with s.begin():
                         mark_received(
                             s,
                             execution_id=execution_id,
-                            raw_response=call_result.raw_text,
+                            raw_response=raw_for_persist,
                             latency_ms=cumulative_latency_ms,
                             planner_provider=call_result.provider,
                             planner_model=call_result.model,
@@ -750,7 +768,11 @@ def _build_prompt_or_raise(
         active_turn=ctx.active_turn,
         closed_turns=ctx.closed_turns,
         now=ctx.now,
-        user_message=ctx.user_message + (retry_feedback or ""),
+        # audit 2026-07-18 (planner-core MAJOR): retry feedback travels as
+        # a SEPARATE suffix section, not appended into the capped
+        # user_message — otherwise messages >~2950 chars could never retry.
+        user_message=ctx.user_message,
+        retry_feedback=retry_feedback,
         voice_meta=ctx.voice_meta,
         budget=ctx.budget,
     )
@@ -788,15 +810,27 @@ def _maybe_alert(
     *,
     errors: str,
 ) -> None:
-    """Send P1 admin alert with PII redaction. No-op if alert_fn is None."""
+    """Send P1 admin alert with PII redaction. No-op if alert_fn is None.
+
+    Audit 2026-07-18 (planner-core MINOR): the title is derived from the
+    actual failure class (``errors`` prefix) instead of the old hardcoded
+    «invalid plan after retry» — provider_unavailable / timeout /
+    persistence / prompt_budget_exceeded paths must not masquerade as an
+    invalid-plan failure for on-call."""
     if alert_fn is None:
         return
     redacted_user = _redact_for_alert(ctx.user_message, max_chars=200)
     redacted_errors = _redact_for_alert(errors, max_chars=500)
+    head = errors.split(":", 1)[0].strip() or "failure"
+    if head == "persistence":
+        # keep the sub-stage (insert_pending / mark_received / mark_valid)
+        parts = errors.split(":")
+        head = ":".join(parts[:2]) if len(parts) > 1 else head
+    title = f"planner: {head}"[:120]
     try:
         alert_fn(
             severity="P1",
-            title="planner: invalid plan after retry",
+            title=title,
             body=(
                 f"execution_id={execution_id}\n"
                 f"tenant_id=[REDACTED]\n"

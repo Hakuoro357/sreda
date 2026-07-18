@@ -189,10 +189,20 @@ def schedule_candidate_recording(
         return  # строгие признаки кандидата (план: только чистый успех)
     # проекция — ТОЖЕ в отсоединённой задаче (оба Codex R1 MAJOR:
     # «целиком вне request path» — без работы до return)
-    _create_task(
-        _record_and_shadow(tenant_id=tenant_id, run_id=run_id, plan=plan),
-        name=f"plan_library:{run_id}",
-    )
+    # audit 2026-07-18 (planner-exec MINOR): asyncio.create_task на
+    # закрывающемся event loop (shutdown/reload воркера) бросает
+    # RuntimeError — без стража исключение улетало в request path уже
+    # после формирования ответа. Фоновая запись best-effort: лог и дроп.
+    try:
+        _create_task(
+            _record_and_shadow(tenant_id=tenant_id, run_id=run_id, plan=plan),
+            name=f"plan_library:{run_id}",
+        )
+    except RuntimeError:
+        logger.warning(
+            "plan_library: event loop закрывается — фоновая запись run=%s "
+            "отменена (candidate не записан)", run_id,
+        )
 
 
 async def _record_and_shadow(*, tenant_id: str, run_id: str,

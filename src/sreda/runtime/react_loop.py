@@ -528,15 +528,20 @@ def react_fallback_llm(primary_provider: str = "") -> Any:
 class _Reply(str):
     """Ответ handle_turn: строка ответа (для старых вызывающих — обычный str) + признак
     `awaiting_confirm`, что это да/нет-подтверждение (канал тогда вешает кнопки [Да][Нет]),
-    и `confirm_id` — id паузы для callback_data кнопок (защита от устаревшего тапа)."""
+    и `confirm_id` — id паузы для callback_data кнопок (защита от устаревшего тапа).
+    `had_internal_error` (FC-1, аудит 2026-07-18, cross-concurrency Н1): ход завершился
+    внутренним сбоем, но пользователю ушёл safe-fallback — канал НЕ помечает inbound
+    «processed» (статус остаётся для unprocessed_inbound monitor'а)."""
     awaiting_confirm: bool
     confirm_id: str
+    had_internal_error: bool
 
     def __new__(cls, text: str, awaiting_confirm: bool = False,
-                confirm_id: str = "") -> "_Reply":
+                confirm_id: str = "", had_internal_error: bool = False) -> "_Reply":
         obj = super().__new__(cls, text)
         obj.awaiting_confirm = awaiting_confirm
         obj.confirm_id = confirm_id
+        obj.had_internal_error = had_internal_error
         return obj
 
 # #162 полный перенос: семьи, которые добираем из общего реестра (напоминания+задачи
@@ -1477,6 +1482,13 @@ def _apply_domain_policy(tools: list, allowed_read: Any, allowed_write: Any) -> 
 # отказ кандидата: ЕДИНАЯ константа (R2 Claude MINOR) - её же ищет _prev_open_domains;
 # дрейф текста ломал бы фильтр молча в небезопасную сторону (freeze-тест через wrap).
 _CONFIRM_DECLINED_TEXT = "Хорошо, не делаю."
+
+# аудит 2026-07-18 (runtime-react #2): тексты отказа ОБЕИХ confirm-обёрток
+# (_generic_confirm_wrap → _CONFIRM_DECLINED_TEXT; легаси _confirm_wrap → «Хорошо, не трогаю.»).
+# run_tools метит такой ToolMessage artifact.result_kind="confirm_declined" (не «ok» — мутация
+# НЕ исполнена), а chat-узел на unified-ходе по метке не жжёт LLM-проход на детерминированный
+# отказ (#321: ответ подставит handle_turn).
+_CONFIRM_DECLINED_TEXTS = frozenset({_CONFIRM_DECLINED_TEXT, "Хорошо, не трогаю."})
 
 
 # #338/#349/#350: слот-исходы, структурно продолжающие серию (время не названо /
@@ -2536,6 +2548,18 @@ def _confirm_declined(is_confirm_pause: bool, resume_val: str, tenant_id: str) -
             and _unified_execute_for(tenant_id))
 
 
+def _last_tool_confirm_declined(messages: Any) -> bool:
+    """аудит 2026-07-18 (runtime-react #2): последнее сообщение — ToolMessage с отказом
+    confirm-обёртки (artifact.result_kind=="confirm_declined", ставит run_tools)? По этой метке
+    chat-узел на unified-ходе НЕ зовёт LLM: отказ детерминирован (#321 подставит handle_turn),
+    а сочинённый текст раньше отбрасывался, но оставался в durable-истории (скрытая от юзера
+    реплика — рассинхрон + риск ложного «удалено») и стоил полный оплаченный проход."""
+    last = (list(messages or []) or [None])[-1]
+    return (isinstance(last, ToolMessage)
+            and isinstance(getattr(last, "artifact", None), dict)
+            and last.artifact.get("result_kind") == "confirm_declined")
+
+
 def _summary_enabled_for(tenant_id: str) -> bool:
     """#232 способ Б: включена ли durable-выжимка истории у тенанта (SREDA_REACT_SUMMARY_TENANTS).
     Дефолт — НЕТ → фича OFF (генерация не пишет, потребление байт-идентично #194). Канарейка/kill-switch."""
@@ -2697,6 +2721,11 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         # #333 R1 (оба Codex, блокер): у bespoke-инструмента НЕ БЫЛО recurrence_rule —
         # хинт велел передавать аргумент вне схемы, повторы через ReAct не работали.
         rrule = (recurrence_rule or "").strip()
+        # аудит 2026-07-18 (runtime-react #8): RFC-5545 допускает имя свойства
+        # («RRULE:FREQ=DAILY») — снимаем префикс до проверки, иначе модель, послушавшая
+        # «RFC-5545 RRULE» из docstring, получала отказ на валидной форме.
+        if rrule.upper().startswith("RRULE:"):
+            rrule = rrule[6:].strip()
         if rrule and not rrule.upper().startswith("FREQ="):
             return f"Не разобрала правило повтора: {rrule!r}. Нужен формат FREQ=…"
         # #174: прошедший момент → для РАЗОВОГО перекат-подсказка; для повтора допустимо
@@ -3241,6 +3270,20 @@ def _build_graph(llm: Any, all_tools: list, *,
         else _persona_overlay_for(session, tenant_id, user_id)
     )
     system_prompt = _system_prompt(today_str, persona_overlay=_persona_overlay)
+    # аудит 2026-07-18 (cross-latency NEW-5): кэш bind_tools на ХОД (замыкание графа, умирает с
+    # ним — инвалидация не нужна). Ключ (id(llm), отсортированные имена): набор bound меняется
+    # только с active_families; tool-объекты одни и те же весь ход (замкнуты на session хода),
+    # обёртки _generic_confirm_wrap чисты → повторная сериализация ~49 схем на итерацию снята.
+    # Списки bound не мутируются (_select_tools/_apply_* возвращают новые) → кэш безопасен.
+    _bind_cache: dict = {}
+
+    def _bind_cached(llm_obj: Any, bound: list) -> Any:
+        key = (id(llm_obj), tuple(sorted(t.name for t in bound)))
+        hit = _bind_cache.get(key)
+        if hit is None:
+            hit = llm_obj.bind_tools(bound)
+            _bind_cache[key] = hit
+        return hit
     # #175: каноничное имя модели — ТЕМ ЖЕ резолвером, что legacy #151 (planner/llm), чтобы
     # ключ (provider_key, model) совпал с прайс-таблицей llm_pricing → USD на дашборде/бюджете.
     # response_metadata.model_name мог бы дать иную форму → unpriced. Резолвим РАЗ (не на вызов).
@@ -3283,6 +3326,21 @@ def _build_graph(llm: Any, all_tools: list, *,
         # "task", иначе intent при preflight (OFF → None → byte-identical даже при чекпойнте intent=chat).
         # Один резолвер во ВСЕХ узлах (chat/run_tools/route) → одна персона+политика согласованы.
         eff = _effective_intent(state, preflight_enabled)
+        # аудит 2026-07-18 (runtime-react #2): confirm-ОТКАЗ на едином пути — LLM НЕ зовём.
+        # Раньше chat сочинял отказ (деньги+латентность полного прохода), handle_turn (#321) его
+        # отбрасывал, но текст ОСТАВАЛСЯ в durable-истории: модель видела скрытую от юзера реплику
+        # (та самая галлюцинация «удалено», от которой #321 защищает). Возвращаем пустой AIMessage
+        # (пара protocol-цела, история чистая), детерминированный текст подставит handle_turn.
+        # Гейт unified_execute — как у #321 (legacy байт-идентичен). usage/llm_calls не пишем:
+        # вызова не было.
+        if state.get("unified_execute") and _last_tool_confirm_declined(state["messages"]):
+            return {
+                "messages": [AIMessage(content="")],
+                "turn_pass_count": (state.get("turn_pass_count") or 0) + 1,  # проход узла был
+                "guard_nudge": "",
+                "stale_pause_note": "",  # consume-and-clear, как в обычном выходе ниже
+                "llm_calls": [],
+            }
         _used_provider, _used_model, _fallback_fired = provider_key, _model_name, False
         # #159 R2 (Codex MAJOR): телеметрия попытки primary при срабатывании запаса. Учёт ДЕНЕГ
         # (#175) пишется на ОТВЕТИВШИЙ провайдер — токены зависшего/упавшего primary неизвестны (его
@@ -3311,14 +3369,14 @@ def _build_graph(llm: Any, all_tools: list, *,
             _t0 = _time.perf_counter()
             try:  # guarded bind+invoke (deepseek может не принять tool-схему); #256: КОРОТКИЙ chat-таймаут
                 resp = invoke_with_per_call_timeout(
-                    _primary.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s,
+                    _bind_cached(_primary, bound), _msgs, timeout_seconds=_chat_timeout_s,
                     provider=_used_provider)  # #343: per-provider breaker keying
             except Exception as _e:  # noqa: BLE001 — сбой/таймаут deepseek → fallback Фредди web-only
                 logger.warning("react_loop: chat/fact primary (%s) сбой → fallback Фредди web-only",
                                type(_e).__name__, exc_info=True)
                 _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
                 resp = invoke_with_per_call_timeout(  # тот же web-only bound, НЕ task; #256: тоже короткий
-                    llm.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s,
+                    _bind_cached(llm, bound), _msgs, timeout_seconds=_chat_timeout_s,
                     provider=provider_key)  # #343: fallback Фредди → СВОЙ breaker-bucket, не primary
                 _used_provider, _used_model, _fallback_fired = provider_key, _model_name, True
             _latency_ms = int((_time.perf_counter() - _t0) * 1000)
@@ -3472,7 +3530,7 @@ def _build_graph(llm: Any, all_tools: list, *,
             #       ронял бы happy-path primary, хотя Mercury в порядке; ленивость это исключает;
             #   (4) лог с exc_info=True — полный traceback причины перехода.
             # Если запас тоже упал — исключение всплывает во внешний guard handle_turn → safe-reply.
-            _bound_primary = llm.bind_tools(bound)
+            _bound_primary = _bind_cached(llm, bound)
             _t0 = _time.perf_counter()  # #192: латентность вызова для трейса
             if fallback_llm is not None:
                 try:
@@ -3484,7 +3542,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                                    type(_e).__name__, exc_info=True)
                     _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
                     resp = invoke_with_per_call_timeout(
-                        fallback_llm.bind_tools(bound), _msgs, timeout_seconds=_react_timeout_s,
+                        _bind_cached(fallback_llm, bound), _msgs, timeout_seconds=_react_timeout_s,
                         provider=_FALLBACK_PROVIDER_KEY)  # #343: Оса → СВОЙ breaker-bucket
                     _used_provider, _used_model = _FALLBACK_PROVIDER_KEY, _fallback_model_name
                     _fallback_fired = True
@@ -3678,43 +3736,6 @@ def _build_graph(llm: Any, all_tools: list, *,
                         content=_wmsg, name=tc["name"], tool_call_id=tc["id"],
                         artifact={"result_kind": "source_result_required"}))
                     continue
-            # #288 (возврат механизма #180, красная линия «врёт об успехе»): напоминание с КОНКРЕТНЫМ
-            # моментом, при том что юзер время НЕ называл за ход (окно = текст + ответы ask_human) →
-            # структурный отказ, НЕ создание (прод-кейс 01.07: «напомни 8 числа» → бот молча создал на
-            # 13:00). Промпт (докстринг schedule_reminder) слабую модель не держал — держит диспатч.
-            # update_reminder гейтится ТОЛЬКО при смене времени (title-only проходит). БЕЗ unified-гейта:
-            # это страховочный МЕХАНИЗМ безопасности всего ReAct-пути (как сам #180), не фича канарейки.
-            if name in ("schedule_reminder", "update_reminder"):
-                _needs_time = (name == "schedule_reminder"
-                               or bool(str((tc_args or {}).get("trigger_iso") or "").strip()))
-                from sreda.runtime.react_signals import text_mentions_time
-                if _needs_time and not text_mentions_time(_turn_time_window_text(state["messages"])):
-                    out.append(ToolMessage(
-                        content=("время не названо пользователем — НЕ выдумывай своё: спроси "
-                                 "«во сколько?» одним коротким вопросом"),
-                        name=tc["name"], tool_call_id=tc["id"],
-                        artifact={"result_kind": "time_not_specified"}))
-                    continue
-            # #350: конец повторения — СТРУКТУРНЫЙ слот (решение владельца «конец
-            # обязателен к уточнению» переносится из промпт-хинта #333 в диспатч, как
-            # гейт времени #180: хинт «сперва спроси» оставлял серию БЕЗ слот-исхода в
-            # журнале → цепочка окна #349/наследование #338 не сцеплялись → «3 раза»
-            # приходило в ход без времени → деградация, прод 2026-07-11 13:30).
-            # ОДИН раз на серию: вопрос уже задавали → правило без COUNT/UNTIL ставится
-            # как есть (юзер ответил неявно/«бессрочно» — не мучаем повтором).
-            if name == "schedule_reminder":
-                _rr350 = str((tc_args or {}).get("recurrence_rule") or "").strip().upper()
-                _has_end350 = bool(re.search(r"COUNT=0*[1-9]", _rr350)
-                                   or re.search(r"UNTIL=[0-9]", _rr350))
-                if (_rr350 and not _has_end350
-                        and not _recurrence_end_already_asked(state["messages"])):
-                    out.append(ToolMessage(
-                        content=("конец повторения не назван — спроси одним коротким "
-                                 "вопросом: «до какого времени повторять или сколько "
-                                 "раз?», потом ставь с ;COUNT=N или ;UNTIL=…"),
-                        name=tc["name"], tool_call_id=tc["id"],
-                        artifact={"result_kind": "recurrence_end_not_specified"}))
-                    continue
             # #197/#215: лимит web-инструментов за ход — ТОЛЬКО chat/fact, ПО ИНТЕНТУ (_SEARCH_CAPS:
             # chat web_search≤1/fetch_url≤2; fact web_search≤3/fetch_url≤3). Исполненные в прошлых проходах
             # (из истории) + в текущем батче; лишние → synthetic limit (пара цела, operation_id НЕ
@@ -3793,6 +3814,46 @@ def _build_graph(llm: Any, all_tools: list, *,
                     content=_umsg, name=tc["name"], tool_call_id=tc["id"],  # #192: не-исполнение
                     artifact={"result_kind": "domain_blocked" if _ureason == "domain_blocked" else "unavailable"}))
                 continue
+            # #288 (возврат механизма #180, красная линия «врёт об успехе»): напоминание с КОНКРЕТНЫМ
+            # моментом, при том что юзер время НЕ называл за ход (окно = текст + ответы ask_human) →
+            # структурный отказ, НЕ создание (прод-кейс 01.07: «напомни 8 числа» → бот молча создал на
+            # 13:00). Промпт (докстринг schedule_reminder) слабую модель не держал — держит диспатч.
+            # update_reminder гейтится ТОЛЬКО при смене времени (title-only проходит). БЕЗ unified-гейта:
+            # это страховочный МЕХАНИЗМ безопасности всего ReAct-пути (как сам #180), не фича канарейки.
+            # аудит 2026-07-18 (runtime-react #1): гейт стоит ПОСЛЕ проверки доступности инструмента —
+            # галлюцинированный вызов вне bind получает честный unavailable/domain_blocked, а не
+            # «время не названо» (иначе лишний recovery-диалог и ложный след в истории).
+            if name in ("schedule_reminder", "update_reminder"):
+                _needs_time = (name == "schedule_reminder"
+                               or bool(str((tc_args or {}).get("trigger_iso") or "").strip()))
+                from sreda.runtime.react_signals import text_mentions_time
+                if _needs_time and not text_mentions_time(_turn_time_window_text(state["messages"])):
+                    out.append(ToolMessage(
+                        content=("время не названо пользователем — НЕ выдумывай своё: спроси "
+                                 "«во сколько?» одним коротким вопросом"),
+                        name=tc["name"], tool_call_id=tc["id"],
+                        artifact={"result_kind": "time_not_specified"}))
+                    continue
+            # #350: конец повторения — СТРУКТУРНЫЙ слот (решение владельца «конец
+            # обязателен к уточнению» переносится из промпт-хинта #333 в диспатч, как
+            # гейт времени #180: хинт «сперва спроси» оставлял серию БЕЗ слот-исхода в
+            # журнале → цепочка окна #349/наследование #338 не сцеплялись → «3 раза»
+            # приходило в ход без времени → деградация, прод 2026-07-11 13:30).
+            # ОДИН раз на серию: вопрос уже задавали → правило без COUNT/UNTIL ставится
+            # как есть (юзер ответил неявно/«бессрочно» — не мучаем повтором).
+            if name == "schedule_reminder":
+                _rr350 = str((tc_args or {}).get("recurrence_rule") or "").strip().upper()
+                _has_end350 = bool(re.search(r"COUNT=0*[1-9]", _rr350)
+                                   or re.search(r"UNTIL=[0-9]", _rr350))
+                if (_rr350 and not _has_end350
+                        and not _recurrence_end_already_asked(state["messages"])):
+                    out.append(ToolMessage(
+                        content=("конец повторения не назван — спроси одним коротким "
+                                 "вопросом: «до какого времени повторять или сколько "
+                                 "раз?», потом ставь с ;COUNT=N или ;UNTIL=…"),
+                        name=tc["name"], tool_call_id=tc["id"],
+                        artifact={"result_kind": "recurrence_end_not_specified"}))
+                    continue
             # ctx per tool_call: turn_key (из state, переживает resume) + step_id=tc id
             # (из checkpointed AIMessage) → operation_id стабилен при перевыполнении узла.
             _t = _time.perf_counter()  # #192: латентность инструмента для трейса
@@ -3822,6 +3883,15 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # инструмента → честный частичный отчёт named-P. wrote_unkeyed НЕ ставим.
                 logger.warning("react_loop: tool %s failed type=%s at=%s",
                                name, _safe_tn(exc), _safe_tb(exc))
+                # FC-1 (аудит 2026-07-18): упавший инструмент мог оставить shared session хода в
+                # failed-state (незакрытая транзакция) — без rollback следующий инструмент батча/
+                # прохода упал бы PendingRollbackError (каскадный сбой хода). Эталон — локальный
+                # try/except + rollback (executor.py:209/254; rollback идемпотентен, session=None → skip).
+                if session is not None:
+                    try:
+                        session.rollback()
+                    except Exception:  # noqa: BLE001 — rollback не валит ход
+                        logger.warning("react_loop: session rollback after tool failure failed")
                 out.append(ToolMessage(
                     content=f"error: инструмент {name} не смог выполниться, повтори запрос.",
                     name=tc["name"], tool_call_id=tc["id"], status="error",
@@ -3862,6 +3932,12 @@ def _build_graph(llm: Any, all_tools: list, *,
                         _art["checklist_kind"] = _rt
             out.append(ToolMessage(content=str(res), name=tc["name"], tool_call_id=tc["id"],
                                    artifact=_art))
+            # аудит 2026-07-18 (runtime-react #2): отказ confirm-обёртки — НЕ «ok» исполнение
+            # мутации. Метка честна для трейса (#192) и нужна chat-узлу: на unified-ходе по ней
+            # LLM-проход не зовётся (ответ детерминирован — #321 подставит handle_turn). Меняем
+            # УЖЕ добавленный artifact (мутация dict допустима — ToolMessage не хешируется).
+            if str(res) in _CONFIRM_DECLINED_TEXTS:
+                _art["result_kind"] = "confirm_declined"
             if (name in _CORE_MUTATING_TOOLS
                     or TOOL_FAMILY_MANIFEST.get(name) in _UNKEYED_WRITE_FAMILIES):
                 # rerun-unsafe запись (#202 Codex medium R3): core-мутирующая (add_task без даты — нет
@@ -4046,10 +4122,13 @@ def _build_graph(llm: Any, all_tools: list, *,
     def stop(state: ReactState):
         # АНТИ-ПЕТЛЯ: лимит проходов исчерпан. Закрываем висящие tool_calls парными
         # ToolMessage (иначе провайдер на след. ходу отвергнет историю) + терминальный ответ.
+        # аудит 2026-07-18 (runtime-react #4): stub НЕ исполнение — честный result_kind
+        # "step_limit", иначе _count_executed_tool/трейс считали stub «исполненным».
         last = state["messages"][-1]
         out: list = [
             ToolMessage(content="прервано: исчерпан лимит шагов хода",
-                        name=tc["name"], tool_call_id=tc["id"])
+                        name=tc["name"], tool_call_id=tc["id"],
+                        artifact={"result_kind": "step_limit"})
             for tc in (getattr(last, "tool_calls", None) or [])
         ]
         out.append(AIMessage(content=_MAX_STEPS_REPLY))  # #258: маркер для детектора штопора
@@ -4286,7 +4365,9 @@ def _called_tools(result: Any) -> list[str]:
 def _count_executed_tool(messages: Any, name: str) -> int:
     """#197: сколько РАЗ инструмент `name` РЕАЛЬНО исполнен в текущем ходу (после последнего
     HumanMessage) — по ИСПОЛНЕННЫМ ToolMessage (re-exec-safe: история checkpointed, не append-счётчик).
-    Synthetic-лимит (artifact.result_kind=="search_limit") НЕ считается исполнением. Для cap web_search≤1."""
+    Synthetic-лимит (artifact.result_kind=="search_limit") НЕ считается исполнением. Для cap web_search≤1.
+    аудит 2026-07-18 (runtime-react #4): stub stop-узла ("step_limit") — тоже НЕ исполнение
+    (инструмент не запускался), иначе web-кап и executed-метрики завышены на max_iter-ходах."""
     msgs = list(messages or [])
     start = 0
     for i, m in enumerate(msgs):
@@ -4296,7 +4377,7 @@ def _count_executed_tool(messages: Any, name: str) -> int:
     for m in msgs[start:]:
         if isinstance(m, ToolMessage) and getattr(m, "name", None) == name:
             rk = (getattr(m, "artifact", None) or {}).get("result_kind")
-            if rk != "search_limit":
+            if rk not in ("search_limit", "step_limit"):
                 n += 1
     return n
 
@@ -4549,6 +4630,15 @@ async def _run_post_turn_summary_inner(
         session.close()
 
 
+def _mint_anon_turn_key(channel: str, tenant_id: str, thread_id: str) -> str:
+    """Аудит 2026-07-18 (runtime-react #3): turn_key для хода БЕЗ inbound_message_id
+    (прямые/тестовые вызовы handle_turn; прод-callers всегда шлют непустой id). Уникальный
+    суффикс — иначе ВСЕ ходы треда делили один ключ и persist_trace_start молча пропускал
+    2+ ходы (ON CONFLICT DO NOTHING). Вынесено в хелпер — тесты коллизии (#320) патчат здесь."""
+    import uuid as _uuid_tk
+    return f"react:{channel}:{tenant_id}:{thread_id}:{_uuid_tk.uuid4().hex[:12]}"
+
+
 async def handle_turn(
     *, session: Any, tenant_id: str, user_id: str, thread_id: str,
     llm: Any, user_text: str, inbound_message_id: str = "", channel: str = "react",
@@ -4592,7 +4682,11 @@ async def handle_turn(
         # setup → OFF на этот ход (как будто preflight выключен) — ход не падает.
         # #250: persona overlay (стиль) считаем ОДИН раз на ход — нужен и task-промту
         # (_system_prompt через _build_graph), и chat/fact-промту (болтовня тоже живая).
-        _persona_overlay = _persona_overlay_for(session, tenant_id, user_id)
+        # аудит 2026-07-18 (runtime-react #6): sync-DB чтение уводим из event loop в поток —
+        # блокировка loop на время roundtrip'а+дешифровки стопорила бы всех тенантов процесса.
+        # Session из pool-потока безопасна: loop-поток ждёт await, конкурентного доступа нет.
+        _persona_overlay = await asyncio.to_thread(
+            _persona_overlay_for, session, tenant_id, user_id)
         _preflight = False
         _deepseek_llm = None
         _chat_prompt = ""
@@ -4624,7 +4718,9 @@ async def handle_turn(
         if _persist_enabled() and _summary_enabled_for(tenant_id):
             try:
                 from sreda.services import react_summary_store
-                _summary = react_summary_store.load_summary(session, _durable_thread_id(base))
+                # аудит 2026-07-18 (runtime-react #6): sync-DB чтение выжимки — в поток (event loop).
+                _summary = await asyncio.to_thread(
+                    react_summary_store.load_summary, session, _durable_thread_id(base))
             except Exception:  # noqa: BLE001 — потребление выжимки не валит ход
                 logger.warning("react_summary: load failed → без выжимки", exc_info=True)
         graph = _build_graph(  # #165 Срез A: сырой llm + ВСЕ инструменты; bind поднабора в узлах
@@ -4726,7 +4822,7 @@ async def handle_turn(
                 # Свежий ainvoke ниже продолжит беседу с историей, без залипшей паузы.
                 if _persist_enabled():
                     try:
-                        _get_checkpointer().clear_pending(_durable_thread_id(base))
+                        _get_checkpointer().clear_pending(_durable_thread_id(base), tenant_id=tenant_id)
                         # #316 R2/R3 (субагент MAJOR): очистка ЖИВОЙ паузы на redirect снимает interrupt-write,
                         # но AIMessage(tool_calls) уже закоммичен в durable-историю без пары ToolMessage
                         # (узел прервался до коммита результата) → свежий ainvoke послал бы «сироту» → Mercury
@@ -4764,7 +4860,14 @@ async def handle_turn(
                 _abandon_tk = str(_pre_vals.get("turn_key") or "")
                 _abandon_is_confirm = _stale_is_confirm
             # turn_key минтится РАЗ на свежий ход; durable inbound id (не in-memory счётчик).
-            turn_key = f"react:{channel}:{tenant_id}:{inbound_message_id or thread_id}"
+            # аудит 2026-07-18 (runtime-react #3): fallback на голый thread_id давал ВСЕМ ходам
+            # треда один turn_key → persist_trace_start молча пропускал 2+ ходы (ON CONFLICT DO
+            # NOTHING), трейс треда глох. Прод-callers всегда шлют непустой inbound id; пустое —
+            # только прямые/тестовые вызовы → суффикс-уник (_mint_anon_turn_key).
+            if not inbound_message_id:
+                turn_key = _mint_anon_turn_key(channel, tenant_id, thread_id)
+            else:
+                turn_key = f"react:{channel}:{tenant_id}:{inbound_message_id}"
             _tk_trace = turn_key
             # #320.1: терминализация БРОШЕННОГО ряда — старый ход остался awaiting_confirm навсегда
             # (недосчёт redirect в метрике #285/#269; висело и у протухших). Лёгкий переход awaiting_confirm
@@ -4772,12 +4875,15 @@ async def handle_turn(
             # поведение → без unified-гейта (протухшие ряды легаси тоже перестают висеть). is_confirm —
             # чтобы abandoned ask_human НЕ писал confirm_resolution (не загрязнял confirm-метрику, R1 субагент).
             if _abandon_tk and _abandon_tk != turn_key:
-                _trace.persist_trace_abandoned(
+                # аудит 2026-07-18 (runtime-react #6): sync-DB трейс — в поток (event loop).
+                await asyncio.to_thread(
+                    _trace.persist_trace_abandoned,
                     tenant_id=tenant_id, user_id=user_id, turn_key=_abandon_tk,
                     reason=("redirected" if _redirect_new else "expired"),
                     is_confirm=_abandon_is_confirm)
             # #192: start-строка трейса ДО графа (свежий ход). Resume — НЕ start (строка есть с pause).
-            _trace.persist_trace_start(
+            await asyncio.to_thread(  # аудит 2026-07-18 (runtime-react #6): sync-DB в поток
+                _trace.persist_trace_start,
                 tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
                 turn_key=turn_key, origin_user_text=user_text)
             # #165 Срез B (R3-карв-аут): пруненый тенант → база = НЕБЕЗОПАСНЫЕ-к-обрезке
@@ -5070,7 +5176,10 @@ async def handle_turn(
                                 if (_res376.status in ("exact", "unique_fuzzy")
                                         and _res376.checklist is not None):
                                     # канонический id (не сырой span) — устойчиво к fuzzy
-                                    _pair376 = _prebuilt_checklist_read(
+                                    # аудит 2026-07-18 (runtime-react #6): _t.func внутри —
+                                    # sync-DB чтение чек-листа с items → в поток (event loop).
+                                    _pair376 = await asyncio.to_thread(
+                                        _prebuilt_checklist_read,
                                         tools, _res376.checklist.id)
                                     if _pair376 is not None:
                                         _init["messages"] = [*_init["messages"], *_pair376]
@@ -5153,7 +5262,9 @@ async def handle_turn(
             reply = _Reply(_postformat(q) or "Уточни, пожалуйста.",
                            awaiting_confirm=is_confirm, confirm_id=pid)
             # #192: pause-ход → awaiting_confirm/pending (conditional; не переоткрывает done)
-            _trace.persist_trace_pause(tenant_id=tenant_id, user_id=user_id, turn_key=_tk_trace)
+            await asyncio.to_thread(  # аудит 2026-07-18 (runtime-react #6): sync-DB в поток
+                _trace.persist_trace_pause,
+                tenant_id=tenant_id, user_id=user_id, turn_key=_tk_trace)
             return reply
         last = result["messages"][-1] if result.get("messages") else None
         text = _text_content(getattr(last, "content", "")) if isinstance(last, AIMessage) else ""
@@ -5212,7 +5323,8 @@ async def handle_turn(
                         _tpj = json.dumps(_pd285, ensure_ascii=False)
                     except Exception:  # noqa: BLE001 — события best-effort, полиси не теряем
                         pass
-                _trace.persist_trace_finish(
+                await asyncio.to_thread(  # аудит 2026-07-18 (runtime-react #6): sync-DB в поток
+                    _trace.persist_trace_finish,
                     tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
                     turn_key=_tk_trace, reply_text=str(reply), llm_calls=_lcs, tool_calls=_tcs,
                     confirm_state=("confirmed" if _did_resume else "none"),  # #316 R2: redirect≠confirmed
@@ -5242,6 +5354,15 @@ async def handle_turn(
         # прод-краша слепа (искали причину часами по одному «type=»).
         logger.warning("react_loop: handle_turn failed type=%s gen=%s at=%s",
                        _safe_tn(exc), gen, _safe_tb(exc))
+        # FC-1 (аудит 2026-07-18): краш мог оставить shared session хода в failed-state
+        # (незакрытая транзакция) — сбрасываем, чтобы post-turn commit call-site'а и любые
+        # последующие чтения той же сессии не упали PendingRollbackError. Эталон — локальный
+        # try/except + rollback (executor.py:254/264; идемпотентно, session=None → skip).
+        if session is not None:
+            try:
+                session.rollback()
+            except Exception:  # noqa: BLE001 — recovery не валит ход
+                logger.warning("react_loop: session rollback in catch-all failed")
         _transient = _is_transient_llm_exc(exc)  # #225: LLM/сеть down ≠ porча стейта
         if _persist_enabled():
             # #193/#225: durable-ключ стабилен → восстановление не через gen-bump. ТРАНЗИЕНТ (LLM/сеть
@@ -5254,15 +5375,15 @@ async def handle_turn(
                     # R1 (Codex medium MAJOR): транзиент РВЁТ цепочку «подряд» → сброс poison-счётчика
                     # (иначе poison→transient→poison ложно сносит на 2-м, хотя крахи не подряд-poison).
                     _DURABLE_CRASH.pop(_dur, None)
-                    _get_checkpointer().clear_pending(_dur)  # снять залипшую паузу
+                    _get_checkpointer().clear_pending(_dur, tenant_id=tenant_id)  # снять залипшую паузу
                 else:
                     n = _DURABLE_CRASH.get(_dur, 0) + 1
                     if n >= _DURABLE_CRASH_LIMIT:
-                        _get_checkpointer().delete_thread(_dur)
+                        _get_checkpointer().delete_thread(_dur, tenant_id=tenant_id)
                         _DURABLE_CRASH.pop(_dur, None)
                     else:
                         _DURABLE_CRASH[_dur] = n
-                        _get_checkpointer().clear_pending(_dur)  # хотя бы снять залипшую паузу
+                        _get_checkpointer().clear_pending(_dur, tenant_id=tenant_id)  # хотя бы снять залипшую паузу
             except Exception as _dexc:  # noqa: BLE001 — recovery не валит ход
                 # #366: exc_info=True печатал str(exc) с SQL+ПД (g-039); PII-safe стек.
                 logger.warning("react_loop: durable crash-recovery failed type=%s at=%s",
@@ -5270,14 +5391,18 @@ async def handle_turn(
         else:
             _THREAD_GEN[base] = gen + 1
         # #225: на транзиенте при durable беседа ЦЕЛА → не врём «потеряла контекст».
+        # FC-1 (аудит 2026-07-18, cross-concurrency Н1): safe-fallback после внутреннего
+        # сбоя → had_internal_error=True (канал НЕ помечает inbound «processed»).
         _reply = _Reply(
             "Связь на секунду подвела — повтори, пожалуйста. Контекст я сохранила."
             if (_transient and _persist_enabled()) else
-            "Ой, я потеряла контекст этого диалога. Повтори, пожалуйста, что нужно сделать.")
+            "Ой, я потеряла контекст этого диалога. Повтори, пожалуйста, что нужно сделать.",
+            had_internal_error=True)
         # #192: handled-ошибка (поймана) → терминал done+outcome (НЕ in_progress; in_progress
         # остаётся только при НЕпойманном краше/потере finish-хука). Best-effort, guarded.
         if _tk_trace:
-            _trace.persist_trace_finish(
+            await asyncio.to_thread(  # аудит 2026-07-18 (runtime-react #6): sync-DB в поток
+                _trace.persist_trace_finish,
                 tenant_id=tenant_id, user_id=user_id, thread_id=base, channel=channel,
                 turn_key=_tk_trace, reply_text=str(_reply), llm_calls=None, tool_calls=None,
                 confirm_state="none", outcome="safe_reply", passes=0)

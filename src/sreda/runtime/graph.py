@@ -31,6 +31,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+from collections import OrderedDict
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any
@@ -365,6 +366,14 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
     # first anyway.
     _trace_ctx = trace.current()
     _trace_stashed = False
+    # Stage 9.1: capture TG-side message_id/date for the inline path so
+    # we can correlate ack vs final delivery order. Lives only for the
+    # duration of this turn — fed into final_meta below. Declared BEFORE
+    # the loop and assigned only for the FIRST reply: outbox_items[0]
+    # carries the ``_trace``, so >1 reply in a turn must not attribute
+    # the LAST reply's ids to it (audit 2026-07-18 runtime-core #4).
+    first_send_tg_message_id: int | None = None
+    first_send_tg_date: int | None = None
     for reply in replies:
         feature_key = reply.get("feature_key")
         skill_config = _find_skill_config(skill_configs, feature_key)
@@ -433,12 +442,6 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
             decision=decision.kind.value,
         )
 
-        # Stage 9.1: capture TG-side message_id/date for the inline path
-        # so we can correlate ack vs final delivery order. Lives only
-        # for the duration of this turn — fed into final_meta below.
-        first_send_tg_message_id: int | None = None
-        first_send_tg_date: int | None = None
-
         if decision.kind == DeliveryKind.drop:
             outbox.status = "muted"
         elif decision.kind == DeliveryKind.defer:
@@ -477,10 +480,15 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
                         if isinstance(result, dict):
                             mid = result.get("message_id")
                             tg_date = result.get("date")
-                            if isinstance(mid, int):
-                                first_send_tg_message_id = mid
-                            if isinstance(tg_date, int):
-                                first_send_tg_date = tg_date
+                            # Only the FIRST reply's ids belong to
+                            # outbox_items[0] (the trace row). Items are
+                            # appended at the end of each iteration, so
+                            # an empty list here means first reply.
+                            if not outbox_items:
+                                if isinstance(mid, int):
+                                    first_send_tg_message_id = mid
+                                if isinstance(tg_date, int):
+                                    first_send_tg_date = tg_date
                     except TelegramDeliveryError:
                         # Leave pending; delivery worker will retry.
                         outbox.status = "pending"
@@ -540,6 +548,16 @@ async def node_persist_replies(state: AssistantGraphState, config: RunnableConfi
 
 async def node_persist_error(state: AssistantGraphState, config: RunnableConfig) -> dict:
     session = _session(config)
+    # Audit 2026-07-18 (cross-concurrency Н3, узкий аналог Н1 на
+    # graph-пути): handler мог сделать flush частичной мутации ДО raise
+    # ``ActionRuntimeError`` — без rollback commit ниже зацементировал бы
+    # грязь вместе со статусом «failed» (эталон — executor.py rollback в
+    # except-путях). ``run``/``job`` дальше перечитываются из
+    # закоммиченного состояния (claim закоммичен executor'ом). Побочка:
+    # ``touch_accessed``-счётчики из load_memories на error-пути
+    # отбрасываются — приемлемая потеря телеметрии, для упавшего хода
+    # даже корректнее.
+    session.rollback()
     action = _action(state)
     telegram = _telegram_for(config, action.bot_key)
     run = session.get(AgentRun, state["run_id"])
@@ -683,6 +701,65 @@ def _branch_after_execute(state: AssistantGraphState) -> str:
 # ---------------------------------------------------------------------------
 
 
+class _BoundedInMemorySaver(InMemorySaver):
+    """InMemorySaver с LRU-потолком на число retained thread_id.
+
+    Audit 2026-07-18 (runtime-core #3): при выключенной persistence
+    (дефолт, opt-in из-за PII) каждый graph-run пишет ~7 чекпоинтов с
+    полным state под УНИКАЛЬНЫМ-per-run ``thread_id`` в never-evict dict
+    process-wide синглтона — медленная гарантированная утечка памяти в
+    обоих long-lived процессах (uvicorn, job_runner). Чекпоинты на
+    graph-пути никем не читаются обратно (thread_id уникален на run),
+    поэтому eviction ничего не ломает. Чистим все три store'а
+    (``storage`` / ``writes`` / ``blobs``) — в установленной версии
+    langgraph ``delete_for_thread`` у InMemorySaver нет.
+    """
+
+    def __init__(self, *, max_threads: int = 256, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._max_threads = max(1, max_threads)
+        self._lru: OrderedDict[str, None] = OrderedDict()
+
+    def _touch_thread(self, config: RunnableConfig) -> None:
+        thread_id = (config.get("configurable") or {}).get("thread_id")
+        if not thread_id:
+            return
+        thread_id = str(thread_id)
+        self._lru[thread_id] = None
+        self._lru.move_to_end(thread_id)
+        while len(self._lru) > self._max_threads:
+            evict_id, _ = self._lru.popitem(last=False)
+            self._evict_thread(evict_id)
+
+    def _evict_thread(self, thread_id: str) -> None:
+        self.storage.pop(thread_id, None)
+        for key in [k for k in self.writes if k[0] == thread_id]:
+            self.writes.pop(key, None)
+        for key in [k for k in self.blobs if k[0] == thread_id]:
+            self.blobs.pop(key, None)
+
+    def put(
+        self,
+        config: RunnableConfig,
+        checkpoint: Any,
+        metadata: Any,
+        new_versions: Any,
+    ) -> RunnableConfig:
+        result = super().put(config, checkpoint, metadata, new_versions)
+        self._touch_thread(config)
+        return result
+
+    def put_writes(
+        self,
+        config: RunnableConfig,
+        writes: Any,
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        super().put_writes(config, writes, task_id, task_path)
+        self._touch_thread(config)
+
+
 _POSTGRES_CHECKPOINTER_SINGLETON: Any | None = None
 """Process-lifetime PostgresSaver. Held module-level so the underlying
 connection pool isn't torn down between graph compiles.
@@ -767,7 +844,9 @@ def _make_checkpointer() -> Any:
     - ``database_url`` starts with ``postgresql`` AND
       ``SREDA_LANGGRAPH_CHECKPOINTER`` is not ``"memory"``
       → :class:`PostgresSaver` (production path, durable state)
-    - anything else → :class:`InMemorySaver` (sqlite / dev / test)
+    - anything else → :class:`_BoundedInMemorySaver` (sqlite / dev /
+      test / persistence opted-out — LRU-capped, audit 2026-07-18
+      runtime-core #3)
 
     The PostgresSaver is held in a module-level singleton so the
     connection pool isn't recreated on every graph compile (compile
@@ -782,18 +861,18 @@ def _make_checkpointer() -> Any:
 
     settings = get_settings()
     if settings.langgraph_checkpointer_mode.strip().lower() == "memory":
-        return InMemorySaver()
+        return _BoundedInMemorySaver()
     # Codex R1 CRITICAL 2026-05-26 — PostgresSaver writes LangGraph state
     # (profile + memories + replies — decrypted PII) into its own
     # checkpoint tables. Those bypass our ``EncryptedString`` column type
     # and project retention controls. Until we add an encrypted
     # serializer, persistence is OFF unless explicitly opted in.
     if not settings.langgraph_persistence_opted_in:
-        return InMemorySaver()
+        return _BoundedInMemorySaver()
     db_url = (settings.database_url or "").lower()
     if not db_url.startswith(("postgresql", "postgres+", "postgresql+")):
         # SQLite / unrecognized — fall back to in-memory so tests work.
-        return InMemorySaver()
+        return _BoundedInMemorySaver()
 
     if _POSTGRES_CHECKPOINTER_SINGLETON is None:
         _POSTGRES_CHECKPOINTER_SINGLETON = _build_postgres_checkpointer(

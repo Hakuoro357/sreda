@@ -79,6 +79,15 @@ _TERMINAL_EXECUTION_STATUSES: frozenset[str] = frozenset(
     }
 )
 
+# audit 2026-07-18 (planner-exec MINOR): poison-pill ceiling. ``recovery_attempt``
+# is incremented on every claim but was never compared to a maximum — an
+# execution whose recovery deterministically raises (e.g. an unforeseen
+# ledger status making decide_recovery raise ValueError, or a corrupt row)
+# was re-claimed every lease cycle FOREVER, producing an endless error log
+# with no escalation. After this many failed recovery attempts the
+# execution is terminalized as failed_needs_manual + P1 alert.
+MAX_RECOVERY_ATTEMPTS = 5
+
 
 @dataclass(frozen=True)
 class _AlertPayload:
@@ -520,6 +529,76 @@ def recover_execution(
 # ---------------------------------------------------------------------------
 
 
+def _terminalize_poison_execution(
+    session_factory: Callable[[], Session],
+    *,
+    execution_id: str,
+    alert_fn: Callable[..., None] | None,
+) -> None:
+    """Poison-pill escalation (audit 2026-07-18, planner-exec MINOR).
+
+    Called from ``run_recovery_scan`` when ``recover_execution`` raised.
+    If the execution's ``recovery_attempt`` has reached
+    ``MAX_RECOVERY_ATTEMPTS``, terminalize it as ``failed_needs_manual``
+    (lease cleared → never re-claimed) and fire a P1 alert — otherwise the
+    row would be re-claimed every lease cycle forever (endless error log,
+    no escalation).
+
+    Best-effort and NEVER raises: any failure here is logged; the row is
+    simply re-claimed on a later tick and the ceiling is re-checked.
+    The alert fires only AFTER the terminalizing commit succeeds (same
+    post-commit rule as the main scan path)."""
+    try:
+        poison_session = session_factory()
+        try:
+            execution = poison_session.get(PlannerExecution, execution_id)
+            if (
+                execution is None
+                or execution.execution_status != "in_progress"
+                or (execution.recovery_attempt or 0) < MAX_RECOVERY_ATTEMPTS
+            ):
+                return
+            execution.execution_status = TERMINAL_FAILED_NEEDS_MANUAL
+            execution.recovery_lease_until = None  # terminal — never re-claim
+            poison_session.commit()
+        finally:
+            poison_session.close()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "run_recovery_scan: poison-pill terminalization failed for "
+            "execution_id=%r — will retry on a later tick",
+            execution_id,
+        )
+        return
+    logger.error(
+        "run_recovery_scan: execution_id=%r terminalized as "
+        "failed_needs_manual after %d failed recovery attempts (poison)",
+        execution_id,
+        MAX_RECOVERY_ATTEMPTS,
+    )
+    if alert_fn is not None:
+        try:
+            alert_fn(
+                severity="P1",
+                title="planner recovery: poison execution failed_needs_manual",
+                body=(
+                    f"execution_id={execution_id}\n"
+                    f"recover_execution raised on {MAX_RECOVERY_ATTEMPTS} "
+                    f"consecutive claims — deterministic recovery failure. "
+                    f"Execution terminalized as failed_needs_manual; manual "
+                    f"investigation required (see step_execution_ledger and "
+                    f"scanner error logs for execution_id={execution_id})."
+                ),
+                dedupe_key=f"planner_recovery_poison:{execution_id[:16]}",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "run_recovery_scan: poison-pill admin alert failed for "
+                "execution_id=%r (DB state already committed)",
+                execution_id,
+            )
+
+
 def run_recovery_scan(
     session_factory: Callable[[], Session],
     *,
@@ -642,6 +721,14 @@ def run_recovery_scan(
             )
             exec_session.rollback()
             summary["errored"] += 1
+            # audit 2026-07-18 (planner-exec MINOR): poison-pill ceiling —
+            # a deterministically failing recovery must not be re-claimed
+            # every lease cycle forever (see MAX_RECOVERY_ATTEMPTS).
+            _terminalize_poison_execution(
+                session_factory,
+                execution_id=execution_id,
+                alert_fn=alert_fn,
+            )
             continue
         finally:
             exec_session.close()
@@ -692,6 +779,7 @@ def run_recovery_scan(
 
 
 __all__ = [
+    "MAX_RECOVERY_ATTEMPTS",
     "RecoverOutcome",
     "claim_stale_executions",
     "recover_execution",

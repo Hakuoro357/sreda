@@ -253,7 +253,11 @@ def _resolve_path(path: str, state: dict[str, Any]) -> Any:
         else:
             raise InvalidReferenceError(
                 f"Reference '${{{path}}}' — cannot access field '{field}' on "
-                f"value of type {type(current).__name__} (value: {current!r})."
+                # audit 2026-07-18 (planner-exec MINOR): no `value:
+                # {current!r}` — the repr embedded arbitrary user data
+                # (shopping lists, reminders) into error_summary →
+                # plaintext logs / persisted diagnostics.
+                f"value of type {type(current).__name__}."
             )
     return current
 

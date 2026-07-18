@@ -535,7 +535,13 @@ async def _execute_one_step(
             step_id=step_id,
             tool=action.tool,
             status="arg_violation",
-            error_summary=f"execute_time_arg_violation: {exc.errors()}",
+            # audit 2026-07-18 (planner-exec MINOR): include_input=False —
+            # pydantic errors() otherwise embeds the raw `input` values
+            # (user PII from tool args) into error_summary → plaintext logs
+            # and planner_executions diagnostics.
+            error_summary=(
+                f"execute_time_arg_violation: {exc.errors(include_input=False)}"
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         # Defensive — non-ValidationError surfacing from the validator
@@ -564,12 +570,20 @@ async def _execute_one_step(
             step_id=step_id,
             tool_name=action.tool,
         )
-        ls = ledger_session_factory()
+        ls = None
         try:
-            # FAIL-FAST precondition: open_step / commit are deliberately NOT
-            # guarded — if the 'started' row can't be persisted we must NOT run
-            # the (possibly durable) tool, since the write would be unledgered
-            # and unrecoverable. Raising aborts the step fail-closed.
+            ls = ledger_session_factory()
+            # FAIL-CLOSED precondition: if the 'started' row can't be
+            # persisted we must NOT run the (possibly durable) tool, since
+            # the write would be unledgered and unrecoverable.
+            # audit 2026-07-18 (planner-exec MINOR): the failure surfaces as
+            # an ordinary StepResult(status='error') instead of propagating
+            # — a raw raise here pierced asyncio.gather(
+            # return_exceptions=False) and aborted the WHOLE execute_plan,
+            # dropping the ExecutionLog and every sibling result while
+            # already-started siblings kept running detached. Per-step
+            # error keeps the batch alive; downstream consumers cascade-skip
+            # via failed_step_ids, and no tool ran → no commit risk.
             open_step(
                 ls,
                 execution_id=execution_id,
@@ -579,16 +593,28 @@ async def _execute_one_step(
                 now=now_fn(),
             )
             ls.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "executor: ledger 'started' open failed for step %s — "
+                "step NOT run (fail-closed)", step_id,
+            )
+            return StepResult(
+                step_id=step_id,
+                tool=action.tool,
+                status="error",
+                error_summary=f"ledger_open_failed:{type(exc).__name__}",
+            )
         finally:
             # close() itself must not mask the (intended) open/commit exception
             # nor raise on its own (Codex A/B #8b-2 R2 MINOR — consistency).
-            try:
-                ls.close()
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "executor: ledger 'started' session close failed for "
-                    "step %s", step_id,
-                )
+            if ls is not None:
+                try:
+                    ls.close()
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "executor: ledger 'started' session close failed for "
+                        "step %s", step_id,
+                    )
 
     started = time.monotonic()
 

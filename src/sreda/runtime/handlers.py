@@ -14,6 +14,7 @@ unit-testing trivial.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -635,7 +636,7 @@ def execute_profile_propose_update(
 
     lines = [
         "🤖 Предлагаю обновить профиль:",
-        f"• {field_name} → {proposed_value}",
+        f"• {_field_ru_338(field_name)} → {_value_ru_338(field_name, proposed_value)}",
     ]
     if justification:
         lines.append(f"\n{justification}")
@@ -1946,6 +1947,27 @@ def _load_chat_history(
         .limit(limit)
         .all()
     )
+    # Audit 2026-07-18 (runtime-core #9): batch-fetch всех outbox-rows
+    # одним IN-запросом вместо per-id ``session.get`` в цикле (до ~20
+    # лишних PK-lookup'ов на каждый chat-turn). Семантика цикла ниже
+    # не меняется — меняется только источник lookup'а.
+    _all_outbox_ids: list[str] = []
+    for run in prior_runs:
+        try:
+            _result_data = json.loads(run.result_json or "{}")
+        except (ValueError, TypeError):
+            continue  # parse error обработается (с warning) в основном цикле
+        for _oid in _result_data.get("outbox_message_ids") or []:
+            _all_outbox_ids.append(str(_oid))
+    _outbox_by_id: dict[str, Any] = {}
+    if _all_outbox_ids:
+        for _ob in (
+            session.query(OutboxMessage)
+            .filter(OutboxMessage.id.in_(_all_outbox_ids))
+            .all()
+        ):
+            _outbox_by_id[str(_ob.id)] = _ob
+
     turns: list[tuple[str, str]] = []
     for run in prior_runs:
         try:
@@ -1959,7 +1981,7 @@ def _load_chat_history(
             outbox_ids = result_data.get("outbox_message_ids") or []
             bot_parts: list[str] = []
             for oid in outbox_ids:
-                ob = session.get(OutboxMessage, oid)
+                ob = _outbox_by_id.get(str(oid))
                 if ob is None or not ob.payload_json:
                     continue
                 payload = json.loads(ob.payload_json)
@@ -2523,7 +2545,16 @@ async def _run_legacy_react_loop(  # noqa: C901 — complexity lives here by des
                 action.tenant_id, _iter, len(tool_calls),
                 [tc.get("name") for tc in tool_calls],
             )
-        _results = _dispatch_tool_calls_batch(tool_calls, tools_by_name)
+        _results = await asyncio.to_thread(
+            _dispatch_tool_calls_batch, tool_calls, tools_by_name
+        )
+        # Audit 2026-07-18 (cross-latency NEW-2, MAJOR): весь sync
+        # tool-слой (HTTP Tavily/fetch/weather с таймаутами 8-10с, sync
+        # DB инструментов, quota-retry sleep) исполнялся прямо на
+        # loop-потоке — стопорил чужие ходы, webhook-и и outbox-доставку.
+        # `asyncio.to_thread` уводит batch в worker-поток; внутренний
+        # parallel/serial выбор и детерминированный порядок результатов
+        # не меняются (`_dispatch_one_tool` — pure, thread-safe by design).
 
         # R-32 (2026-05-15): dispatch returns 4-tuple
         # `(tc_id, name, result_str, is_physical_execution)` — flag
@@ -3465,7 +3496,14 @@ async def finalize_chat_reply(fin: FinalizeInput) -> list[RuntimeReply]:
         for m in reversed(current_turn_msgs):
             if not isinstance(m, AIMessage):
                 continue
-            candidate = (getattr(m, "content", "") or "").strip()
+            # Audit 2026-07-18 (llm-core #7, legacy-сторона): rescued
+            # text проходит через тот же strip_reasoning_prefix, что и
+            # основной путь (:3442 эталон) — иначе спасённый из более
+            # ранней итерации ответ может утечь юзеру с reasoning-
+            # префиксом («thought\n…»).
+            candidate = strip_reasoning_prefix(
+                (getattr(m, "content", "") or "").strip()
+            )
             if candidate:
                 text = candidate
                 rescued = True
@@ -4027,10 +4065,14 @@ def _is_synthetic_fallback_reply(text: str) -> bool:
     stripped = text.strip()
     if stripped == _EMPTY_REPLY_FALLBACK:
         return True
-    # Exact match on refusal substitute. Use startswith on first
-    # 25 chars чтобы tolerate trailing punctuation / whitespace
-    # без матчинга на любой текст начинающийся со «Прости».
-    if stripped.startswith(_REFUSAL_SUBSTITUTE_MESSAGE[:25]):
+    # Exact match on refusal substitute. Match on the full first
+    # sentence («Прости, не получилось понять запрос») — tolerates
+    # trailing punctuation / whitespace, но НЕ матчит органические
+    # ответы модели, начинающиеся с той же извиняющейся конструкции
+    # (audit 2026-07-18, runtime-core #8: прежний 25-символьный префикс
+    # «Прости, не получилось поня» молча выкидывал из истории любой
+    # естественный ответ с таким началом).
+    if stripped.startswith(_REFUSAL_SUBSTITUTE_MESSAGE[:35]):
         return True
     return False
 

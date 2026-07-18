@@ -113,7 +113,17 @@ def build_memory_tools(
             session.commit()
             return payload
         from sreda.config.settings import get_settings
-        secret = get_settings().encryption_key or "dev-insecure-args-hmac"
+        # Audit 2026-07-18 (runtime-core #7): fail-closed вместо молчаливого
+        # fallback на публичную константу «dev-insecure-args-hmac» — без
+        # SREDA_ENCRYPTION_KEY args-HMAC не считается вовсе (тот же ключ
+        # нужен EncryptedString-колонкам; эталон — _durable_thread_id
+        # #193 в react_loop.py).
+        secret = get_settings().encryption_key
+        if not secret:
+            from sreda.services.encryption import EncryptionConfigError
+            raise EncryptionConfigError(
+                "idempotent memory write требует SREDA_ENCRYPTION_KEY"
+            )
         try:
             # NB: БЕЗ audit_* — react-аудит (audit_feed) memory-тип не белосписан, и memory-записи
             # не аудитились и до #325; скоуп задачи — идемпотентность, аудит памяти = отдельное решение.
