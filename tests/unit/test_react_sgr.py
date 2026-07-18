@@ -189,7 +189,7 @@ def test_wire_schema_long_description_not_truncated():
     assert branch["description"] == long_desc
 
 
-def test_wire_schema_couples_enough_data():
+def test_sgr_schema_couples_enough_data():
     # приёмка п.4: схемная связка — act несёт const true, clarify const false, finish const true
     schema = build_wire_schema(_slice(), "flat")
     act, clarify, finish = schema["anyOf"]

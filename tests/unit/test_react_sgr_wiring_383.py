@@ -16,7 +16,7 @@ import asyncio
 import json
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import StructuredTool
 
@@ -179,17 +179,36 @@ def test_sgr_gate_off_identical(install, monkeypatch, flag, tenants):
 
 
 def test_sgr_off_no_import(install, monkeypatch):
-    # OFF-путь не должен даже импортировать react_sgr (изоляция OFF, R1 sol M7)
+    # OFF-путь не должен даже импортировать react_sgr (изоляция OFF, R1 sol M7).
+    # CR R2 Opus MINOR#2: ловим ОБЕ формы импорта (`import ... react_sgr` даёт name с
+    # 'react_sgr'; `from sreda.runtime import react_sgr` — name='sreda.runtime' +
+    # fromlist=['react_sgr']) И проверяем sys.modules по ПОЛНОМУ имени после хода.
+    import sys as _sys
+    _sys.modules.pop("sreda.runtime.react_sgr", None)
     install(sgr_flag=False)
     import builtins
     real_import = builtins.__import__
 
-    def _guard(name, *a, **k):
-        assert "react_sgr" not in name, "OFF-путь импортировал react_sgr"
-        return real_import(name, *a, **k)
+    def _guard(name, globals=None, locals=None, fromlist=(), level=0):
+        assert "react_sgr" not in name, "OFF-путь импортировал react_sgr (import-форма)"
+        assert "react_sgr" not in (fromlist or ()), \
+            "OFF-путь импортировал react_sgr (from-форма)"
+        return real_import(name, globals, locals, fromlist, level)
     monkeypatch.setattr(builtins, "__import__", _guard)
     res = _turn(_SgrChat("m"), thread="off-noimp", text=CHECKLIST_TEXT)
     assert str(res)
+    assert "sreda.runtime.react_sgr" not in _sys.modules, \
+        "react_sgr оказался в sys.modules при OFF"
+
+
+def test_sgr_inactive_empty_slice_label(install, monkeypatch):
+    # CR R2 Opus MINOR#3: пустой срез → inactive_reason='empty_slice' (НЕ 'union_size')
+    st = install(sgr_flag=True, sgr_tenants="t-canary")
+    import sreda.runtime.react_sgr as react_sgr
+    monkeypatch.setattr(react_sgr, "compute_sgr_tools", lambda *a, **k: [])
+    _turn(_SgrChat("m"), thread="empty-slice", text=CHECKLIST_TEXT)
+    sgr = [c["sgr"] for c in _chat_calls(st["trace"]) if c.get("sgr")][0]
+    assert sgr["active"] is False and sgr["inactive_reason"] == "empty_slice"
 
 
 @pytest.mark.parametrize("text", [
@@ -437,3 +456,95 @@ def test_sgr_per_attempt_usage(install, monkeypatch):
     llm = _SgrChat("m", sgr_responses=["мусор"])
     _turn(llm, thread="usage1", text=CHECKLIST_TEXT)
     assert recorded.count("inception-mercury2") >= 2  # structured-попытка + легаси-попытка
+
+
+# ─────────────── п.6: машинный dict-пин контракта возврата узла (класс #74/g-042) ───────────────
+
+
+def _sgr_graph_state(inv, sgr_responses, *, thread, text="покажи список дел",
+                     turn_pass_count=0, guard_nudge="", stale_pause_note=""):
+    """Прямой прогон _build_graph → g.invoke (паттерн test_preflight_trace_fields):
+    возврат узла chat аккумулируется в состоянии графа — читаем его напрямую."""
+    llm = _SgrChat("g", sgr_responses=list(sgr_responses))
+    tools = [_mk_tool(n, inv) for n in _CHECKLIST_TOOLS]
+    g = react_loop._build_graph(
+        llm, tools, tenant_id="t-canary", user_id="u", today_str="2026-07-17",
+        session=None, provider_key="inception-mercury2", preflight_enabled=True)
+    return g.invoke(
+        {"messages": [HumanMessage(text)], "turn_key": f"tk-{thread}",
+         "active_families": ["checklists"], "guard_attempted_families": [],
+         "turn_pass_count": turn_pass_count, "guard_nudge": guard_nudge,
+         "stale_pause_note": stale_pause_note, "wrote_unkeyed": False, "intent": "task",
+         "unified_execute": True,
+         "router_allowed_read_domains": ["checklists", "web"],
+         "router_allowed_write_domains": [],
+         "intent_meta": {"source": "unified", "must_task": False, "classifier_raw": None}},
+        {"configurable": {"thread_id": f"sgr-ret-{thread}"}})
+
+
+def test_sgr_return_contract(install):
+    # приёмка п.6: SGR-успешный возврат несёт инкремент turn_pass_count (ЕДИНСТВЕННЫЙ кормилец
+    # анти-петли, route :3900/:3912) И ОБА one-shot-сброса ключами. Прямой пин возврата узла.
+    install(sgr_flag=True, sgr_tenants="t-canary")
+    inv = {}
+    # act(read) → finish: ДВА chat-прохода → инкремент ПО ПРОХОДУ (не константа)
+    res = _sgr_graph_state(
+        inv, [_act_json("show_checklist", q="дела"), _finish_json("Готово.")], thread="two")
+    assert res["turn_pass_count"] == 2                       # 0 → +1 → +1
+    assert "guard_nudge" in res and res["guard_nudge"] == ""        # one-shot consume
+    assert "stale_pause_note" in res and res["stale_pause_note"] == ""
+    chat_calls = [c for c in res["llm_calls"] if c.get("phase") == "chat"]
+    assert len(chat_calls) == 2 and all(c["sgr"]["active"] is True for c in chat_calls)
+    assert inv.get("show_checklist") == 1                    # act реально исполнен run_tools
+    # инкремент = prev+1 (НЕ reset-в-число проходов): старт с 3, те же 2 прохода → 5
+    res2 = _sgr_graph_state(
+        inv, [_act_json("show_checklist", q="дела"), _finish_json("Готово.")], thread="from3",
+        turn_pass_count=3)
+    assert res2["turn_pass_count"] == 5
+
+
+# ─────────────── п.11: confirm-парность на ВСЕХ write-мутациях среза ───────────────
+
+
+@pytest.mark.parametrize("write_tool", ["create_checklist", "add_checklist_items",
+                                        "delete_checklist_item"])
+def test_sgr_confirm_parity(install, write_tool):
+    """приёмка п.11: given чеклистовая мутация, для которой легаси требует подтверждение
+    (на read-ходе allowed_write=∅ → любой write = кандидат под _generic_confirm_wrap),
+    when SGR её выбирает, then пауза ДО «да» и НОЛЬ мутаций в состоянии до подтверждения.
+    Юнит меряет ДИСПЕТЧ (мутация-функция не вызвана до confirm); фактическую неизменность
+    ДАННЫХ в БД на всём голд-наборе меряет Ф3-живой прогон (self-verify-before-owner)."""
+    st = install(sgr_flag=True, sgr_tenants="t-canary")
+    llm = _SgrChat("m", sgr_responses=[_act_json(write_tool, q="нечто")],
+                   legacy_responses=[AIMessage(content="после resume")])
+    res = _turn(llm, thread=f"parity-{write_tool}", text=CHECKLIST_TEXT)
+    assert getattr(res, "awaiting_confirm", False) is True, str(res)   # пауза до «да»
+    assert st["inv"].get(write_tool) is None                          # 0 мутаций до подтверждения
+
+
+# ─────────────── MINOR#1: golden-пин собранного OFF-промпта (анти-reorder хвоста) ───────────────
+
+
+def test_sgr_off_prompt_golden(install, monkeypatch):
+    """CR R2 Opus MINOR#1: снапшот легаси-сборки на фиксированном входе — молчаливая
+    перестановка хвоста в _assemble_msgs (перенос директивы в system, смена порядка)
+    ловится этим пином. Детерминизм: время заморожено, персона-overlay пуст."""
+    monkeypatch.setattr(react_loop, "_now_tail_line", lambda: "Сейчас 2026-07-17, четверг.")
+    monkeypatch.setenv("SREDA_REACT_TIME_IN_TAIL", "1")   # today_str="" → дата не в system
+    st = install(sgr_flag=False)                          # OFF: легаси-сборка (unified path)
+    from sreda.config import settings as settings_mod
+    settings_mod.get_settings.cache_clear()
+    off_msgs = []
+    _turn(_SgrChat("m", legacy_msgs=off_msgs), thread="golden", text=CHECKLIST_TEXT)
+    msgs = off_msgs[0]
+    # структура: [System, Human] (свежий ход без истории)
+    assert [type(m).__name__ for m in msgs] == ["SystemMessage", "HumanMessage"]
+    # system = КАНОНИЧЕСКИЙ _system_prompt БЕЗ хвостовых директив (хвост НЕ в system)
+    assert msgs[0].content == react_loop._system_prompt("", "")
+    # human-хвост: текст юзера, затем availability (из полного bound), затем время —
+    # порядок #247/#298 (директива, потом время; или наоборот — пин фиксирует ФАКТ)
+    human = msgs[1].content
+    assert human.startswith(CHECKLIST_TEXT + "\n\n")       # директива ПОСЛЕ текста юзера
+    assert "доступны инструменты" in human                 # availability в хвосте
+    assert "Сейчас 2026-07-17, четверг." in human          # замороженное время в хвосте
+    _ = st

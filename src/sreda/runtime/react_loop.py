@@ -2249,7 +2249,12 @@ def _sgr_structured_step(*, bound: list, allowed_read: Any, allowed_write: Any,
         from sreda.runtime import react_sgr as _sgr
         stage = "slice_error"
         sgr_tools = _sgr.compute_sgr_tools(bound, _TOOL_NAME_ALIASES)
-        if not sgr_tools or len(sgr_tools) > _SGR_MAX_UNION:
+        if not sgr_tools:
+            # CR R2 Opus MINOR#3: пустой срез ≠ раздутый — раздельные лейблы наблюдаемости
+            out["sgr"] = {"active": False, "inactive_reason": "empty_slice",
+                          "fallback_reason": None}
+            return out
+        if len(sgr_tools) > _SGR_MAX_UNION:
             out["sgr"] = {"active": False, "inactive_reason": "union_size",
                           "fallback_reason": None}
             return out
