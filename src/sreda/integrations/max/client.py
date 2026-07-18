@@ -470,19 +470,24 @@ class MaxClient:
                             )
                         chunks.append(chunk)
                     return b"".join(chunks)
-        except _httpx.TimeoutException as exc:
+        except _httpx.TimeoutException:
+            # SECURITY: `from None` — не цепляем httpx-исключение в
+            # __cause__/__context__: у него ``.request.url`` содержит signed
+            # URL (signatureToken/expires, ~24h доступ к голосовому юзера).
+            # Тот же паттерн, что в telegram/client.py (`from None`).
             raise MaxDeliveryError(
                 f"audio download timeout url={redacted}",
                 method="audio_download", status_code=None,
-            ) from exc
+            ) from None
         except _httpx.RequestError as exc:
             # Не включаем exc-text напрямую — может содержать URL
             # с signature. Класс exception'а достаточно informative.
+            # SECURITY: `from None` — см. TimeoutException-ветку выше.
             raise MaxDeliveryError(
                 f"audio download network ({type(exc).__name__}) "
                 f"url={redacted}",
                 method="audio_download", status_code=None,
-            ) from exc
+            ) from None
 
     async def delete_message(self, message_id: str) -> dict:
         """DELETE /messages?message_id=<mid> — remove a message.

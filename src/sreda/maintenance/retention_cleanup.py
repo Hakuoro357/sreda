@@ -12,6 +12,7 @@ Table                          Window      Conditions
 agent_runs                     90 days     status in completed/failed
 inbound_messages               30 days     any
 jobs                           30 days     status in completed/failed/cancelled
+message_jobs                   30 days     status in done/failed/dead_letter
 outbox_messages (sent)         30 days     status == sent
 outbox_messages (failed)       60 days     status == failed
 skill_ai_executions            30 days     any
@@ -41,6 +42,7 @@ from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from sreda.db.models.core import InboundMessage, Job, OutboxMessage
+from sreda.db.models.message_jobs import MessageJob
 from sreda.db.models.planner import (
     PlannerExecution,
     PlannerGap,
@@ -70,6 +72,7 @@ class RetentionCleanupResult:
     agent_runs_job_unlinked: int = 0
     inbound_messages: int = 0
     jobs: int = 0
+    message_jobs: int = 0  # 2026-07-18 cross-security N1 (вторая половина) — терминальные строки очереди
     outbox_messages_sent: int = 0
     outbox_messages_failed: int = 0
     outbox_messages_dropped: int = 0  # #187 — drain удалённого тенанта (status='dropped')
@@ -95,6 +98,7 @@ class RetentionCleanupResult:
             self.agent_runs
             + self.inbound_messages
             + self.jobs
+            + self.message_jobs
             + self.outbox_messages_sent
             + self.outbox_messages_failed
             + self.outbox_messages_dropped
@@ -111,6 +115,7 @@ class RetentionCleanupResult:
             + self.react_turn_trace
             + self.react_checkpoint
             + self.react_summaries
+            + self.plan_library_entries
         )
 
 
@@ -124,6 +129,11 @@ PLANNER_EXECUTIONS_DAYS = 90
 _PLANNER_LIVE_STATUSES = ("pending", "in_progress")  # живые ходы НЕ чистим
 INBOUND_MESSAGES_DAYS = 30
 JOBS_DAYS = 30
+# 2026-07-18 cross-security N1 (вторая половина): message_jobs хранит полный
+# raw webhook update (ПД; с 0085 — зашифрован, но шифрование НЕ заменяет
+# ретенцию). Окно как у inbound/jobs — 30д строго, терминальные статусы.
+# FK-детей нет (лист-таблица) — простой delete, без unlink-паттерна #127.
+MESSAGE_JOBS_DAYS = 30
 OUTBOX_SENT_DAYS = 30
 OUTBOX_FAILED_DAYS = 60
 # #187: outbox со status='dropped' (drain удалённого тенанта). Терминальный
@@ -148,6 +158,9 @@ INBOUND_CHUNK_SIZE = 5000
 TERMINAL_RUN_STATUSES = ("succeeded", "failed", "cancelled")
 TERMINAL_JOB_STATUSES = ("completed", "failed", "cancelled")
 TERMINAL_AGENT_RUN_STATUSES = ("completed", "failed")
+# message_jobs (workers/message_queue.py): живые — pending/processing
+# (processing с протухшим lease — failover-путь, тоже не трогаем).
+TERMINAL_MESSAGE_JOB_STATUSES = ("done", "failed", "dead_letter")
 
 
 def _delete_returning_count(session: Session, stmt) -> int:
@@ -383,6 +396,22 @@ def cleanup_runtime_retention(
         ),
         make_delete=lambda ids: delete(Job).where(Job.id.in_(ids)),
         chunk_size=INBOUND_CHUNK_SIZE,
+    )
+
+    # ---------- message_jobs ----------
+    # 2026-07-18 cross-security N1 (вторая половина): терминальные строки
+    # FIFO-очереди (payload = полный webhook update, ПД) копились бы
+    # бессрочно. Лист-таблица — FK-ссылок на message_jobs нет, unlink не
+    # нужен. Ключ возраста — enqueued_at (created_at-колонки в таблице нет).
+    message_jobs_cutoff = now - timedelta(days=MESSAGE_JOBS_DAYS)
+    result.message_jobs = _delete_returning_count(
+        session,
+        delete(MessageJob).where(
+            and_(
+                MessageJob.status.in_(TERMINAL_MESSAGE_JOB_STATUSES),
+                MessageJob.enqueued_at < message_jobs_cutoff,
+            )
+        ),
     )
 
     # ---------- outbox_messages ----------

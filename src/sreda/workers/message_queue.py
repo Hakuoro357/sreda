@@ -5,8 +5,9 @@ worker (long-running standalone, or a tick-based job-runner integration)
 will compose into a loop:
 
 * ``enqueue_message`` — webhook handler / poller writes one row at
-  inbound time; cross-channel ``UNIQUE (channel, external_update_id)``
-  collapses redeliveries.
+  inbound time; cross-channel ``UNIQUE (channel, external_update_id,
+  bot_key)`` collapses redeliveries (``bot_key`` обязателен в ключе —
+  Telegram ``update_id`` независимы per-bot).
 * ``claim_next_job`` — pick the oldest ``pending`` (or expired-lease
   ``processing``) job for a thread that has no other worker active.
   Uses ``FOR UPDATE SKIP LOCKED`` on Postgres for true concurrency;
@@ -65,7 +66,7 @@ MAX_ATTEMPTS = 3
 
 
 class DuplicateMessageJob(Exception):
-    """Inbound event already enqueued via (channel, external_update_id).
+    """Inbound event already enqueued via (channel, external_update_id, bot_key).
 
     Surfaces the row that won the race so the caller can ack without
     re-processing — Telegram retry, MAX redelivery, etc.
@@ -74,7 +75,8 @@ class DuplicateMessageJob(Exception):
     def __init__(self, existing: MessageJob) -> None:
         super().__init__(
             f"Job for (channel={existing.channel!r}, "
-            f"external_update_id={existing.external_update_id!r}) "
+            f"external_update_id={existing.external_update_id!r}, "
+            f"bot_key={existing.bot_key!r}) "
             f"already exists as id={existing.id!r}"
         )
         self.existing = existing
@@ -88,13 +90,20 @@ def enqueue_message(
     channel: str,
     external_update_id: str,
     message_payload: dict[str, Any],
+    bot_key: str = "sreda",
     now: datetime | None = None,
 ) -> MessageJob:
     """Insert a new pending job.
 
     Raises ``DuplicateMessageJob`` if the composite
-    ``(channel, external_update_id)`` is already present — the caller
-    treats this as success (ack and move on), no re-processing.
+    ``(channel, external_update_id, bot_key)`` is already present — the
+    caller treats this as success (ack and move on), no re-processing.
+
+    ``bot_key`` — какой бот принял update. Продовые producer'ы обязаны
+    передавать ЯВНО (default ``"sreda"`` — только safety-net против
+    NOT NULL, как у ``OutboxMessage.bot_key``): без него дедуп-ключ
+    схлопнет update_id двух разных ботов в один namespace (audit
+    2026-07-18 db-migrations #1).
 
     The session is **not committed** here — the caller controls the
     transaction boundary so the enqueue can be batched with whatever
@@ -112,6 +121,7 @@ def enqueue_message(
         select(MessageJob).where(
             MessageJob.channel == channel,
             MessageJob.external_update_id == external_update_id,
+            MessageJob.bot_key == bot_key,
         )
     ).scalar_one_or_none()
     if existing is not None:
@@ -123,6 +133,7 @@ def enqueue_message(
         thread_id=thread_id,
         channel=channel,
         external_update_id=external_update_id,
+        bot_key=bot_key,
         message_payload=message_payload,
         status="pending",
         enqueued_at=when,
@@ -457,14 +468,20 @@ def mark_failed(
 
 
 def derive_thread_key(
-    tenant_id: str, channel: str, external_chat_id: str
+    tenant_id: str, channel: str, external_chat_id: str, bot_key: str = "sreda"
 ) -> str:
-    """Deterministic FIFO key for one chat.
+    """Deterministic FIFO key for one chat of one bot.
 
-    Two messages from the same (tenant, channel, chat) get the same
+    Two messages from the same (tenant, channel, bot, chat) get the same
     ``thread_key`` and are therefore serialized by the per-thread FIFO.
     Different chats of the same tenant produce different keys and can
     run in parallel.
+
+    ``bot_key`` входит в ключ (audit 2026-07-18 db-migrations #1): два
+    бота одного tenant'а могут слушать один и тот же чат — их FIFO не
+    должен склеиваться (перепутанный порядок ответов между ботами не
+    нужен, но и взаимные блокировки/перемешивание тоже). Default
+    ``"sreda"`` — тот же safety-net, что у ``enqueue_message``.
 
     The key intentionally does NOT match ``AgentThread.id`` (which is
     a UUID-based random id) — ``message_jobs.thread_id`` and
@@ -480,11 +497,12 @@ def derive_thread_key(
     Separator invariant (code-review 2026-05-25 MINOR-2): we rely on
     ``::`` not appearing in any component. Currently safe — tenant_id
     is ``tenant_{channel_prefix}_{numeric}``, channel is a short ASCII
-    enum (``telegram``/``max``), external_chat_id is a numeric string
-    from the messenger. If any of these formats expand to allow ``::``,
-    switch to a hash or use a control-byte separator.
+    enum (``telegram``/``max``), bot_key — ключ BotRegistry (short ASCII
+    slug), external_chat_id is a numeric string from the messenger. If
+    any of these formats expand to allow ``::``, switch to a hash or use
+    a control-byte separator.
     """
-    return f"{tenant_id}::{channel}::{external_chat_id}"
+    return f"{tenant_id}::{channel}::{bot_key}::{external_chat_id}"
 
 
 def is_queue_enabled_for(tenant_id: str) -> bool:

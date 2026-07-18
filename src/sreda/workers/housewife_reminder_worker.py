@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from sqlalchemy.exc import IntegrityError
@@ -33,6 +33,12 @@ from sreda.services.housewife_reminders import (
 logger = logging.getLogger(__name__)
 
 HOUSEWIFE_FEATURE_KEY = "housewife_assistant"
+
+# Аудит 2026-07-18 (#7): reminder без доставляемого канала (юзер отвязал
+# TG/MAX) НЕ помечается fired, а откладывается на этот интервал. Час —
+# не спамим тик каждые 5–10с, но и не теряем напоминание: канал появится
+# (перепривязка) — доставим при ближайшем наступлении срока.
+NO_CHANNEL_RETRY_MINUTES = 60
 
 
 class HousewifeReminderWorker:
@@ -79,6 +85,7 @@ class HousewifeReminderWorker:
 
         fired = 0
         skipped_late = 0
+        deferred_no_channel = 0
         for reminder_id, tenant_id in due_ids:
             try:
                 with tenant_session(tenant_id) as s:
@@ -172,26 +179,49 @@ class HousewifeReminderWorker:
                             skipped_late += 1
                             continue
 
-                    self._enqueue_outbox_for(s, reminder)
-                    service.mark_fired(reminder, now=current)
+                    enqueued = self._enqueue_outbox_for(s, reminder)
+                    if enqueued:
+                        service.mark_fired(reminder, now=current)
+                    else:
+                        # Аудит 2026-07-18 (#7): нет доставляемого канала /
+                        # workspace → mark_fired НЕ вызываем (one-shot
+                        # закрывался бы без единой попытки доставки —
+                        # молчаливая потеря пользовательского reminder'а).
+                        # Откладываем: late-grace считается от
+                        # next_trigger_at, поэтому silent-finalise ветка
+                        # выше не сработает; канал появится — доставим.
+                        reminder.next_trigger_at = current + timedelta(
+                            minutes=NO_CHANNEL_RETRY_MINUTES
+                        )
+                        reminder.updated_at = current
                     s.commit()
-                    fired += 1
+                    if enqueued:
+                        fired += 1
+                    else:
+                        deferred_no_channel += 1
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "reminder %s: failed to fire, will retry next tick",
                     reminder_id,
                 )
                 continue
-        if fired or skipped_late:
+        if fired or skipped_late or deferred_no_channel:
             logger.info(
-                "housewife: fired=%d skipped_late=%d",
-                fired, skipped_late,
+                "housewife: fired=%d skipped_late=%d deferred_no_channel=%d",
+                fired, skipped_late, deferred_no_channel,
             )
         return fired
 
     # --- internals ------------------------------------------------------
 
-    def _enqueue_outbox_for(self, session: Session, reminder: FamilyReminder) -> None:
+    def _enqueue_outbox_for(self, session: Session, reminder: FamilyReminder) -> bool:
+        """Поставить outbox-строки доставки по всем каналам reminder'а.
+
+        Аудит 2026-07-18 (#7): возвращает True, если доставка ОБЕСПЕЧЕНА
+        (хотя бы один routing получил новую строку или уже был поставлен
+        другим писателем — дедуп по idem-key), False — если доставляемого
+        канала / workspace нет (тогда вызывающий НЕ помечает fired, а
+        откладывает reminder)."""
         routings = self._resolve_routings(session, reminder)
         if not routings:
             logger.warning(
@@ -200,7 +230,7 @@ class HousewifeReminderWorker:
                 reminder.id,
                 reminder.tenant_id,
             )
-            return
+            return False
 
         workspace_id = self._resolve_workspace_id(session, reminder.tenant_id)
         if not workspace_id:
@@ -209,7 +239,7 @@ class HousewifeReminderWorker:
                 reminder.id,
                 reminder.tenant_id,
             )
-            return
+            return False
 
         # Escalation UI: inline keyboard (кнопки «Сделал ✅»/«Отложить ⏰»).
         # ``callback_data`` — TG-style; MAX-доставка КОНВЕРТИРУЕТ их в свои inline-
@@ -299,6 +329,9 @@ class HousewifeReminderWorker:
                     reminder.id, routing.channel,
                 )
                 continue
+        # Доставка обеспечена (хотя бы один routing получил строку или
+        # дедуп'нулся об уже поставленную) — можно mark_fired.
+        return True
 
     def _outbox_key_exists(self, session: Session, idem_key: str) -> bool:
         """Pre-check дедупа доставки (#163 Фаза 4): есть ли уже outbox с этим ключом.

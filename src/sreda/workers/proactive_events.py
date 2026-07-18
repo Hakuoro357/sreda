@@ -23,6 +23,7 @@ usage). Most skills compose deterministic text and skip LLM entirely.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -175,7 +176,13 @@ class ProactiveEventWorker:
             budget=budget,
         )
 
-        replies = handler(context) or []
+        # Аудит 2026-07-18 (#8): хендлер — СИНХРОННЫЙ (контракт
+        # register_proactive_handler; docstring модуля разрешает звать LLM).
+        # Прямой вызов блокировал бы event loop job_runner на секунды
+        # (reminders / outbox-доставка / dispatcher встали бы) → гоним в
+        # поток. Доступ к session сериализован await'ом: пока работает
+        # поток, главный поток сессию не трогает (и наоборот).
+        replies = await asyncio.to_thread(handler, context) or []
         # Normalize — handlers may return a single RuntimeReply for convenience.
         if isinstance(replies, RuntimeReply):
             replies = [replies]

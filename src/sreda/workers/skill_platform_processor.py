@@ -135,6 +135,13 @@ class SkillPlatformJobProcessor:
                 job.id,
                 feature_key,
             )
+            # Аудит 2026-07-18 (#3) — rollback ПЕРВЫМ ДЕЙСТВИЕМ в except
+            # (эталон runtime/executor.py:254,264; класс инцидента #331).
+            # Если хендлер упал DB-ошибкой, транзакция в aborted-состоянии
+            # (InFailedSqlTransaction): без rollback каждый recovery-запрос
+            # ниже бросил бы снова, а job навсегда остался бы 'running'
+            # (claim закоммичен в _claim_job, recovery-свипера нет).
+            session.rollback()
             repo.complete_skill_run_attempt(
                 attempt.id,
                 status=SkillAttemptStatus.failed,

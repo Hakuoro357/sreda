@@ -73,6 +73,31 @@ OUTBOX_ROW_DEADLINE_SECONDS = 25
 # Жёсткий таймаут ОДНОЙ сетевой отправки (defense-in-depth внутри общего дедлайна).
 OUTBOX_SEND_TIMEOUT_SECONDS = 20
 
+# Аудит 2026-07-18 (#2) — счётчик попыток + потолок ретраев + dead-letter.
+# Раньше ЛЮБАЯ ошибка доставки (включая перманентные 4xx «bot was blocked
+# by the user» / «chat not found») оставляла строку 'pending' → failing-
+# вызов к TG/MAX API каждый тик бессрочно, poison-строки копились (retention
+# чистит только sent/failed/dropped), а метрика reliability_report (считает
+# только 'failed') врала «всё ок».
+#
+# Перманентный отказ (HTTP 4xx, кроме 429 rate-limit) → dead-letter СРАЗУ:
+# status='failed' + drop_reason='delivery_permanent_<code>'. Транзиентные
+# (429 / 5xx / сеть) → ретрай с потолком OUTBOX_MAX_DELIVERY_ATTEMPTS
+# попыток, затем dead-letter: status='failed' +
+# drop_reason='delivery_retry_exhausted' + admin alert. 'failed' виден
+# reliability_report → метрика честная; retention чистит failed через 60д.
+#
+# Потолок 500 при тике 5–10с ≈ 40–80 минут транзиентного сбоя до dead-
+# letter: кратковременный инцидент канала строки не убивает, настоящий
+# poison всё же финализируется.
+#
+# ОГРАНИЧЕНИЕ: счётчик in-memory (модульный) — сбрасывается рестартом
+# процесса (poison-строка получит ещё N попыток). Durable-варианту нужна
+# колонка outbox_messages.attempts + миграция (вне scope этого фикса —
+# см. финальный отчёт воркера).
+OUTBOX_MAX_DELIVERY_ATTEMPTS = 500
+_DELIVERY_ATTEMPTS: dict[str, int] = {}
+
 
 class OutboxDeliveryWorker:
     def __init__(
@@ -322,6 +347,89 @@ class OutboxDeliveryWorker:
         row.claim_token = None
         row.lease_expires_at = None
 
+    # --- delivery failure accounting (audit 2026-07-18 #2) ---------------
+
+    @staticmethod
+    def _is_permanent_delivery_error(status_code: int | None) -> bool:
+        """HTTP 4xx (кроме 429 rate-limit) = перманентный отказ ЭТОЙ строки:
+        повтор с тем же payload бессмыслен (клиенты TG/MAX 4xx сами не
+        ретраят — см. integrations/telegram/client.py:307-315)."""
+        return (
+            status_code is not None
+            and 400 <= status_code < 500
+            and status_code != 429
+        )
+
+    @staticmethod
+    def _clear_attempts(row: OutboxMessage) -> None:
+        """Снять in-memory счётчик попыток на терминальном статусе
+        (sent/failed/muted/dropped) — иначе словарь копил бы мёртвые id."""
+        _DELIVERY_ATTEMPTS.pop(row.id, None)
+
+    def _note_delivery_failure(
+        self, row: OutboxMessage, exc: Exception, *, channel: str,
+    ) -> str:
+        """Аудит 2026-07-18 (#2) — attempts + потолок ретраев + dead-letter.
+
+        Возвращает "dead_letter" (строка терминирована 'failed', claim снят)
+        или "retry" (строка остаётся 'pending', claim снят → быстрый ретрай
+        на следующем тике, at-least-once).
+        """
+        status_code = getattr(exc, "status_code", None)
+        if self._is_permanent_delivery_error(status_code):
+            self._clear_attempts(row)
+            row.status = "failed"
+            row.drop_reason = f"delivery_permanent_{status_code}"
+            self._release_claim(row)
+            logger.warning(
+                "outbox delivery: permanent %s error on %s (HTTP %s) — "
+                "dead-letter (failed/%s)",
+                channel, row.id, status_code, row.drop_reason,
+            )
+            return "dead_letter"
+        attempts = _DELIVERY_ATTEMPTS.get(row.id, 0) + 1
+        _DELIVERY_ATTEMPTS[row.id] = attempts
+        if attempts >= OUTBOX_MAX_DELIVERY_ATTEMPTS:
+            self._clear_attempts(row)
+            row.status = "failed"
+            row.drop_reason = "delivery_retry_exhausted"
+            self._release_claim(row)
+            logger.error(
+                "outbox delivery: %s row %s exhausted %d attempts — "
+                "dead-letter (failed/delivery_retry_exhausted)",
+                channel, row.id, attempts,
+            )
+            self._alert_retry_exhausted(row, channel=channel, exc=exc)
+            return "dead_letter"
+        logger.warning(
+            "outbox delivery: %s error on %s (attempt %d/%d) — keeping pending",
+            channel, row.id, attempts, OUTBOX_MAX_DELIVERY_ATTEMPTS,
+        )
+        row.status = "pending"
+        self._release_claim(row)
+        return "retry"
+
+    @staticmethod
+    def _alert_retry_exhausted(
+        row: OutboxMessage, *, channel: str, exc: Exception
+    ) -> None:
+        """Best-effort admin alert о dead-letter после потолка ретраев.
+        dedupe_key по КАНАЛУ (не по строке): массовый транзиентный сбой
+        даст один алерт на канал за окно rate-limit, а не шторм."""
+        try:
+            from sreda.services.admin_alerts import send_admin_alert
+            send_admin_alert(
+                "P1",
+                f"outbox {channel}: retry ceiling reached — row dead-lettered",
+                f"row_id={row.id}\nfeature={row.feature_key}\n"
+                f"error={type(exc).__name__}: {exc}"[:500],
+                dedupe_key=f"outbox-retry-exhausted:{channel}",
+            )
+        except Exception:  # noqa: BLE001 — alert не должен ронять доставку
+            logger.debug(
+                "outbox delivery: retry-exhausted alert failed", exc_info=True,
+            )
+
     async def _process_one(self, session: Session, row: OutboxMessage, *, now_utc: datetime) -> None:
         # #187 soft-delete — fencing (дверь #9): тенант мог быть удалён ПОСЛЕ
         # постановки строки в outbox. Проверяем В ТОЙ ЖЕ TX прямо перед внешней
@@ -331,6 +439,7 @@ class OutboxDeliveryWorker:
         if not is_tenant_active(session, row.tenant_id):
             row.status = "dropped"
             row.drop_reason = "tenant_deleted"
+            self._clear_attempts(row)  # #2: терминал — снять счётчик попыток
             session.commit()
             return
 
@@ -345,6 +454,7 @@ class OutboxDeliveryWorker:
 
         if decision.kind == DeliveryKind.drop:
             row.status = "muted"
+            self._clear_attempts(row)  # #2: терминал — снять счётчик попыток
             session.commit()
             return
         if decision.kind == DeliveryKind.defer:
@@ -422,6 +532,7 @@ class OutboxDeliveryWorker:
                     )
                     row.status = "failed"
                     row.drop_reason = "unknown_bot_key"
+                    self._clear_attempts(row)  # #2: терминал
                     session.commit()
                     return
         else:
@@ -438,6 +549,7 @@ class OutboxDeliveryWorker:
         except json.JSONDecodeError:
             logger.exception("outbox delivery: bad payload_json for %s", row.id)
             row.status = "failed"
+            self._clear_attempts(row)  # #2: терминал
             session.commit()
             return
 
@@ -492,6 +604,7 @@ class OutboxDeliveryWorker:
                             exc_info=True,
                         )
             row.status = "sent"
+            self._clear_attempts(row)  # #2: терминал — снять счётчик попыток
             # #344 F5 (R1 MINOR): снимаем lease на терминальном 'sent' — иначе
             # partial-index (lease_expires_at IS NOT NULL) копил бы все доставленные.
             self._release_claim(row)
@@ -502,19 +615,25 @@ class OutboxDeliveryWorker:
                 tg_message_id=tg_msg_id,
                 tg_date=tg_date,
             )
-        except TelegramDeliveryError:
-            logger.warning("outbox delivery: telegram error on %s, keeping pending", row.id)
-            row.status = "pending"
-            # #344 F5: снимаем claim → следующий тик подхватит строку сразу (быстрый
-            # retry), не дожидаясь истечения lease. status остаётся 'pending'.
-            self._release_claim(row)
-            # Stays pending — worker retries next tick. Trace will be
-            # emitted then. Don't emit now or we'd fire the same block
-            # again on retry (idempotency is on a fresh context, which
-            # the worker reconstructs each time).
+        except TelegramDeliveryError as exc:
+            # Аудит 2026-07-18 (#2): attempts + потолок + dead-letter вместо
+            # бессрочного pending. Перманентный 4xx → dead-letter сразу;
+            # транзиент — ретрай до OUTBOX_MAX_DELIVERY_ATTEMPTS.
+            outcome = self._note_delivery_failure(row, exc, channel="telegram")
+            if outcome == "dead_letter":
+                self._emit_trace(
+                    trace_payload,
+                    chat_id=payload.get("chat_id"),
+                    status="failed",
+                )
+            # Retry: строка остаётся 'pending', claim снят (#344 F5) →
+            # следующий тик подхватит сразу. Trace НЕ эмитим — иначе тот же
+            # блок выстрелит повторно на ретрае (idempotency — на свежем
+            # контексте, который воркер пересобирает каждый раз).
         except Exception:
             logger.exception("outbox delivery: unexpected error on %s", row.id)
             row.status = "failed"
+            self._clear_attempts(row)  # #2: терминал
             self._emit_trace(
                 trace_payload,
                 chat_id=payload.get("chat_id"),
@@ -568,6 +687,7 @@ class OutboxDeliveryWorker:
                 # Dev/test path — token не настроен в env, mark sent
                 # для unit-тестов
                 row.status = "sent"
+            self._clear_attempts(row)  # #2: терминал
             session.commit()
             return
 
@@ -576,6 +696,7 @@ class OutboxDeliveryWorker:
         except json.JSONDecodeError:
             logger.exception("max outbox: bad payload_json for %s", row.id)
             row.status = "failed"
+            self._clear_attempts(row)  # #2: терминал
             session.commit()
             return
 
@@ -597,6 +718,7 @@ class OutboxDeliveryWorker:
                 row.id,
             )
             row.status = "failed"
+            self._clear_attempts(row)  # #2: терминал
             self._emit_trace(
                 trace_payload, chat_id=None, status="failed_no_recipient",
             )
@@ -621,6 +743,7 @@ class OutboxDeliveryWorker:
             if ack_edit_message_id:
                 if ack_final_already_visible and not attachments:
                     row.status = "sent"
+                    self._clear_attempts(row)  # #2: терминал
                     self._emit_trace(
                         trace_payload,
                         chat_id=chat_id,
@@ -677,20 +800,25 @@ class OutboxDeliveryWorker:
                     MaxDeliveryError,
                 )
             row.status = "sent"
+            self._clear_attempts(row)  # #2: терминал — снять счётчик попыток
             self._release_claim(row)  # #344 F5 (R1 MINOR): снять lease на терминале
             self._emit_trace(
                 trace_payload, chat_id=chat_id, status="ok",
             )
-        except MaxDeliveryError:
-            logger.warning(
-                "max outbox: delivery error on %s, keeping pending", row.id,
-            )
-            row.status = "pending"
-            # #344 F5: снимаем claim → быстрый retry на следующем тике.
-            self._release_claim(row)
+        except MaxDeliveryError as exc:
+            # Аудит 2026-07-18 (#2): attempts + потолок + dead-letter вместо
+            # бессрочного pending (симметрично TG-пути).
+            outcome = self._note_delivery_failure(row, exc, channel="max")
+            if outcome == "dead_letter":
+                self._emit_trace(
+                    trace_payload, chat_id=chat_id, status="failed",
+                )
+            # Retry: 'pending' + claim снят (#344 F5) → быстрый retry
+            # на следующем тике; trace не эмитим (дубль на ретрае).
         except Exception:
             logger.exception("max outbox: unexpected error on %s", row.id)
             row.status = "failed"
+            self._clear_attempts(row)  # #2: терминал
             self._emit_trace(
                 trace_payload, chat_id=chat_id, status="failed",
             )

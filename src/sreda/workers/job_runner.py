@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Coroutine
+from typing import Any
 
 from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
 from sreda.config.logging import configure_logging
@@ -23,6 +25,27 @@ from sreda.workers.retention_worker import RetentionWorker
 from sreda.workers.skill_platform_processor import SkillPlatformJobProcessor
 
 logger = logging.getLogger(__name__)
+
+
+async def _run_worker_isolated(
+    name: str, work: Coroutine[Any, Any, int]
+) -> int:
+    """Аудит 2026-07-18 (#4): пер-воркерная изоляция внутри тика.
+
+    Воркеры тика вызываются последовательно; раньше исключение из
+    раннего воркера (например, битая сессия/схема/конфиг в
+    process_message_queue или runtime_service) прерывало тик ЦЕЛИКОМ —
+    proactive/reminders не наполняли outbox, delivery не дренирул
+    очередь, retention/reliability не работали. Теперь сбой одного
+    воркера логируется, засчитывается как 0 и не пропускает остальных.
+    asyncio.CancelledError (BaseException) не глотается — shutdown
+    остаётся честным.
+    """
+    try:
+        return await work
+    except Exception:  # noqa: BLE001 — изоляция воркера, не тика
+        logger.exception("job_runner: worker %s failed — tick continues", name)
+        return 0
 
 
 async def process_pending_jobs_once(*, limit: int = 20) -> int:
@@ -108,18 +131,38 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         # jobs / reminders / outbox delivery. 5 is enough for typical
         # webhook bursts; remaining backlog catches up over the next
         # tick (~5-10s in production).
-        message_queue_processed = await process_message_queue(
-            limit=min(5, limit)
+        # Аудит 2026-07-18 (#4): каждый воркер — под _run_worker_isolated,
+        # чтобы системный сбой одного не пропускал всех следующих в тике.
+        message_queue_processed = await _run_worker_isolated(
+            "message_queue", process_message_queue(limit=min(5, limit))
         )
-        runtime_processed = await runtime_service.process_pending_jobs(limit=limit)
-        skill_processed = await skill_platform.process_pending_jobs(limit=limit)
-        proactive_processed = await proactive.process_pending(limit=limit)
-        housewife_processed = await housewife_reminders.process_pending(limit=limit)
-        onboarding_processed = await housewife_onboarding.process_pending(limit=limit)
-        aha_processed = await onboarding_aha.process_pending(limit=limit)
-        delivery_processed = await delivery.process_pending_messages(limit=limit)
-        retention_processed = await retention.process_pending()
-        reliability_processed = await reliability.process_pending()
+        runtime_processed = await _run_worker_isolated(
+            "runtime", runtime_service.process_pending_jobs(limit=limit)
+        )
+        skill_processed = await _run_worker_isolated(
+            "skill_platform", skill_platform.process_pending_jobs(limit=limit)
+        )
+        proactive_processed = await _run_worker_isolated(
+            "proactive", proactive.process_pending(limit=limit)
+        )
+        housewife_processed = await _run_worker_isolated(
+            "housewife_reminders", housewife_reminders.process_pending(limit=limit)
+        )
+        onboarding_processed = await _run_worker_isolated(
+            "housewife_onboarding", housewife_onboarding.process_pending(limit=limit)
+        )
+        aha_processed = await _run_worker_isolated(
+            "onboarding_aha", onboarding_aha.process_pending(limit=limit)
+        )
+        delivery_processed = await _run_worker_isolated(
+            "outbox_delivery", delivery.process_pending_messages(limit=limit)
+        )
+        retention_processed = await _run_worker_isolated(
+            "retention", retention.process_pending()
+        )
+        reliability_processed = await _run_worker_isolated(
+            "reliability", reliability.process_pending()
+        )
         return (
             message_queue_processed
             + runtime_processed

@@ -5,7 +5,11 @@ and calls Telegram's ``getUpdates`` in a loop.  For each update it invokes
 ``services.telegram_inbound.handle_telegram_update``, then advances the
 in-DB offset only after that ingest has committed (durable ingest →
 offset advance order, idempotency by ``external_update_id`` covers the
-crash window).
+crash window).  An update that crashes the handler deterministically
+(``MAX_UPDATE_ATTEMPTS`` consecutive failures) is dead-lettered instead:
+the offset advances past it and an admin alert fires — otherwise one
+poison update would stall the bot's whole inbound (head-of-line) while
+the heartbeat stayed green (audit 2026-07-18).
 
 Why long-poll instead of webhook (2026-04-30 incident set):
   Connection initiated from our side → kernel TCP keepalive notices a
@@ -73,6 +77,13 @@ BACKOFF_SECS = 2
 # Cap stored last_error so we don't blow up the heartbeats row when an
 # exception body includes a multi-KB HTML 502 page or a full traceback.
 LAST_ERROR_MAX_CHARS = 1000
+# Audit 2026-07-18 (#1): poison-update guard. How many consecutive times
+# the same update may crash the handler before we call it poison and
+# dead-letter it (advance the offset past it + admin alert). Before this
+# guard the offset moved ONLY after a successful handle, so one
+# deterministically-crashing update blocked the bot's entire inbound
+# (head-of-line) for up to ~24h (Telegram-side update TTL).
+MAX_UPDATE_ATTEMPTS = 3
 
 
 def _advisory_lock_id(bot_key: str) -> int:
@@ -150,6 +161,10 @@ class TelegramLongPoller:
         self._lock_engine: Engine | None = None
         self._lock_conn: Connection | None = None
         self.offset: int = 0
+        # Poison-update guard: consecutive handler failures per update_id.
+        # Entries are popped on success / dead-letter, so only updates
+        # currently failing occupy the map.
+        self._update_failures: dict[int, int] = {}
         # Per-bot derived values.
         self._lock_key: int = _advisory_lock_id(bot_key)
         self._channel: str = _poller_channel(bot_key)
@@ -362,7 +377,23 @@ class TelegramLongPoller:
                             upd,
                         )
                         continue
-                    await handle_telegram_update(upd, bot_key=self.bot_key)
+                    try:
+                        await handle_telegram_update(upd, bot_key=self.bot_key)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 — poison-update guard
+                        if await self._handle_update_failure(update_id, upd, exc):
+                            # Will retry: offset not advanced, so the next
+                            # fetch re-delivers this update first. The rest
+                            # of the batch stays queued behind it; sleep so
+                            # a deterministic crash can't hot-loop (a fetch
+                            # with pending updates returns immediately).
+                            await asyncio.sleep(BACKOFF_SECS)
+                            break
+                        # Poison update dead-lettered — carry on with the
+                        # rest of the batch.
+                        continue
+                    self._update_failures.pop(update_id, None)
                     self._save_offset(update_id)
             except asyncio.CancelledError:
                 raise
@@ -404,6 +435,71 @@ class TelegramLongPoller:
                     ok=False, error=f"{type(exc).__name__}: {exc}",
                 )
                 await asyncio.sleep(BACKOFF_SECS)
+
+    async def _handle_update_failure(
+        self, update_id: int, upd: dict, exc: Exception
+    ) -> bool:
+        """Poison-update guard (audit 2026-07-18 #1).
+
+        Returns True when the failure was counted and the update should be
+        retried later (offset NOT advanced — caller breaks the batch and
+        backs off). Returns False when the update hit
+        ``MAX_UPDATE_ATTEMPTS`` and was dead-lettered: the offset is
+        advanced past it and an admin alert fires, so the rest of the
+        batch may proceed.
+
+        Why dead-letter at all: before this guard the offset moved only
+        after a successful handle, so a deterministically-crashing update
+        re-ran every iteration and stalled the bot's whole inbound
+        (head-of-line) while ``_save_heartbeat(ok=True)`` — recorded right
+        after the fetch — kept every health probe green. Dead-letter loses
+        exactly one update but unblocks everyone behind it, and the
+        critical log + alert make the loss visible (the audit's core
+        complaint was the SILENT failure mode).
+        """
+        attempts = self._update_failures.get(update_id, 0) + 1
+        self._update_failures[update_id] = attempts
+        if attempts < MAX_UPDATE_ATTEMPTS:
+            logger.exception(
+                "telegram update %s failed (attempt %d/%d) — will retry",
+                update_id, attempts, MAX_UPDATE_ATTEMPTS,
+            )
+            return True
+        self._update_failures.pop(update_id, None)
+        logger.critical(
+            "telegram update %s crashed handler %d times — DEAD-LETTER: "
+            "advancing offset past it (bot_key=%s, error=%s: %s)",
+            update_id, attempts, self.bot_key, type(exc).__name__, exc,
+        )
+        self._save_offset(update_id)
+        await self._alert_poison_update(update_id, upd, exc)
+        return False
+
+    async def _alert_poison_update(
+        self, update_id: int, upd: dict, exc: Exception
+    ) -> None:
+        """Best-effort admin alert about a dead-lettered poison update.
+
+        Never raises — alerting must not crash the poller. The update
+        payload itself is NOT included (it carries personal chat data);
+        only the update's type keys and the redacted error.
+        """
+        try:
+            from sreda.config.log_redaction import redact_secrets
+            from sreda.services.admin_alerts import send_admin_alert
+
+            send_admin_alert(
+                "P0",
+                f"telegram poller: poison update {update_id} dead-lettered",
+                redact_secrets(
+                    f"bot_key={self.bot_key}\n"
+                    f"update_keys={sorted(upd.keys())}\n"
+                    f"error={type(exc).__name__}: {exc}"
+                )[:LAST_ERROR_MAX_CHARS],
+                dedupe_key=f"telegram-poison-update:{self.bot_key}:{update_id}",
+            )
+        except Exception:  # noqa: BLE001 — alert must never kill the poller
+            logger.exception("failed to send poison-update admin alert")
 
 
 # ---- Entry point -------------------------------------------------------

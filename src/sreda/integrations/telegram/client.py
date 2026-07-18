@@ -174,12 +174,14 @@ class TelegramClient:
         )
 
     async def get_me(self) -> dict:
-        """Telegram `getMe` — лёгкий запрос для прогрева TLS connection.
+        """Telegram `getMe` — лёгкий identity-запрос бота.
 
-        Используется keepalive-pinger task'ом (см. `run_keepalive_pinger`)
-        чтобы idle TCP+TLS не остывал в connection pool'е. Через SOCKS5
-        egress fresh handshake = ~800мс, warm reuse = ~50мс. Пинг каждые
-        45с держит connection живым (keepalive_expiry=300с в pool config).
+        Используется ``verify_bot_configs`` (--check-config). Раньше
+        использовался keepalive-pinger'ом для прогрева connection pool'а,
+        но пул собран с ``max_keepalive_connections=0`` (см.
+        ``_make_pool_client``, инцидент 2026-04-30) — каждый запрос идёт
+        через fresh TCP+TLS handshake, «держать connection тёплым»
+        нечего, и пингер удалён (2026-07-18).
         """
         return await self._post_json("getMe", {}, timeout=5.0)
 
@@ -279,7 +281,21 @@ class TelegramClient:
                 # только «200 OK». Теперь явно ловим `ok=false` и кидаем
                 # TelegramDeliveryError с полным body чтобы при инциденте
                 # было видно что реально вернул Telegram.
-                body = response.json()
+                try:
+                    body = response.json()
+                except ValueError:
+                    # 2026-07-18 audit: HTTP 200 с не-JSON телом (edge-случай
+                    # Telegram/промежуточного прокси). json.JSONDecodeError —
+                    # подкласс ValueError; без перехвата он улетал наверх
+                    # сырым, мимо контракта «всегда TelegramDeliveryError с
+                    # method/status_code». Не ретраим: повтор даст тот же
+                    # не-JSON ответ.
+                    raise TelegramDeliveryError(
+                        f"Telegram {method}: non-JSON body "
+                        f"(status={response.status_code})",
+                        method=method,
+                        status_code=response.status_code,
+                    ) from None
                 if isinstance(body, dict) and body.get("ok") is False:
                     description = body.get("description")
                     logger.warning(
@@ -339,56 +355,32 @@ class TelegramClient:
         ) from None
 
 
-# 2026-04-29: keepalive pinger — фоновая task которая раз в 45с пингует
-# `getMe`, чтобы TCP+TLS connection не остывал в pool'е. Через SOCKS5
-# egress (RU IP заблокирован Telegram'ом, ходим через 89.110.77.78)
-# fresh handshake занимает 800-900мс — невыносимо для UX когда первый
-# ack юзера в день этим занимается. Pinger держит connection «горячим»
-# 24/7 ценой ~1920 пустых getMe'ев в день (копейки $-wise).
+# 2026-07-18 audit (config-integ): keepalive pinger RETIRED.
 #
-# Стратегия dumb: не трекаем last_activity, не оптимизируем — фиксированный
-# интервал 45с. Это упрощает код (нет shared state, нет race conditions),
-# а 1 запрос в 45с не тревожит rate-limit Telegram'а ни на йоту.
+# Пул собран с ``max_keepalive_connections=0`` (откат после инцидента
+# 2026-04-30 — см. комментарий в ``_make_pool_client``): соединение
+# закрывается сразу после каждого ответа, прогревать нечего. Пингер
+# делал ~1920 пустых getMe в сутки с нулевым эффектом (fresh TCP+TLS
+# каждый раз) и вводил в заблуждение своим описанием.
 #
-# DEBUG-level logging — пингов очень много, INFO засорил бы trace.
-
-_PINGER_INTERVAL_SECONDS = 45.0
+# ``run_keepalive_pinger`` оставлен как no-op shim: ``main.py`` всё ещё
+# создаёт эту task на lifespan startup (cleanup call-site'а — отдельно).
+# НЕ воскрешать пингер без возврата keepalive в pool config — stale
+# connections через SOCKS5 давали 30-60s залипы (инцидент 2026-04-30).
 
 
 async def run_keepalive_pinger(token: str, *, bot_key: str = "sreda") -> None:
-    """Бесконечная task: getMe → sleep 45s → repeat.
+    """Deprecated no-op (2026-07-18).
 
-    Запускается на FastAPI lifespan startup, отменяется на shutdown
-    (через asyncio.CancelledError). Сбои getMe (network glitches,
-    egress down) не пробрасываются — просто log + продолжаем тикать.
-    Когда egress поднимется обратно, следующий пинг прогреет
-    connection заново.
-
-    ``bot_key`` идентифицирует бота в логах (никогда не суффикс токена).
+    Раньше бесконечная task: getMe → sleep 45s → repeat для прогрева
+    keep-alive соединения. Pool больше не держит keep-alive
+    (``max_keepalive_connections=0``), поэтому пинг был бесполезным
+    фон-трафиком. Оставлено для обратной совместимости с call-site'ом в
+    ``main.py``; завершается сразу. Новый код не должен это вызывать.
     """
-    client = TelegramClient(token)
+    _ = token  # подпись сохранена для совместимости с main.py call-site'ом
     logger.info(
-        "telegram keepalive pinger started: bot_key=%s interval=%.0fs",
-        bot_key, _PINGER_INTERVAL_SECONDS,
+        "telegram keepalive pinger is retired (pool max_keepalive_connections=0); "
+        "no-op, returning immediately: bot_key=%s",
+        bot_key,
     )
-    try:
-        while True:
-            await asyncio.sleep(_PINGER_INTERVAL_SECONDS)
-            try:
-                await client.get_me()
-                logger.debug("telegram keepalive pinger: getMe ok")
-            except TelegramDeliveryError as exc:
-                logger.debug(
-                    "telegram keepalive pinger: getMe failed status=%s",
-                    exc.status_code,
-                )
-            except Exception:  # noqa: BLE001
-                # Defensive: pinger никогда не должен ломаться. Любая
-                # неожиданная ошибка — log debug и идём дальше.
-                logger.debug(
-                    "telegram keepalive pinger: unexpected error",
-                    exc_info=True,
-                )
-    except asyncio.CancelledError:
-        logger.info("telegram keepalive pinger stopped")
-        raise

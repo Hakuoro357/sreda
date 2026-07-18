@@ -17,8 +17,11 @@ Provides:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Callable, Awaitable, Any
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -177,10 +180,23 @@ class TelegramBotRegistry:
         The ``"sreda"`` bot is always present (backward-compat) and uses
         the existing ``telegram_*`` config fields.  The ``"sreda_home"``
         bot is added only when ``home_bot_token`` is set.
+
+        Empty primary token (``telegram_bot_token=None`` — MAX-only/dev
+        config): ``"sreda"`` stays registered so routing-key validation and
+        ``resolve()`` keep working for channel bookkeeping, but
+        ``telegram_client_for`` refuses to build a client for it
+        (fail-closed — see there). A warning is logged here so the
+        misconfiguration is visible instead of surfacing later as
+        confusing Telegram 404s.
         """
         bots: list[BotConfig] = []
 
         # --- Primary / legacy bot (always "sreda") ----------------------
+        if not settings.telegram_bot_token:
+            logger.warning(
+                "telegram_bot_token is empty — bot 'sreda' registered without "
+                "a token; telegram_client_for('sreda') will raise (fail-closed)"
+            )
         bots.append(BotConfig(
             key="sreda",
             token=settings.telegram_bot_token or "",
@@ -224,6 +240,8 @@ def telegram_client_for(bot_key: str, registry: TelegramBotRegistry) -> "Any":
     ------
     KeyError
         Propagated from ``registry.resolve`` when *bot_key* is unknown.
+    ValueError
+        When the resolved bot has an empty token (fail-closed, see below).
     """
     # Import here to avoid a circular import at module load time
     # (client.py → bot_registry would be fine, but registry.py → client.py
@@ -231,6 +249,20 @@ def telegram_client_for(bot_key: str, registry: TelegramBotRegistry) -> "Any":
     from sreda.integrations.telegram.client import TelegramClient
 
     cfg = registry.resolve(bot_key)
+    # Fail-closed on empty token (2026-07-18 audit, config-integ MINOR):
+    # previously a bot registered with token="" produced TelegramClient("")
+    # whose every call 404-looped as confusing
+    # ``TelegramDeliveryError non-retryable`` on each background send
+    # (outbox / admin routing). Raise a descriptive error at the factory
+    # instead — same fail-closed policy as the long-poll entrypoint, which
+    # refuses to start on an empty token.
+    if not cfg.token:
+        known = [b.key for b in registry.all_bots()]
+        raise ValueError(
+            f"Bot {bot_key!r} has an empty token (telegram_bot_token not set?). "
+            f"Refusing to build TelegramClient. "
+            f"Configure the token or use another bot_key. Known keys: {known}."
+        )
     return TelegramClient(cfg.token)
 
 

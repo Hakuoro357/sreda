@@ -55,6 +55,14 @@ class FeatureRegistry:
         # #181 defense-in-depth: never register a retired skill's module.
         if is_feature_disabled(module.feature_key):
             return
+        # Fail-closed on duplicate feature_key (2026-07-18 audit) — same
+        # policy as register_skill_job_handler / register_proactive_handler /
+        # register_delivery_hook below: silently overwriting would drop the
+        # first module's register_api/runtime/workers wiring without a trace.
+        if module.feature_key in self._modules:
+            raise ValueError(
+                f"feature module already registered for feature_key={module.feature_key!r}"
+            )
         self._modules[module.feature_key] = module
 
     def register_api(self, app: FastAPI) -> None:
