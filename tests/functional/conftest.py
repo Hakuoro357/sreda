@@ -22,10 +22,17 @@ import pytest_asyncio
 # Субагент R1 MAJOR (доказано запуском): ProactorEventLoop (дефолт Windows)
 # соединяется через ConnectEx МИМО socket.connect — форсируем selector-loop
 # на всю сюиту, гард снова ловит async-соединения.
+# Аудит 2026-07-18 (MINOR, платформенная хрупкость): прежняя механика —
+# session-фикстура event_loop_policy — на pytest-asyncio 1.x задепрекечена
+# и не применяется, поэтому на Windows httpx.AsyncClient реально ходил
+# наружу (test_network_ban_blocks_external_http падал DID NOT RAISE).
+# Починка двумя слоями:
+#   1) политика selector-loop ставится при ИМПОРТЕ conftest — до создания
+#      любого loop'а pytest-asyncio (механизм, а не фикстура);
+#   2) ниже гард поднят на уровень httpx network-транспортов — закрывает
+#      ConnectEx-обход независимо от того, какой loop реально создался.
 if hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
-    @pytest.fixture(scope="session")
-    def event_loop_policy():
-        return asyncio.WindowsSelectorEventLoopPolicy()
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 _ALLOWED_HOSTS = ("127.0.0.1", "::1", "localhost", "test")
@@ -35,6 +42,7 @@ _ALLOWED_HOSTS = ("127.0.0.1", "::1", "localhost", "test")
 def _no_external_network(monkeypatch):
     real_connect = socket.socket.connect
     real_gai = socket.getaddrinfo
+    real_create_connection = socket.create_connection
 
     def guarded(self, addr):
         host = addr[0] if isinstance(addr, tuple) else str(addr)
@@ -48,8 +56,37 @@ def _no_external_network(monkeypatch):
             raise AssertionError(f"DNS наружу запрещён в functional: {host!r}")
         return real_gai(host, *a, **kw)
 
+    def guarded_create_connection(address, *a, **kw):
+        # sync-путь (httpcore sync backend) идёт через socket.create_connection,
+        # а не socket.connect — без этого патча дыра зеркальная ConnectEx.
+        host = address[0] if isinstance(address, tuple) else str(address)
+        if str(host) not in _ALLOWED_HOSTS:
+            raise AssertionError(
+                f"внешняя сеть запрещена в functional: {address!r}"
+            )
+        return real_create_connection(address, *a, **kw)
+
     monkeypatch.setattr(socket.socket, "connect", guarded)
     monkeypatch.setattr(socket, "getaddrinfo", guarded_gai)
+    monkeypatch.setattr(socket, "create_connection", guarded_create_connection)
+
+    # Слой 2 (аудит 2026-07-18): httpx network-транспорты. ProactorEventLoop
+    # на Windows соединяется через ConnectEx МИМО socket.* — перехват на
+    # уровне транспорта закрывает обход независимо от event-loop'а.
+    # ASGITransport харнеса (base_url http://test) — другой класс, не патчится.
+    import httpx
+
+    def _blocked_transport(self, request):
+        raise AssertionError(
+            f"внешняя сеть запрещена в functional: {request.url!r}"
+        )
+
+    monkeypatch.setattr(
+        httpx.AsyncHTTPTransport, "handle_async_request", _blocked_transport,
+    )
+    monkeypatch.setattr(
+        httpx.HTTPTransport, "handle_request", _blocked_transport,
+    )
 
 
 # --- фейковый ТГ-клиент (повышен из test_housewife_persona_callbacks) ------
@@ -102,6 +139,15 @@ CHAT_ID = "100000003"
 def harness(monkeypatch, tmp_path):
     """Окружение: SQLite-файл на сценарий, кэши сброшены, гейты выставлены,
     фейк-канал и захваты подключены. Возвращает объект с ручками."""
+    # Аудит 2026-07-18: сюит подключена к CI (job functional), но тракт
+    # построен на chat-скиле из ПРИВАТНОГО пакета sreda-private-features —
+    # на публичном CI-checkout его нет. Честный skip вместо ImportError:
+    # шов-тесты (test_seams) от харнеса не зависят и в CI бегут полностью.
+    pytest.importorskip(
+        "sreda_feature_housewife_assistant",
+        reason="functional-харнес требует приватный feature-плагин "
+               "(sreda-private-features); на CI-checkout его нет",
+    )
     db = tmp_path / "func.db"
     key = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode()
     monkeypatch.setenv("SREDA_DATABASE_URL", f"sqlite:///{db.as_posix()}")

@@ -373,15 +373,21 @@ def test_e2e_stale_durable_320(install, monkeypatch, tmp_path):
 
 
 def test_abandoned_skipped_on_turn_key_collision_320(install, monkeypatch, tmp_path):
-    """#320 R2 (субагент R1 MINOR): пустой inbound_message_id → новый turn_key = f(thread) СОВПАДАЕТ со
-    старым → терминализировать НЕЛЬЗЯ (пометили бы done ряд, который start/finish свежего хода уже не
-    переоткроют — полная потеря трейса). Guard old != new → abandoned НЕ вызывается."""
+    """#320 R2 (субагент R1 MINOR): turn_key нового хода СОВПАДАЕТ со старым → терминализировать
+    НЕЛЬЗЯ (пометили бы done ряд, который start/finish свежего хода уже не переоткроют — полная
+    потеря трейса). Guard old != new → abandoned НЕ вызывается.
+    Аудит 2026-07-18 (runtime-react #3): пустой inbound_message_id теперь минтит УНИКАЛЬНЫЙ
+    turn_key (ранее fallback на голый thread_id давал коллизию всем ходам треда) → коллизия
+    конструируется явно: _mint_anon_turn_key запатчен на константу."""
     saver = _durable_saver(tmp_path, "ck320c.db")
     monkeypatch.setattr(react_loop, "_persist_enabled", lambda: True)
     monkeypatch.setattr(react_loop, "_get_checkpointer", lambda: saver)
+    # коллизия ключей old==new (guard-путь; в проде ключи уникальны — аудит runtime-react #3)
+    monkeypatch.setattr(react_loop, "_mint_anon_turn_key",
+                        lambda channel, tenant_id, thread_id: f"react:{channel}:{tenant_id}:{thread_id}")
     freddie = _Chat("freddie", responses=[
-        _ai_call("add_task", "c1", title="x"),  # ход1 → пауза (imid ПУСТОЙ → ключ = f(thread))
-        AIMessage(content="Привет!"),            # ход2 stale-clear (imid ПУСТОЙ → ТОТ ЖЕ ключ)
+        _ai_call("add_task", "c1", title="x"),  # ход1 → пауза
+        AIMessage(content="Привет!"),            # ход2 stale-clear (ТОТ ЖЕ ключ — патч выше)
     ])
     install(deepseek=_Chat("ds"))
     rec = _RecTrace()
@@ -390,7 +396,7 @@ def test_abandoned_skipped_on_turn_key_collision_320(install, monkeypatch, tmp_p
     def _turn_no_imid(text):
         return asyncio.run(react_loop.handle_turn(
             session=None, tenant_id="t", user_id="u", thread_id="col320",
-            llm=freddie, user_text=text, inbound_message_id="",  # ← пустой → fallback на thread_id
+            llm=freddie, user_text=text, inbound_message_id="",  # ← пустой → _mint_anon_turn_key (запатчен)
             channel="react", resume_only=False, expected_confirm_id="",
             provider_key="inception-mercury2", fallback_llm=None))
 

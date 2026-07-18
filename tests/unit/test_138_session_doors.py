@@ -245,16 +245,6 @@ _ALLOWED: dict[tuple[str, str, str], tuple[int, str]] = {
          "определение легаси FastAPI-dep (реэкспорт get_db_session); "
          "использования классифицируются на сайтах Depends(...) отдельно"
          ),
-    ('api/routes/connect.py', 'open_eds_connect_form', 'Depends(get_db_session)'):
-        (1,
-         "#181 tombstone: EDS retired, роут возвращает статическую страницу, "
-         "сессию НЕ использует"
-         ),
-    ('api/routes/connect.py', 'submit_eds_connect_form', 'Depends(get_db_session)'):
-        (1,
-         "#181 tombstone: EDS retired, статическая страница, сессия не "
-         "используется"
-         ),
     ('api/routes/miniapp.py', '_require_miniapp_auth', 'Depends(get_session)'):
         (1,
          "auth-фаза 5c: NO_RLS-чтения (runtime_config через guard); все "
@@ -313,9 +303,11 @@ _ALLOWED: dict[tuple[str, str, str], tuple[int, str]] = {
         (1,
          "инструмент исполняется в ReAct-турне ПОД ctx"
          ),
-    ('services/llm.py', '_resolve_provider_overrides', 'get_session_factory'):
+    ('services/llm.py', '_resolve_provider_overrides_uncached', 'get_session_factory'):
         (1,
-         "runtime_config = NO_RLS (0082), app-грант сохранён"
+         "runtime_config = NO_RLS (0082), app-грант сохранён; DB-lookup "
+         "вынесен в uncached-helper из _resolve_provider_overrides "
+         "(кэш-обёртка), вызов тот же"
          ),
     ('services/max_inbound.py', '_process_approved_max_turn', 'get_session_factory'):
         (1,

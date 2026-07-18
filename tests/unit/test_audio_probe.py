@@ -79,13 +79,15 @@ def test_format_missing_streams_missing_byte_estimate_used() -> None:
         assert ffprobe_duration(audio_bytes) == pytest.approx(3.0)
 
 
-def test_byte_estimate_capped_at_30_seconds() -> None:
-    """Byte estimate сверху ограничен 30s (free-tier per-voice ceiling).
-    Codex r4 MINOR: aligned с product policy."""
+def test_byte_estimate_capped_at_free_daily_ceiling() -> None:
+    """Byte estimate сверху ограничен 300s (дневной free-лимит
+    SREDA_FREE_VOICE_SECONDS_DAILY). Аудит 2026-07-18 (svc-features #10):
+    прежний кап 30s систематически занижал длительность голосовых >30s
+    (TG такие позволяет) → undercharge voice_stt_seconds в money-path."""
     fake_out = json.dumps({"format": {}, "streams": []})
     huge_bytes = b"x" * 1_000_000  # would estimate to 666s
     with patch("subprocess.run", return_value=_mock_subprocess_run(stdout=fake_out)):
-        assert ffprobe_duration(huge_bytes) == pytest.approx(30.0)
+        assert ffprobe_duration(huge_bytes) == pytest.approx(300.0)
 
 
 def test_zero_byte_audio_with_no_metadata_raises() -> None:

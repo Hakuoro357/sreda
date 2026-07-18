@@ -201,6 +201,10 @@ async def test_tg_callback_lock_timeout_shows_retry_toast(monkeypatch):
             "message": {"chat": {"id": "1"}, "message_id": 5, "text": "🔔 X"},
         },
         data="rem_snooze:rid-1",
+        # Аудит 2026-07-18 svc-inbound #4: обязательный onboarding (cross-tenant
+        # check). Lock-timeout ветка выходит раньше проверки — семантика теста
+        # сохранена.
+        onboarding=SimpleNamespace(tenant_id="t1"),
     )
     assert fake.answered == [REMINDER_CALLBACK_BUSY_TEXT]
     assert fake.edited == []  # кнопки не трогаем — юзер перетапнет

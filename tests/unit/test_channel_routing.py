@@ -533,12 +533,14 @@ async def test_housewife_reminder_cross_tenant_user_id_skipped(worker_db, caplog
     )
     assert rows == [], f"no leak; got rows: {rows}"
 
-    # 2) Worker marked reminder fired (чтобы не retry'ило infinitely);
-    # delivery silently skipped, but state advanced.
+    # 2) Аудит 2026-07-18 (#7 — устаревший ассерт обновлён): reminder НЕ
+    # помечается fired без доставки (раньше — молчаливая потеря ради защиты
+    # от infinite retry); теперь откладывается на NO_CHANNEL_RETRY_MINUTES
+    # и остаётся pending — state НЕ advance'ится, retry не чаще раза в час.
     worker_db.expire_all()
     rem = worker_db.get(FamilyReminder, "rem_xtenant")
-    assert rem.status == "fired", f"expected fired, got {rem.status}"
-    assert fired == 1  # processed
+    assert rem.status == "pending", f"expected pending (deferred), got {rem.status}"
+    assert fired == 0  # не доставлен — не засчитан
 
     # 3) Warning log mentions tenant mismatch — visible в monitor
     warn_msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]

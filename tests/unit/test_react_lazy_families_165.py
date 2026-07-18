@@ -29,12 +29,16 @@ class _RecordingStubLLM:
         self._scripted = scripted
         self._i = 0
         self.binds: list[set[str]] = []
+        # аудит 2026-07-18 NEW-5: bind_tools кэшируется по набору имён → число bind'ов
+        # больше НЕ прокси числа проходов; проходы считаем по invoke.
+        self.invokes: int = 0
 
     def bind_tools(self, tools):  # noqa: ANN001
         self.binds.append({getattr(t, "name", None) for t in tools})
         return self
 
     def invoke(self, messages):  # noqa: ANN001
+        self.invokes += 1
         msg = self._scripted[min(self._i, len(self._scripted) - 1)]
         self._i += 1
         return msg
@@ -275,8 +279,9 @@ async def test_need_family_invalid_does_not_load(db_session):
         thread_id="lazy165-badfam", llm=stub, user_text="сделай что-нибудь",
         inbound_message_id="lazy165-badfam-msg", channel="react")
     # невалидная семья не загружена → набор на 2-м проходе тот же, что на 1-м
-    assert len(stub.binds) >= 2
-    assert stub.binds[0] == stub.binds[1], "невалидная семья изменила набор инструментов"
+    # (NEW-5: bind'ы кэшированы → проходы считаем по invoke, набор — по уникальным bind'ам)
+    assert stub.invokes >= 2
+    assert all(b == stub.binds[0] for b in stub.binds), "невалидная семья изменила набор инструментов"
 
 
 @pytest.mark.asyncio
@@ -296,7 +301,8 @@ async def test_need_family_non_string_arg_no_crash(db_session):
         thread_id="lazy165-nonstr", llm=stub, user_text="сделай что-нибудь",
         inbound_message_id="lazy165-nonstr-msg", channel="react")
     assert reply and "потеряла контекст" not in reply  # не упал
-    assert stub.binds[0] == stub.binds[1]  # ничего не загружено
+    assert stub.invokes >= 2
+    assert all(b == stub.binds[0] for b in stub.binds)  # ничего не загружено
 
 
 @pytest.mark.asyncio
@@ -456,7 +462,7 @@ async def test_guard_suppressed_after_unkeyed_write(db_session, monkeypatch):
         thread_id="lazy165-unkeyed-guard", llm=stub, user_text="запомни: любит борщ",
         inbound_message_id="lazy165-unkeyed-guard-msg", channel="react")
     # guard НЕ сработал (wrote_unkeyed) → нет 3-го прохода с web; web не догружен
-    assert len(stub.binds) == 2, f"guard сработал после unkeyed-write: {len(stub.binds)} проходов"
+    assert stub.invokes == 2, f"guard сработал после unkeyed-write: {stub.invokes} проходов"
     assert all("web_search" not in b for b in stub.binds)
 
 
@@ -520,7 +526,7 @@ async def test_guard_full_recovery_on_router_miss_refusal_202(db_session):
 async def test_guard_suppressed_after_core_write_no_dup_202(db_session):
     """#202 (Codex medium R3 CRITICAL): после core-записи (add_task — задача без даты, нет
     семантического дедупа) отказ на второй интент → guard/full-recovery ПОДАВЛЕН (wrote_unkeyed),
-    иначе ретрай пере-создал бы задачу. Задача РОВНО одна; full-recovery-прохода нет (binds==2)."""
+    иначе ретрай пере-создал бы задачу. Задача РОВНО одна; full-recovery-прохода нет (проходов==2)."""
     u = seed_telegram_user(db_session)
     db_session.commit()  # _prune_on (autouse) → обрезка ВКЛ
     scripted = [
@@ -534,8 +540,8 @@ async def test_guard_suppressed_after_core_write_no_dup_202(db_session):
         session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
         thread_id="lazy202-core", llm=stub, user_text="добавь задачу купить хлеб",
         inbound_message_id="lazy202-core-msg", channel="react")
-    assert len(stub.binds) == 2, (
-        f"после core-записи guard НЕ должен восстанавливать (нет 3-го прохода): {len(stub.binds)}")
+    assert stub.invokes == 2, (
+        f"после core-записи guard НЕ должен восстанавливать (нет 3-го прохода): {stub.invokes}")
     from sreda.db.models.tasks import Task
     tasks = db_session.query(Task).filter(Task.tenant_id == u.tenant_id).all()
     assert len(tasks) == 1, f"задача РОВНО одна (без дубля от recovery-ретрая): {len(tasks)}"

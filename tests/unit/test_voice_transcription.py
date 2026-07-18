@@ -253,6 +253,7 @@ async def test_speech_recognition_error_sends_error():
         patch("sreda.services.telegram_bot.BudgetService", return_value=budget),
         patch("sreda.services.telegram_bot.get_settings", return_value=_make_settings()),
         patch("sreda.services.telegram_bot.get_speech_recognizer", return_value=recognizer),
+        _patch_paid_gate(),
     ):
         result = await _maybe_transcribe_voice(
             payload, session=session, telegram_client=telegram, onboarding=onboarding
@@ -280,6 +281,7 @@ async def test_happy_path_injects_text():
         patch("sreda.services.telegram_bot.BudgetService", return_value=budget),
         patch("sreda.services.telegram_bot.get_settings", return_value=_make_settings()),
         patch("sreda.services.telegram_bot.get_speech_recognizer", return_value=recognizer),
+        _patch_paid_gate(),
     ):
         result = await _maybe_transcribe_voice(
             payload, session=session, telegram_client=telegram, onboarding=onboarding
@@ -333,6 +335,7 @@ async def test_a_no_voice_sub_active_housewife_billed_under_carrier():
         patch("sreda.services.telegram_bot.BudgetService", return_value=budget),
         patch("sreda.services.telegram_bot.get_settings", return_value=_make_settings()),
         patch("sreda.services.telegram_bot.get_speech_recognizer", return_value=recognizer),
+        _patch_paid_gate(),
     ):
         result = await _maybe_transcribe_voice(
             payload, session=session, telegram_client=telegram, onboarding=onboarding
@@ -420,6 +423,7 @@ async def test_g_scheduled_carrier_not_subscribed_gate_does_not_block():
         patch("sreda.services.telegram_bot.BudgetService", return_value=budget),
         patch("sreda.services.telegram_bot.get_settings", return_value=_make_settings()),
         patch("sreda.services.telegram_bot.get_speech_recognizer", return_value=recognizer),
+        _patch_paid_gate(),
     ):
         result = await _maybe_transcribe_voice(
             payload, session=session, telegram_client=telegram, onboarding=onboarding
@@ -458,6 +462,28 @@ def _patch_free_gate():
         return_value=GateResult(
             allowed=True, reason="ok",
             plan_key="sreda_free", is_grandfathered=False,
+        )
+    )
+    return patch("sreda.services.entitlement_gate.EntitlementGate", return_value=gate)
+
+
+def _patch_paid_gate():
+    """Patch EntitlementGate так, чтобы ``.check()`` вернул НЕ-free план
+    (``_is_free=False``) — paid-path без free-tier-резерва, как voice-тесты
+    и предполагали до Phase 2C.
+
+    2026-07-18 audit fallout: после фикса окна подписки в гейте
+    (``_within_active_window``, entitlement_gate.py:125) голый
+    ``MagicMock``-session падает с ``TypeError`` на ``row.quantity <= 0``.
+    Патчим гейт по публичному контракту ``GateResult`` (близнец
+    ``_patch_free_gate`` выше) — это менее хрупко, чем фикстура формы
+    SQL-row (``active_until``/``quantity``): внутренности запроса гейта
+    здесь не тестируются."""
+    gate = MagicMock()
+    gate.check = MagicMock(
+        return_value=GateResult(
+            allowed=True, reason="ok",
+            plan_key="housewife_assistant_base", is_grandfathered=False,
         )
     )
     return patch("sreda.services.entitlement_gate.EntitlementGate", return_value=gate)

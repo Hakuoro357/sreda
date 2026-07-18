@@ -359,11 +359,14 @@ def test_consume_link_tg_target_uses_hash(session):
 
 
 def test_consume_link_invalid_token_format(session):
-    with pytest.raises(ValueError, match="invalid token format"):
-        consume_link(
-            session, raw_token="garbage", target_channel="max",
-            target_account_id="555", target_chat_id="chat_555",
-        )
+    # audit 2026-07-18 (svc-inbound #6): consume_link больше не бросает
+    # ValueError на мусорном токене — возвращает outcome с ошибкой.
+    outcome = consume_link(
+        session, raw_token="garbage", target_channel="max",
+        target_account_id="555", target_chat_id="chat_555",
+    )
+    assert outcome.success is False
+    assert outcome.error == "invalid_token_format"
 
 
 def test_consume_link_same_account_refreshes_chat_id(session):

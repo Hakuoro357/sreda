@@ -112,8 +112,11 @@ class TestDecideRecovery:
             # --- started, durable, probe confirmed: record the commit ------
             ("started", True, True,  False, "mark_committed"),
 
-            # --- started, durable, probe not confirmed: escalate -----------
-            ("started", True, False, False, "mark_failed_needs_manual"),
+            # --- started, durable, probe not confirmed ---------------------
+            # audit 2026-07-18 (planner-exec MAJOR): settle-window symmetry —
+            # window NOT elapsed → re_probe (a stuck worker's to_thread may
+            # still commit); only after the window → escalate.
+            ("started", True, False, False, "re_probe"),
             ("started", True, False, True,  "mark_failed_needs_manual"),
 
             # --- unknown, non-durable: defensive skip ----------------------

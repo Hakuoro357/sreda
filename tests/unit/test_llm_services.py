@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from sreda.config.settings import Settings, get_settings
+from sreda.config.settings import get_settings
 from sreda.services.embeddings import (
     DisabledEmbeddingClient,
     EMBEDDING_DIM_FAKE,
@@ -158,20 +158,29 @@ def test_openai_compat_client_posts_to_embeddings_endpoint(monkeypatch):
         def __exit__(self, *args):
             return False
 
-        def post(self, url, headers=None, json=None):
+        def post(self, url, headers=None, json=None, timeout=None):
             captured["url"] = url
             captured["headers"] = headers
             captured["body"] = json
+            # 2026-07-18 audit fix (llm-core MINOR #9b): клиент стал shared,
+            # timeout переехал из конструктора в per-request kwarg.
+            captured["request_timeout"] = timeout
             return _FakeResponse({"data": [{"embedding": [0.1, 0.2, 0.3]}]})
 
     import sreda.services.embeddings as emb_module
 
     monkeypatch.setattr(emb_module.httpx, "Client", _FakeClient)
+    # Shared client кэшируется глобально — сбрасываем, чтобы подменённый
+    # класс был использован и не утёк в соседние тесты (MINOR #9b).
+    monkeypatch.setattr(emb_module, "_SHARED_HTTP_CLIENT", None)
 
     client = OpenAICompatEmbeddingClient(
         base_url="http://localhost:1234/v1",
         api_key="lm-studio",
         model="e5-large",
+        # 2026-07-18 audit fix (llm-core MINOR #8): клиент fail-fast
+        # сверяет размерность вектора с dim — fake отдаёт 3-мерный.
+        dim=3,
         query_prefix="query: ",
         passage_prefix="passage: ",
     )

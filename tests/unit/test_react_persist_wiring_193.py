@@ -174,9 +174,10 @@ async def test_durable_crash_recovery_counter(monkeypatch):
     calls = {"clear": 0, "delete": 0}
 
     class _FakeSaver:
-        def clear_pending(self, tid, ns=""):
+        # tenant-scoped сигнатуры (аудит 2026-07-18: tenant_id кварг у clear_pending/delete_thread)
+        def clear_pending(self, tid, ns="", tenant_id=None):
             calls["clear"] += 1
-        def delete_thread(self, tid):
+        def delete_thread(self, tid, tenant_id=None):
             calls["delete"] += 1
 
     monkeypatch.setattr(RL, "_get_checkpointer", lambda: _FakeSaver())
@@ -229,9 +230,10 @@ async def test_durable_transient_llm_crash_preserves_thread_225(monkeypatch):
     calls = {"clear": 0, "delete": 0}
 
     class _FakeSaver:
-        def clear_pending(self, tid, ns=""):
+        # tenant-scoped сигнатуры (аудит 2026-07-18: tenant_id кварг у clear_pending/delete_thread)
+        def clear_pending(self, tid, ns="", tenant_id=None):
             calls["clear"] += 1
-        def delete_thread(self, tid):
+        def delete_thread(self, tid, tenant_id=None):
             calls["delete"] += 1
 
     monkeypatch.setattr(RL, "_get_checkpointer", lambda: _FakeSaver())
@@ -300,9 +302,10 @@ async def test_durable_badrequest_still_deletes_225(monkeypatch):
     calls = {"clear": 0, "delete": 0}
 
     class _FakeSaver:
-        def clear_pending(self, tid, ns=""):
+        # tenant-scoped сигнатуры (аудит 2026-07-18: tenant_id кварг у clear_pending/delete_thread)
+        def clear_pending(self, tid, ns="", tenant_id=None):
             calls["clear"] += 1
-        def delete_thread(self, tid):
+        def delete_thread(self, tid, tenant_id=None):
             calls["delete"] += 1
 
     class BadRequestError(Exception):
@@ -328,9 +331,10 @@ async def test_durable_transient_resets_poison_counter_225(monkeypatch):
     calls = {"clear": 0, "delete": 0}
 
     class _FakeSaver:
-        def clear_pending(self, tid, ns=""):
+        # tenant-scoped сигнатуры (аудит 2026-07-18: tenant_id кварг у clear_pending/delete_thread)
+        def clear_pending(self, tid, ns="", tenant_id=None):
             calls["clear"] += 1
-        def delete_thread(self, tid):
+        def delete_thread(self, tid, tenant_id=None):
             calls["delete"] += 1
 
     seq = [RuntimeError("boom"), LLMCallTimeout("net"), RuntimeError("boom")]

@@ -50,13 +50,20 @@ def _seed_thread(
     agent_thread row, so tests must seed a real thread before opening
     a turn. SQLite FK enforcement is off by default in the test
     fixture so we don't need parent tenant/workspace rows for the
-    thread to insert."""
+    thread to insert.
+
+    Audit 2026-07-18 (runtime-core #5 / FC-2): agent_threads теперь имеет
+    UNIQUE (tenant_id, channel_type, external_chat_id), поэтому каждый
+    seeded thread получает СВОЙ external_chat_id (= thread_id) — раньше
+    фикстура сидила несколько threads с одной тройкой, что под новым
+    констрейнтом невалидно (на смысл тестов turn-lifecycle chat_id не
+    влияет)."""
     thread = AgentThread(
         id=thread_id,
         tenant_id=tenant_id,
         workspace_id="ws_test",
         channel_type="telegram",
-        external_chat_id="123",
+        external_chat_id=thread_id,
         status="active",
     )
     session.add(thread)

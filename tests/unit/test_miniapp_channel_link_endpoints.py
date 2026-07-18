@@ -238,7 +238,10 @@ async def test_account_status_tg_uses_hash(db_session, monkeypatch):
         platform="telegram",
         payload={"telegram_id": "100", "user_id": "user_tg"},
     )
-    db_session.get(User, "user_tg").max_account_id = "200"
+    # Audit 2026-07-18 FC-2: users.max_account_id теперь global partial
+    # unique (миграция 20260718_0085) — значение отличаем от fixture'ного
+    # user_max("200"), чтобы не сидеть дубль (на assert значение не влияет).
+    db_session.get(User, "user_tg").max_account_id = "201"
     db_session.commit()
 
     response = await mi.channel_link_account_status(
@@ -377,8 +380,11 @@ async def test_start_same_user_relink_allowed_for_refresh(db_session, monkeypatc
     _patch_settings(monkeypatch)
 
     # Сам инициатор уже имеет MAX-привязку (сценарий обновления chat_id).
+    # Audit 2026-07-18 FC-2: users.max_account_id — global partial unique
+    # (миграция 20260718_0085); "201", чтобы не дублировать fixture'ный
+    # user_max("200") (на смысл теста значение не влияет).
     user = db_session.get(User, "user_tg")
-    user.max_account_id = "200"
+    user.max_account_id = "201"
     db_session.commit()
 
     _patch_auth(

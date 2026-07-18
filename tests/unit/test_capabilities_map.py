@@ -123,6 +123,29 @@ def test_doc_on_disk_is_fresh():
     )
 
 
+# Аудит 2026-07-18 (MINOR): on-disk документ лежит под gitignored
+# docs/internal/ → на CI-checkout его НЕТ, и test_doc_on_disk_is_fresh
+# там осознанно деселектится (ci-tests.yml) → до этого дня свежесть
+# карты не была enforced НИ В ОДНОМ контуре, и документ на диске
+# стабильно протухал (красный локальный свит → привыкание игнорировать).
+# Контрольная сумма ниже КОММИТИТСЯ в репо вместе с этим тестом, поэтому
+# drift «код ушёл, карта не перегенерирована» теперь ловится в CI на
+# каждый PR. Обновление: `python scripts/dev/gen_capabilities.py`, затем
+# подставить сюда новый хэш из упавшего ассерта (одна строка).
+_DOC_SHA256 = "676441a84c0d63f3bb67590ab261ee845b1c716d8610f0960107f4b74504abe3"
+
+
+def test_doc_hash_pinned_for_ci():
+    import hashlib
+
+    got = hashlib.sha256(GEN.build_document().encode("utf-8")).hexdigest()
+    assert got == _DOC_SHA256, (
+        "карта возможностей рассинхронирована с кодом — перегенери "
+        "`python scripts/dev/gen_capabilities.py` и обнови _DOC_SHA256 "
+        f"в tests/unit/test_capabilities_map.py на {got}"
+    )
+
+
 def test_doctored_doc_is_detected():
     doctored = GEN.build_document().replace("id_only", "ВРУЧНУЮ-ПОДДЕЛАНО")
     assert doctored != GEN.build_document()

@@ -2,9 +2,11 @@
 
 The constraints are load-bearing for queue safety:
 
-- ``UNIQUE (channel, external_update_id)`` — cross-channel idempotency.
-  Telegram redelivery / MAX retry / future channel duplicates all
-  collapse at INSERT time without reaching the worker loop.
+- ``UNIQUE (channel, external_update_id, bot_key)`` — cross-channel and
+  cross-bot idempotency (audit 2026-07-18 db-migrations #1: Telegram
+  update_id counters are independent per-bot). Telegram redelivery /
+  MAX retry / future channel duplicates all collapse at INSERT time
+  without reaching the worker loop.
 - ``CHECK status IN (...)`` — keeps the state-machine enum honest.
 - ``CHECK status_timestamps`` — pending rows must not have ``started_at``;
   processing rows must have lease set; terminal rows must have
@@ -239,7 +241,10 @@ def test_table_has_unique_channel_update_constraint(db_session: Session) -> None
     inspector = inspect(db_session.bind)
     unique_constraints = inspector.get_unique_constraints("message_jobs")
     names = {uc["name"] for uc in unique_constraints}
-    assert "uq_message_jobs_channel_external_update_id" in names, (
+    # Audit 2026-07-18 db-migrations #1: ключ расширен bot_key (переименован
+    # из uq_message_jobs_channel_external_update_id) — update_id независимы
+    # per-bot, два TG-бота не должны схлопываться в один namespace.
+    assert "uq_message_jobs_channel_bot_update" in names, (
         f"Missing cross-channel idempotency constraint. Found: {names}"
     )
 

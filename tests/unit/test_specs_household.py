@@ -621,13 +621,18 @@ def test_update_family_member_input_clear_birth_year_satisfies_at_least_one() ->
 
 
 def test_update_family_member_input_clear_birth_year_false_doesnt_count() -> None:
-    """``clear_birth_year=False`` (default) is not «doing something»
-    — must still pass at-least-one-field check via another non-None."""
+    """``clear_birth_year=False`` is not «doing something».
+
+    Audit 2026-07-18 MAJOR #1: the flag is now typed
+    ``Literal[True] | None`` (pattern of ``clear_recurrence`` in
+    specs_reminders.py), so ``False`` is rejected at FIELD validation
+    time — even earlier than the old at-least-one-field
+    model_validator. Assert the new, stricter rejection reason."""
     with pytest.raises(ValidationError) as exc:
         UpdateFamilyMemberInput.model_validate({
             "member_id": FM_A, "clear_birth_year": False,
         })
-    assert "at least one" in str(exc.value)
+    assert "Input should be True" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------

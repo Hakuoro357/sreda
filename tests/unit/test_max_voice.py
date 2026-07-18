@@ -281,6 +281,7 @@ async def test_transcribe_oversize_via_413_error_sends_too_long(monkeypatch):
 
     _patch_voice_access(monkeypatch)
     _patch_budget(monkeypatch)
+    _patch_paid_gate(monkeypatch)
     monkeypatch.setattr(
         "sreda.services.speech.factory.get_speech_recognizer",
         lambda settings: MagicMock(),
@@ -318,6 +319,7 @@ async def test_transcribe_generic_download_error_sends_retry_message(monkeypatch
 
     _patch_voice_access(monkeypatch)
     _patch_budget(monkeypatch)
+    _patch_paid_gate(monkeypatch)
     monkeypatch.setattr(
         "sreda.services.speech.factory.get_speech_recognizer",
         lambda settings: MagicMock(),
@@ -432,6 +434,7 @@ async def test_transcribe_success_injects_text_into_body(monkeypatch):
         lambda: MagicMock(modules={"voice_transcription": True}),
     )
     _budget = _patch_budget(monkeypatch)
+    _patch_paid_gate(monkeypatch)
 
     max_client = MagicMock()
     max_client.send_message = AsyncMock()
@@ -542,6 +545,7 @@ async def test_max_g_scheduled_carrier_not_subscribed_gate_does_not_block(monkey
     _budget = _patch_budget(
         monkeypatch, _make_quota(is_subscribed=False, is_exhausted=True)
     )
+    _patch_paid_gate(monkeypatch)
     fake_recognizer = MagicMock()
     fake_recognizer.recognize = AsyncMock(return_value="расшифровка g")
     monkeypatch.setattr(
@@ -592,6 +596,27 @@ def _patch_free_gate(monkeypatch) -> None:
         return_value=GateResult(
             allowed=True, reason="ok",
             plan_key="sreda_free", is_grandfathered=False,
+        )
+    )
+    monkeypatch.setattr(
+        "sreda.services.entitlement_gate.EntitlementGate", lambda s: gate
+    )
+
+
+def _patch_paid_gate(monkeypatch) -> None:
+    """EntitlementGate.check → НЕ-free план → ``_is_free=False`` (paid-path
+    без free-tier-резерва, как тесты предполагали до Phase 2C).
+
+    2026-07-18 audit fallout: после фикса окна подписки в гейте
+    (``_within_active_window``) голый MagicMock-session падает с TypeError
+    на ``row.quantity <= 0`` — патчим публичный контракт ``GateResult``
+    (близнец ``_patch_free_gate`` выше), а не форму SQL-row: так менее
+    хрупко."""
+    gate = MagicMock()
+    gate.check = MagicMock(
+        return_value=GateResult(
+            allowed=True, reason="ok",
+            plan_key="housewife_assistant_base", is_grandfathered=False,
         )
     )
     monkeypatch.setattr(
@@ -676,8 +701,10 @@ async def test_max_v6_non_exhausted_free_carrier_does_reserve_llm_turn(monkeypat
         lambda: MagicMock(modules={"voice_transcription": True}),
     )
     # ffprobe duration нужен для voice-резерва ПОСЛЕ download.
+    # audit 2026-07-18: max_inbound зовёт probe_audio_async → ffprobe_duration
+    # получает kwarg timeout_sec — lambda обязана его принимать.
     monkeypatch.setattr(
-        "sreda.services.audio_probe.ffprobe_duration", lambda b: 3.0
+        "sreda.services.audio_probe.ffprobe_duration", lambda b, timeout_sec=10.0: 3.0
     )
 
     max_client = MagicMock()

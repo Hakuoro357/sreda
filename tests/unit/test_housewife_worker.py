@@ -15,7 +15,10 @@ from datetime import UTC, datetime, timedelta
 from sreda.db.models.core import OutboxMessage, Tenant, User, Workspace
 from sreda.db.models.housewife import FamilyReminder
 from sreda.services.housewife_reminders import HousewifeReminderService, _coerce_utc
-from sreda.workers.housewife_reminder_worker import HousewifeReminderWorker
+from sreda.workers.housewife_reminder_worker import (
+    NO_CHANNEL_RETRY_MINUTES,
+    HousewifeReminderWorker,
+)
 
 
 def _seed_base(session) -> None:
@@ -155,9 +158,17 @@ def test_worker_skips_tenant_without_telegram(worker_db) -> None:
 
     fired = asyncio.run(HousewifeReminderWorker().process_pending(now=now))
 
-    # Worker returns fired count 1 (reminder state advanced), but no
-    # outbox row because chat_id was unresolvable.
+    # Аудит 2026-07-18 (#7 — устаревший ассерт обновлён): reminder БЕЗ
+    # доставляемого канала больше НЕ помечается fired (раньше закрывался
+    # без единой попытки доставки — молчаливая потеря). Теперь: fired=0,
+    # outbox-строк нет, статус pending, next_trigger_at отложен на
+    # NO_CHANNEL_RETRY_MINUTES (появится канал — доставим).
     worker_db.expire_all()
-    assert fired == 1
+    assert fired == 0
     outbox = worker_db.query(OutboxMessage).all()
     assert len(outbox) == 0
+    reminder = worker_db.query(FamilyReminder).one()
+    assert reminder.status == "pending"
+    assert _coerce_utc(reminder.next_trigger_at) == (
+        now + timedelta(minutes=NO_CHANNEL_RETRY_MINUTES)
+    )

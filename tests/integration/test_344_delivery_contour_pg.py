@@ -22,6 +22,7 @@ import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -755,6 +756,10 @@ def test_reminder_worker_does_not_clobber_concurrent_snooze(pg_db, monkeypatch):
                             telegram_client=fake_tg,
                             callback_query=_snooze_callback_query(rid),
                             data=f"rem_snooze:{rid}",
+                            # Аудит 2026-07-18 svc-inbound #4: обязательный
+                            # onboarding для cross-tenant check; напоминание
+                            # посажено в TENANT — совпадает, проверка прозрачна.
+                            onboarding=SimpleNamespace(tenant_id=TENANT),
                         )
                     )
                 snooze_done.set()

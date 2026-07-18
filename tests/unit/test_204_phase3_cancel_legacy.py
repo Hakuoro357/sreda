@@ -29,6 +29,7 @@ dry_run=False)``, чтобы биллинг-мутацию можно было �
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -54,6 +55,13 @@ _SCRIPT_PATH = (
     / "204_cancel_legacy_voice_subs.py"
 )
 _MOD_NAME = "script_204_cancel_legacy_voice_subs"
+# Audit 2026-07-18: скрипт больше не хранит прод-tenant-id'ы в коде — читает
+# их из env. Тест подставляет те же синтетические-для-теста id, что сидит
+# ниже (TENANT_A/TENANT_B), ДО exec_module (константа считается при импорте).
+os.environ.setdefault(
+    "SREDA_204_EXPECTED_TENANTS",
+    "tenant_tg_1089832184,tenant_tg_755682022",
+)
 _spec = importlib.util.spec_from_file_location(_MOD_NAME, _SCRIPT_PATH)
 mod = importlib.util.module_from_spec(_spec)
 # Register before exec so @dataclass(field(default_factory=...)) can resolve

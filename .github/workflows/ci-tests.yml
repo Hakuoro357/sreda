@@ -41,10 +41,26 @@ jobs:
         # test_doc_on_disk_is_fresh — ЛОКАЛЬНО-девелоперский чек: сверяет ЛОКАЛЬНЫЙ генерируемый
         # docs/internal/dev/SREDA_CAPABILITIES.md (он GITIGNORED, в репо не коммитится) с build_document().
         # На CI-checkout файла НЕТ → тест неприменим (не «свежесть», а «файла нет»). Исключаем из CI.
-        # Свежесть капабилити-дока проверяется локально перед коммитом (см. vex-assistant#340).
+        # Свежесть карты в CI enforced через test_doc_hash_pinned_for_ci (аудит 2026-07-18:
+        # sha256 эталонного build_document() коммитится в репо — drift ловится на каждый PR).
         run: >-
           uv run --all-extras python -m pytest tests/unit -m "not pg"
           --deselect tests/unit/test_capabilities_map.py::test_doc_on_disk_is_fresh -q
+
+  functional:
+    name: functional (E2E-тракт #133, сеть запрещена)
+    # Аудит 2026-07-18 (MAJOR): единственный сквозной тракт «HTTP → planner →
+    # executor → БД» раньше не бежал НИГДЕ — регрессия шва create_task ушла
+    # в main незамеченной. Шов-тесты (test_seams) бегут везде; трактовые
+    # тесты построены на chat-скиле из ПРИВАТНОГО пакета sreda-private-features
+    # и на публичном checkout честно скипаются (importorskip в conftest) —
+    # локально у владельца (плагин установлен) сюит полный.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Прогон functional-свита
+        run: uv run --all-extras python -m pytest tests/functional -q
 
   pg-integration:
     name: pg-integration (реальный Postgres, класс #331)
@@ -85,6 +101,14 @@ jobs:
             -c "ALTER ROLE sreda_app LOGIN PASSWORD 'app'" \
             -c "ALTER ROLE sreda_identity LOGIN PASSWORD 'identity'" \
             -c "ALTER ROLE sreda_maintenance LOGIN PASSWORD 'maintenance'"
+      - name: Throwaway-БД для destructive PG-сьютов
+        # Аудит 2026-07-18 (MAJOR): quota-concurrency сьюиты и #344 дропают
+        # таблицы/схему → их safety-гейты требуют БД с тестовым именем
+        # ('*_test'). Держим её ОТДЕЛЬНО от мигрированной `sreda`, чтобы
+        # DROP SCHEMA не сносил схему RLS-сьютов.
+        run: >-
+          psql postgresql://sreda:sreda@localhost:5432/sreda
+          -v ON_ERROR_STOP=1 -c "CREATE DATABASE sreda_test"
       - name: Класс #331 на реальном PG (begin-хук #138 × изоляция quota)
         run: uv run --all-extras python -m pytest tests/integration/test_331_tx_isolation_pg.py -m pg -q
       - name: RLS red-suites (#138 изоляция + identity + vex#360 onboard-smoke)
@@ -98,3 +122,28 @@ jobs:
           tests/integration/test_138_rls_pg.py
           tests/integration/test_138_identity_pg.py
           tests/integration/test_360_onboard_smoke_rls_pg.py -m pg -q
+      - name: PG-конкуренция money-path + delivery-контур #344
+        # Аудит 2026-07-18 (MAJOR): защита double-spend квот (SERIALIZABLE +
+        # retry по SQLSTATE 40001) и reclaim-fence воркеров рассылок на SQLite
+        # не воспроизводятся, а в CI эти сьюиты НЕ БЕЖАЛИ: 5 quota-сьютов
+        # гейтятся на SREDA_TEST_POSTGRES_URL + DESTRUCTIVE_OPT_IN (CI их не
+        # выставлял), а test_344 вообще не был включён в job. Теперь единый
+        # контур: throwaway-БД sreda_test (создаётся шагом выше; имя проходит
+        # safety-гейт '*_test'), обе переменные выставлены. test_344 читает
+        # SREDA_PG_TEST_DSN — перекрываем на шаге: job-level DSN указывает
+        # на мигрированную `sreda`, где его DROP SCHEMA не пропустил бы
+        # safety-гейт. БЕЗ `-m pg`: 5 quota-сьютов маркера pg не имеют
+        # (гейтятся только env'ом) — маркерный фильтр их бы деселектил.
+        env:
+          SREDA_TEST_POSTGRES_URL: postgresql+psycopg://sreda:sreda@localhost:5432/sreda_test
+          SREDA_TEST_POSTGRES_DESTRUCTIVE_OPT_IN: "1"
+          SREDA_PG_TEST_DSN: postgresql+psycopg://sreda:sreda@localhost:5432/sreda_test
+        run: >-
+          uv run --all-extras python -m pytest
+          tests/integration/test_344_delivery_contour_pg.py
+          tests/integration/test_341_max_chat_id_pg_concurrency.py
+          tests/integration/test_fetch_url_quota_postgres_concurrency.py
+          tests/integration/test_web_search_quota_postgres_concurrency.py
+          tests/integration/test_message_queue_postgres_concurrency.py
+          tests/integration/test_conversation_turns_postgres_fk.py
+          -q

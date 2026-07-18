@@ -34,8 +34,21 @@ def _fake_embedding_client():
 
 
 def _get_tool():
+    session = MagicMock()
+    # EntitlementGate after the 2026-07-18 audit fix (svc-billing #1)
+    # validates the subscription window (quantity > 0, active_until in the
+    # future or NULL). A bare MagicMock row crashes the window arithmetic
+    # with TypeError, so return a valid active row: perpetual paid sub,
+    # gate allowed, not free-tier — same effective outcome as on main.
+    active_sub_row = MagicMock(
+        plan_key="sreda_pro",
+        grandfathered_at=None,
+        active_until=None,
+        quantity=1,
+    )
+    session.execute.return_value.first.return_value = active_sub_row
     tools = build_memory_tools(
-        session=MagicMock(),
+        session=session,
         tenant_id="tenant_1",
         user_id="user_1",
         embedding_client=_fake_embedding_client(),

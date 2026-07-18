@@ -829,7 +829,10 @@ def test_capture_accepts_explicit_name_with_sentence_punctuation(
         raw_name="Меня зовут Катя.",
     )
 
-    assert display_name == "Меня зовут Катя."
+    # audit 2026-07-18: save_pb_tour_display_name прогоняет raw_name через
+    # ``_extract_short_name`` (срез префикса «Меня зовут» + терминальной
+    # пунктуации) — в профиль уходит короткое имя, а не сырая фраза.
+    assert display_name == "Катя"
 
 
 def test_capture_does_not_overwrite_existing_display_name(

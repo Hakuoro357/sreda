@@ -5,33 +5,22 @@ Covers ``get_chat_llm`` returning a MiMo/OpenRouter client based on
 fallback provider is configured. No real API calls — we monkey-patch
 ``ChatOpenAI`` so tests stay offline and fast.
 
-2026-05-23: ENTIRE FILE SKIPPED.
-The ``_patch_chat_openai`` autouse fixture below sets
-``llm_module.ChatOpenAI = _fake_chat_openai_factory`` and analogous for
-``MimoChatOpenAI``, but **тесты всё равно делают реальные network
-calls** — pytest зависает >60s на каждом тесте (cf. R-29 incident
-2026-05-14 что ввёл lazy import ``MimoChatOpenAI`` в llm.py:1304).
-Гипотеза: какая-то autouse фикстура в ``conftest.py`` (``_default_
-encryption_key`` или ``_clear_module_level_loop_bound_state``) reset'ит
-state ПОСЛЕ нашего patch'а, либо openai SDK кэширует client somewhere.
-Until debug — module-level skip, see #66.
+2026-05-23 — 2026-07-18: файл был целиком скипнут (#66): тесты делали
+реальные network calls и pytest вис >60s. Корневая причина (аудит
+2026-07-18, MAJOR): autouse-фикстура патчила ``llm_module.ChatOpenAI``,
+но MiMo-путь в ``llm._build_chat_llm`` ЛЕНИВО импортирует
+``MimoChatOpenAI`` из ``sreda.services.mimo_chat_openai`` (R-29) —
+патч на ``llm_module`` его не доставал, конструировался настоящий
+клиент. Починка: патчим ``MimoChatOpenAI`` в модуле-источнике (ленивый
+импорт резолвит атрибут модуля в момент вызова) + локальный
+network-guard ниже — любой возврат к реальной сети падает мгновенно
+с AssertionError вместо зависания (в unit-сьюите общего гарда нет —
+он живёт только в tests/functional/conftest.py).
 """
 
 from __future__ import annotations
 
-import pytest
-
-# Module-level skip — see docstring above. Remove this line when fixture
-# is repaired so dispatch coverage returns to CI.
-pytestmark = pytest.mark.skip(
-    reason=(
-        "MimoChatOpenAI/ChatOpenAI fixture broken — tests perform real "
-        "network calls instead of using _FakeLLM, pytest hangs >60s per "
-        "test. Pre-existing tech-debt from R-29 (2026-05-14). See follow-up "
-        "issue for fixture rework."
-    ),
-)
-
+import socket
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -84,6 +73,16 @@ def _fake_chat_openai_factory(**kwargs: Any) -> _FakeLLM:
 @pytest.fixture(autouse=True)
 def _patch_chat_openai(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(llm_module, "ChatOpenAI", _fake_chat_openai_factory)
+    # MiMo-путь в llm._build_chat_llm ЛЕНИВО импортирует MimoChatOpenAI
+    # (``from sreda.services.mimo_chat_openai import MimoChatOpenAI`` внутри
+    # функции, R-29) — патч на llm_module.ChatOpenAI его не доставал,
+    # из-за чего тесты когда-то уходили в реальную сеть (#66). Ленивый
+    # импорт резолвит атрибут модуля-источника в момент вызова → патчим там.
+    import sreda.services.mimo_chat_openai as mimo_module
+
+    monkeypatch.setattr(
+        mimo_module, "MimoChatOpenAI", _fake_chat_openai_factory,
+    )
     # Strip any SREDA_* env leakage so Settings constructs cleanly
     # from explicit overrides only — otherwise a dev shell with
     # real keys configured makes these tests order-dependent.
@@ -94,21 +93,49 @@ def _patch_chat_openai(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(var, raising=False)
 
 
-# 2026-05-23: 5 тестов below делают реальные network calls — fixture
-# выше патчит llm_module.ChatOpenAI, но MiMo путь в llm.py:1304 лениво
-# импортирует ``MimoChatOpenAI`` (subclass ChatOpenAI из отдельного
-# модуля, добавлен в R-29 incident 2026-05-14 для preserving
-# reasoning_content в thinking mode). Monkeypatch на
-# ``mimo_chat_openai.MimoChatOpenAI`` тоже не помогает — pytest висит
-# >60s, ChatOpenAI.__init__ где-то блокируется (вероятно openai SDK
-# config check). Скип до отдельной задачи fixture-rework.
-_FIXTURE_BROKEN = pytest.mark.skip(
-    reason=(
-        "MimoChatOpenAI fixture broken — tests perform real network "
-        "calls instead of using _FakeLLM. See issue tracking fixture "
-        "rework. Pre-existing tech-debt from R-29 (2026-05-14)."
-    ),
-)
+@pytest.fixture(autouse=True)
+def _offline_provider_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``get_chat_llm`` без ``provider=`` делает DB-lookup admin-switcher'а
+    (``runtime_config``) через глобальную ``get_session_factory`` — с
+    дефолтным PG-DSN это реальный network connect (psycopg/libpq идёт на
+    C-уровне МИМО socket-патчей) — историческое зависание >60s (#66).
+    Шов ``_factory_for`` — тот же, что в ``worker_db`` (unit conftest):
+    подменяем фабрику на локальную SQLite с ПУСТОЙ ``runtime_config`` →
+    lookup честно отрабатывает «нет записи» → env-дефолты, офлайн."""
+    from sqlalchemy.pool import StaticPool
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    RuntimeConfig.__table__.create(engine)
+    factory = sessionmaker(bind=engine)
+    monkeypatch.setattr("sreda.db.session._factory_for", lambda _engine: factory)
+
+
+@pytest.fixture(autouse=True)
+def _no_network_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Локальный network-guard (аудит 2026-07-18): в unit-сьюите общего
+    гарда нет, а этот модуль ровно про конструирование LLM-клиентов.
+    Любая регрессия к реальному сетевому вызову падает мгновенно с
+    AssertionError вместо исторического зависания >60s (#66 / R-29)."""
+
+    def _blocked(*a: Any, **kw: Any) -> None:
+        raise AssertionError(
+            "внешняя сеть запрещена в test_llm_provider_dispatch "
+            f"(offline-гарда): {a!r} {kw!r}"
+        )
+
+    monkeypatch.setattr(socket.socket, "connect", _blocked)
+    monkeypatch.setattr(socket, "create_connection", _blocked)
+
+    import httpx
+
+    monkeypatch.setattr(
+        httpx.AsyncHTTPTransport, "handle_async_request", _blocked,
+    )
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _blocked)
 
 
 def _settings(**overrides: Any):
@@ -153,7 +180,6 @@ def _set_runtime_config(session, key: str, value: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@_FIXTURE_BROKEN
 def test_default_provider_is_mimo() -> None:
     s = _settings(mimo_api_key="mimo-k")
     got = llm_module.get_chat_llm(s)
@@ -225,7 +251,6 @@ def test_openrouter_variants_share_the_same_key() -> None:
     """All three OpenRouter variants must degrade to None when the OR
     key isn't configured — prevents silent behaviour where the UI
     showed 'available' but runtime found no key."""
-    s = _settings()  # no keys
     for variant in ("openrouter", "openrouter-grok", "openrouter-qwen"):
         s_v = _settings(chat_provider=variant)
         assert llm_module.get_chat_llm(s_v) is None, variant
@@ -241,7 +266,6 @@ def test_openrouter_missing_key_returns_none() -> None:
 # ---------------------------------------------------------------------------
 
 
-@_FIXTURE_BROKEN
 def test_with_fallback_disabled_by_default() -> None:
     """Absence of ``chat_fallback_provider`` must never trigger the
     wrap — a no-op config shouldn't change runtime behaviour."""
@@ -251,7 +275,6 @@ def test_with_fallback_disabled_by_default() -> None:
     assert not isinstance(got, _FakeFallback)
 
 
-@_FIXTURE_BROKEN
 def test_with_fallback_enabled_wraps_both_providers() -> None:
     s = _settings(
         mimo_api_key="mimo-k",
@@ -265,7 +288,6 @@ def test_with_fallback_enabled_wraps_both_providers() -> None:
     assert "openrouter.ai" in got.fallbacks[0].base_url
 
 
-@_FIXTURE_BROKEN
 def test_with_fallback_same_as_primary_is_noop() -> None:
     """Config smell: fallback equals primary. Must skip the wrap and
     log a warning instead of producing a self-referential chain."""
@@ -278,7 +300,6 @@ def test_with_fallback_same_as_primary_is_noop() -> None:
     assert not isinstance(got, _FakeFallback)
 
 
-@_FIXTURE_BROKEN
 def test_with_fallback_missing_fallback_key_degrades_to_primary() -> None:
     """Fallback provider configured but key missing — keep serving
     requests with the primary rather than crashing the turn."""

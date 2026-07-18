@@ -85,8 +85,10 @@ def test_network_failure_returns_error_string_not_exception() -> None:
     # tool returns the quota/unavailable error string, NOT an exception and NOT
     # the raw "ConnectionError" name. Intent preserved: network failure → safe
     # error string, never a raised exception.
+    # Аудит 2026-07-18 (svc-features #7): транзиентный фейл DDG — это НЕ
+    # исчерпание лимита; сообщение сменилось на «временно недоступен».
     assert result.startswith("error:")
-    assert result == "error: Достигнут лимит поиска"
+    assert result == "error: веб-поиск временно недоступен, попробуйте позже"
 
 
 def test_missing_package_returns_error() -> None:
@@ -109,4 +111,6 @@ def test_missing_package_returns_error() -> None:
     # so the tool surfaces the quota/unavailable error string (was the old
     # "error: web_search not available"). Intent preserved: missing dependency →
     # graceful error string, no crash.
-    assert result == "error: Достигнут лимит поиска"
+    # Аудит 2026-07-18 (svc-features #7): транзиентный фейл (нет пакета) — это
+    # НЕ исчерпание лимита; сообщение сменилось на «временно недоступен».
+    assert result == "error: веб-поиск временно недоступен, попробуйте позже"
