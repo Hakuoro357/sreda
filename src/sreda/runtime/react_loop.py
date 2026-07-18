@@ -1779,6 +1779,17 @@ def _generic_confirm_wrap(inner: Any) -> Any:
     )
 
 
+# #389: аддитивные write-инструменты, доказанные прод-данными как чистое трение под
+# candidate-confirm — продолжение диктовки покупок («1 литр молока», «Еще добавь в соль»)
+# не несёт императив+домен-слово в ОДНОМ сообщении → allowed_write=∅ → «Подтверждаешь?»
+# на каждом пункте; оба прод-кейса (react_turn_trace 18.07) resolved yes = промах сигнала
+# по калибровочному контракту #285 Фазы A. Точечное осознанное исключение из пилляра
+# «нет молчаливой записи» (позиция владельца в issue: добавление — аддитивно, видимо,
+# обратимо). ТОЛЬКО add_shopping_items: деструктив (remove_*/clear_*) и другие семьи
+# расширять сюда БЕЗ данных нельзя.
+_UNIFIED_AUTOEXEC_WRITE_TOOLS = frozenset({"add_shopping_items"})
+
+
 def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any,
                           exclude_read: frozenset = frozenset()) -> list:
     """#285 B2b-2: фильтр набора на ЕДИНОМ пути execute. Как `_apply_domain_policy` для read, НО write
@@ -1806,7 +1817,9 @@ def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any,
             # ярус (а) прямой — ТОЛЬКО если И write-домен разрешён, И read-домен инструмента в allowed_read
             # (B2 CodexH R2: иначе write-инструмент с read≠write доменом, напр. generate_shopping_from_menu
             # write=shopping/read=menu, читал бы menu-own-data без гранта). Иначе → кандидат под confirm.
-            if tool_write_domains(name) <= aw and tool_read_domains(name) <= ar:
+            if name in _UNIFIED_AUTOEXEC_WRITE_TOOLS:
+                out.append(t)  # #389: аддитивное добавление покупок — прямой, без confirm
+            elif tool_write_domains(name) <= aw and tool_read_domains(name) <= ar:
                 out.append(t)  # ярус (а): домены разрешены → прямой write без confirm
             else:
                 out.append(_generic_confirm_wrap(t))  # ярус (б): кандидат под confirm
