@@ -95,3 +95,50 @@ def test_generate_shopping_from_menu_read_gate_intact():
     t = _tool("generate_shopping_from_menu")
     out = _apply_unified_policy([t], ["web", "shopping"], ["shopping"])
     assert len(out) == 1 and out[0] is not t
+
+
+# ─────────── R2 (субагент MAJOR): конкурирующий write-домен роутера ───────────
+
+def test_competing_router_write_domain_restores_confirm():
+    """Субагент R1 MAJOR: «добавь в список дел купить молоко» → роутер дал
+    ПОЛОЖИТЕЛЬНЫЙ write-грант ДРУГОГО домена (checklists). Прямой autoexec
+    add_shopping_items здесь молча писал бы в shopping вопреки роутеру
+    (до #389 confirm примирял расхождение «роутер=checklists vs модель=shopping»).
+    Autoexec ТОЛЬКО без конкурирующего write-домена → здесь кандидат под confirm."""
+    txt = "добавь в список дел купить молоко"
+    pol = _policy(txt)
+    assert "checklists" in pol["allowed_write"]      # конкурирующий грант роутера
+    assert "shopping" not in pol["allowed_write"]
+    t = _tool("add_shopping_items")
+    out = _apply_unified_policy([t], pol["allowed_read"], pol["allowed_write"])
+    assert len(out) == 1 and out[0] is not t         # confirm-backstop восстановлен
+    assert out[0].name == "add_shopping_items"
+
+
+def test_competing_write_domain_synthetic_matrix():
+    """Матрица условия autoexec: aw=∅ → прямой (прод-репро); aw={shopping} → прямой;
+    aw={checklists} → кандидат (конкурирующий домен)."""
+    t = _tool("add_shopping_items")
+    out_empty = _apply_unified_policy([t], ["web"], [])
+    assert out_empty == [t]
+    out_own = _apply_unified_policy([t], ["shopping", "web"], ["shopping"])
+    assert out_own == [t]
+    out_comp = _apply_unified_policy([t], ["checklists", "web"], ["checklists"])
+    assert len(out_comp) == 1 and out_comp[0] is not t
+
+
+# ─────────── R2 (субагент MINOR-1): import-time гвард реестра ───────────
+
+def test_autoexec_registry_guard_mechanism():
+    """Гвард механизмом, не комментом: член реестра обязан быть в манифесте,
+    write-класса и аддитивным (add_*). Неосторожная правка падает на импорте."""
+    from sreda.runtime.react_loop import _validate_unified_autoexec_registry
+    import pytest
+
+    _validate_unified_autoexec_registry()  # текущий реестр валиден
+    with pytest.raises(RuntimeError, match="манифест"):
+        _validate_unified_autoexec_registry(frozenset({"no_such_tool_xyz"}))
+    with pytest.raises(RuntimeError, match="write"):
+        _validate_unified_autoexec_registry(frozenset({"list_shopping"}))  # read-класс
+    with pytest.raises(RuntimeError, match="аддитивн"):
+        _validate_unified_autoexec_registry(frozenset({"remove_shopping_items"}))  # деструктив

@@ -1785,9 +1785,32 @@ def _generic_confirm_wrap(inner: Any) -> Any:
 # на каждом пункте; оба прод-кейса (react_turn_trace 18.07) resolved yes = промах сигнала
 # по калибровочному контракту #285 Фазы A. Точечное осознанное исключение из пилляра
 # «нет молчаливой записи» (позиция владельца в issue: добавление — аддитивно, видимо,
-# обратимо). ТОЛЬКО add_shopping_items: деструктив (remove_*/clear_*) и другие семьи
-# расширять сюда БЕЗ данных нельзя.
+# обратимо). ТОЛЬКО add_shopping_items; фикс НЕ расширяет autoexec на деструктив
+# (remove_*/clear_* остаются в общем двухъярусном контуре B2) и другие семьи — сюда
+# БЕЗ прод-данных не добавлять. R2 (субагент MAJOR): autoexec гейтится отсутствием
+# КОНКУРИРУЮЩЕГО write-домена роутера — «добавь в список дел купить молоко» даёт
+# aw={checklists}, прямой shopping-write тут противоречил бы роутеру → кандидат+confirm
+# (confirm примиряет расхождение «роутер vs выбор модели», как до #389).
 _UNIFIED_AUTOEXEC_WRITE_TOOLS = frozenset({"add_shopping_items"})
+
+
+def _validate_unified_autoexec_registry(registry: frozenset | None = None) -> None:
+    """#389 R2 (субагент MINOR-1): гвард реестра МЕХАНИЗМОМ, не комментом (прецедент #180).
+    Каждый член: существует в манифесте, op-class == write, имя аддитивно (add_*) —
+    неосторожная будущая правка/опечатка падает на импорте, а не молчит на проде.
+    По образцу _validate_tool_op_metadata (families.py)."""
+    from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST, TOOL_OP_CLASS
+    reg = _UNIFIED_AUTOEXEC_WRITE_TOOLS if registry is None else registry
+    for n in reg:
+        if n not in TOOL_FAMILY_MANIFEST:
+            raise RuntimeError(f"autoexec-реестр #389: {n!r} отсутствует в манифесте")
+        if TOOL_OP_CLASS.get(n) != "write":
+            raise RuntimeError(f"autoexec-реестр #389: {n!r} не write-класса")
+        if not n.startswith("add_"):
+            raise RuntimeError(f"autoexec-реестр #389: {n!r} не аддитивный (ожидается add_*)")
+
+
+_validate_unified_autoexec_registry()
 
 
 def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any,
@@ -1817,8 +1840,12 @@ def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any,
             # ярус (а) прямой — ТОЛЬКО если И write-домен разрешён, И read-домен инструмента в allowed_read
             # (B2 CodexH R2: иначе write-инструмент с read≠write доменом, напр. generate_shopping_from_menu
             # write=shopping/read=menu, читал бы menu-own-data без гранта). Иначе → кандидат под confirm.
-            if name in _UNIFIED_AUTOEXEC_WRITE_TOOLS:
-                out.append(t)  # #389: аддитивное добавление покупок — прямой, без confirm
+            if name in _UNIFIED_AUTOEXEC_WRITE_TOOLS and not (aw - tool_write_domains(name)):
+                # #389: аддитивное добавление покупок — прямой, без confirm; ТОЛЬКО когда роутер
+                # НЕ дал конкурирующего write-домена (aw ⊆ доменов инструмента). R2 субагент MAJOR:
+                # при aw={checklists} прямой shopping-write противоречил бы роутеру → ветка ниже
+                # (кандидат+confirm) примиряет расхождение, как до #389.
+                out.append(t)
             elif tool_write_domains(name) <= aw and tool_read_domains(name) <= ar:
                 out.append(t)  # ярус (а): домены разрешены → прямой write без confirm
             else:
