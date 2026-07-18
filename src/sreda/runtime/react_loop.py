@@ -2183,6 +2183,189 @@ def _domain_clf_disambig_for(tenant_id: str) -> bool:
     return bool(s.domain_clf_disambig_enabled) and (tenant_id in s.domain_clf_disambig_tenants)
 
 
+def _sgr_planner_for(tenant_id: str) -> bool:
+    """#383: SGR-шаг планировщика для этого тенанта (флаг + канареечный список, паттерн
+    #285/#376). OFF / не в списке → байт-в-байт текущее (react_sgr не импортируется вовсе)."""
+    from sreda.config.settings import get_settings
+    s = get_settings()
+    return bool(s.sgr_planner_enabled) and (tenant_id in s.sgr_planner_tenants)
+
+
+# #383 §6: кап размера объединения sgr_tools. Обоснование: Ф0-проба (2026-07-17) гейтила
+# живой срез из 13 веток инструментов (+clarify/finish) на обоих провайдерах — 18 даёт запас
+# на рост семьи, НЕ проверенный пробой размер не пускаем (bump — только после новой Ф0-пробы
+# большего объединения; g-018). Кап — по СРЕЗУ, не по полному bound (R1 CRITICAL: bound ≈ 30).
+_SGR_MAX_UNION = 18
+# «Чисто чеклистовый» ход по ФАКТИЧЕСКОЙ unified-политике (Ф2-калибровка на живой
+# compute_unified_policy, урок R1-CRITICAL «мёртвый гейт»): неоднозначная read-кюс-группа
+# «список» ВСЕГДА поднимает shopping РЯДОМ с checklists («покажи список дел» →
+# allowed_read={checklists, shopping, web}; вычитает её только #376-дизамбигуатор своим
+# флагом). Поэтому shopping допускается ТОЛЬКО как read-попутчица; WRITE строго ⊆
+# {checklists} (запись в покупки = не наш ход). Срез sgr_tools при этом остаётся
+# checklists+web — неоднозначность «какой список» решает ветка clarify, не list_shopping.
+_SGR_READ_DOMAINS_ALLOWED = frozenset({"checklists", "web", "shopping"})
+_SGR_WRITE_DOMAINS_ALLOWED = frozenset({"checklists"})
+
+
+def _sgr_shopping_is_companion(text: str) -> bool:
+    """#383 Ф2 (CR R1 sol+terra MAJOR): shopping в allowed_read допустим ТОЛЬКО как попутчица
+    неоднозначной кюс-группы «список» (группа несёт И checklists). Детерминированный provenance
+    по ТЕКСТУ хода: (а) route_domains НЕ дал shopping (явное «покупки/список покупок» → не наш
+    ход); (б) каждая read-кюс-группа с shopping содержит и checklists (самостоятельная
+    {shopping}-группа — «список кино И ПОКУПКИ» — явное требование, SGR его физически не
+    исполнит: в срезе нет shopping-инструментов). Любой сбой → False (fail-closed → легаси)."""
+    try:
+        from sreda.runtime.react_preflight import route_domains
+        from sreda.runtime.react_signals import read_cue_groups
+        if "shopping" in set(route_domains(text).all_domains):
+            return False  # явное «покупки/список покупок» в онтологии — не наш ход
+        checklist_evidence = False
+        for _grp in read_cue_groups(text):
+            g = set(_grp) - {"web"}
+            if "shopping" in g and "checklists" not in g:
+                return False  # квалифицированная shopping-группа = явное требование
+            if "checklists" in g:
+                checklist_evidence = True
+        # ПОЗИТИВНОЕ чеклист-доказательство обязательно: shopping в allowed_read при
+        # тексте БЕЗ единой checklists-группы (континуация, унаследованные/LLM-домены)
+        # → fail-closed. Квалифицированный «список дел» даёт чистую {checklists}-группу,
+        # неквалифицированный «покажи список» — смешанную {checklists, shopping}; обе ок.
+        return checklist_evidence
+    except Exception:  # noqa: BLE001 — provenance не определить → fail-closed
+        return False
+
+
+def _sgr_gate_reason(*, unified_execute: bool, allowed_read: Any, allowed_write: Any,
+                     guard_nudge: str, stale_pause_note: str,
+                     provider_key: str, user_text: str = "") -> str | None:
+    """#383 §2B: детерминированное гейт-условие SGR-хода ДО любой тяжёлой работы.
+    None = SGR может активироваться; иначе enum-причина неактивности (уходит в трейс
+    ``sgr.inactive_reason`` — наблюдаемость сужений для Ф3). Чистая функция — приёмка п.7
+    тестирует её напрямую (test_sgr_inactive_on_one_shot_directives).
+
+    Причины: not_unified | one_shot_directive_pending (R6 Opus MAJOR#1, вариант (б):
+    recovery/спасательный проход — freshness-нудж #356, guard-нудж #267 A4, stale-pause —
+    идёт ЛЕГАСИ, где эти механизмы проверены; их consume-семантика отрабатывает штатно) |
+    domain_mix (ход не «чисто чеклистовый») | provider_unsupported (нет Ф0-формы для
+    провайдера — SGR детерминированно неактивен, не 400 на живом вызове)."""
+    if not unified_execute:
+        return "not_unified"
+    if guard_nudge or stale_pause_note:
+        return "one_shot_directive_pending"
+    ar, aw = set(allowed_read or ()), set(allowed_write or ())
+    if ("checklists" not in (ar | aw) or not aw <= _SGR_WRITE_DOMAINS_ALLOWED
+            or not ar <= _SGR_READ_DOMAINS_ALLOWED):
+        return "domain_mix"
+    # CR R1 sol+terra MAJOR: shopping в ar — только попутчица неоднозначной группы «список»;
+    # явная shopping-улика в тексте (route-домен / самостоятельная кюс-группа) → легаси.
+    if "shopping" in ar and not _sgr_shopping_is_companion(user_text):
+        return "domain_mix"
+    from sreda.runtime.react_sgr import WIRE_SHAPE_BY_PROVIDER
+    if provider_key not in WIRE_SHAPE_BY_PROVIDER:
+        return "provider_unsupported"
+    return None
+
+
+def _sgr_structured_step(*, bound: list, allowed_read: Any, allowed_write: Any,
+                         guard_nudge: str, stale_note: str, assemble: Any, sp: str,
+                         llm: Any, fallback_llm: Any, provider_key: str,
+                         fallback_provider_key: str, fallback_model_name: str,
+                         model_name: str, timeout_s: float, tenant_id: str,
+                         session: Any, run_id: str, user_text: str = "") -> dict:
+    """#383 Ф2: SGR-попытка шага планировщика под ЕДИНОЙ fail-open границей (§5 плана:
+    ЛЮБОЕ исключение ЛЮБОЙ точки — import/срез/схема/bind/invoke/parse/конверсия — возвращает
+    resp=None → вызывающий идёт ЛЕГАСИ тем же проходом с нетронутым legacy-промптом).
+
+    Возврат: {resp: AIMessage|None, sgr: dict|None (PII-free поле трейса), latency_ms,
+    provider, model, usage_recorded: bool}. Учёт стоимости: КАЖДАЯ завершённая structured-
+    попытка пишется здесь (R1 m8, per-attempt); легаси-попытка после сбоя учтётся своим
+    штатным блоком. Wire-форма схемы — по ФАКТИЧЕСКИ вызываемому провайдеру
+    (WIRE_SHAPE_BY_PROVIDER[...], в т.ч. на фолбэке — Opus Ф1 MINOR#3)."""
+    out: dict = {"resp": None, "sgr": None, "latency_ms": 0,
+                 "provider": None, "model": None, "usage_recorded": False,
+                 "fallback_fired": False, "primary_error": ""}
+    stage = "slice_error"
+    try:
+        reason = _sgr_gate_reason(
+            unified_execute=True, allowed_read=allowed_read, allowed_write=allowed_write,
+            guard_nudge=guard_nudge, stale_pause_note=stale_note, provider_key=provider_key,
+            user_text=user_text)
+        if reason is not None:
+            out["sgr"] = {"active": False, "inactive_reason": reason, "fallback_reason": None}
+            return out
+        stage = "import_error"
+        from sreda.runtime import react_sgr as _sgr
+        stage = "slice_error"
+        sgr_tools = _sgr.compute_sgr_tools(bound, _TOOL_NAME_ALIASES)
+        if not sgr_tools:
+            # CR R2 Opus MINOR#3: пустой срез ≠ раздутый — раздельные лейблы наблюдаемости
+            out["sgr"] = {"active": False, "inactive_reason": "empty_slice",
+                          "fallback_reason": None}
+            return out
+        if len(sgr_tools) > _SGR_MAX_UNION:
+            out["sgr"] = {"active": False, "inactive_reason": "union_size",
+                          "fallback_reason": None}
+            return out
+        stage = "schema_error"
+        shape = _sgr.WIRE_SHAPE_BY_PROVIDER[provider_key]
+        schema = _sgr.build_wire_schema(sgr_tools, shape)
+        # §4: availability-подсказка SGR-вызова — из СРЕЗА (иначе хвост обещает инструменты,
+        # которых нет в схеме); легаси-промпт собирается отдельно и остаётся нетронутым.
+        sgr_msgs = assemble(_unified_availability_directive(sgr_tools),
+                            f"{sp}\n\n{_sgr.SGR_SYSTEM_BLOCK}")
+        _rf = {"type": "json_schema",
+               "json_schema": {"name": "sgr_step", "schema": schema, "strict": True}}
+        stage = "invoke_error"
+        used_provider, used_model = provider_key, model_name
+        _t0 = _time.perf_counter()
+        try:
+            raw = invoke_with_per_call_timeout(
+                llm.bind(response_format=_rf), sgr_msgs,
+                timeout_seconds=timeout_s, provider=provider_key)
+        except Exception as _pe:  # noqa: BLE001 — сетевой сбой/таймаут primary → structured-Оса (§5)
+            fb_shape = _sgr.WIRE_SHAPE_BY_PROVIDER.get(fallback_provider_key or "")
+            if fallback_llm is None or not fb_shape:
+                raise
+            logger.warning("react_sgr: primary structured сбой → structured-фолбэк %s",
+                           fallback_provider_key, exc_info=True)
+            # CR R1 sol MINOR: телеметрия попытки primary (PII-free: только тип ошибки) —
+            # llm_calls не должен скрывать сбой Mercury и повторную попытку.
+            out["fallback_fired"], out["primary_error"] = True, type(_pe).__name__
+            _rf_fb = {"type": "json_schema",
+                      "json_schema": {"name": "sgr_step", "strict": True,
+                                      "schema": _sgr.build_wire_schema(sgr_tools, fb_shape)}}
+            raw = invoke_with_per_call_timeout(
+                fallback_llm.bind(response_format=_rf_fb), sgr_msgs,
+                timeout_seconds=timeout_s, provider=fallback_provider_key)
+            used_provider, used_model = fallback_provider_key, fallback_model_name
+        out["latency_ms"] = int((_time.perf_counter() - _t0) * 1000)
+        # per-attempt учёт завершённой structured-попытки (guarded — учёт не валит ход)
+        try:
+            _p, _c = _extract_usage(raw)
+            _record_react_usage(
+                bind=(session.get_bind() if session is not None else None),
+                tenant_id=tenant_id, provider_key=used_provider, model=used_model,
+                prompt_tokens=_p, completion_tokens=_c, run_id=run_id)
+            out["usage_recorded"] = True
+        except Exception:  # noqa: BLE001
+            logger.warning("react_sgr: usage handling failed", exc_info=True)
+        stage = "invalid_response"
+        _content = raw.content if isinstance(raw.content, str) else str(raw.content)
+        decision = _sgr.parse_sgr_reply(_content, getattr(raw, "tool_calls", None), sgr_tools)
+        stage = "convert_error"
+        ai_msg = _sgr.decision_to_aimessage(decision)
+        out.update(resp=ai_msg, provider=used_provider, model=used_model)
+        out["sgr"] = {"active": True, "inactive_reason": None, "fallback_reason": None,
+                      **_sgr.decision_trace_fields(decision, tenant_id=tenant_id)}
+        return out
+    except Exception:  # noqa: BLE001 — ЕДИНАЯ fail-open граница: любой сбой → легаси
+        logger.warning("react_sgr: сбой SGR-участка (%s) → легаси тем же проходом",
+                       stage, exc_info=True)
+        out["resp"] = None
+        out["sgr"] = {"active": False, "inactive_reason": None, "fallback_reason": stage}
+        return out
+
+
 # #376: in-process dedup diff-нотификаций владельцу — ОДИНАКОВОЕ расхождение (тот же кортеж
 # доменов/вида) повторно в течение TTL не шлём; РАЗНЫЕ проходят все («вся разница» соблюдена).
 # Лёгкий dict, НЕ durable: канал best-effort по решению владельца 2026-07-15 («не строить
@@ -3337,6 +3520,9 @@ def _build_graph(llm: Any, all_tools: list, *,
         # поток отброшен обёрткой). Идентичность+ошибку primary кладём в наблюдательный трейс (#192),
         # чтобы дашборд стоимости НЕ выглядел так, будто primary не вызывался/был бесплатным.
         _primary_provider, _primary_model, _primary_error = "", "", ""
+        # #383 Ф2: состояние SGR-шага этого прохода (инициализация ДО интент-развилки —
+        # финальный учёт/трейс читают их на обеих ветках; chat/fact SGR не касается).
+        _sgr_field, _sgr_done, _sgr_usage_done = None, False, False
         # #285 B4: eff уже нормализован (_effective_intent → "task" на unified), поэтому единый путь
         # chat/fact-ветку не берёт БЕЗ отдельного guard здесь — «одна персона» гарантирована в источнике
         # eff (согласовано с run_tools/route/caps/guard, Codex high+medium R1 MAJOR).
@@ -3454,61 +3640,103 @@ def _build_graph(llm: Any, all_tools: list, *,
             # шлём в ХВОСТ отдельным сообщением после истории (свежесть → лучше следование). OFF (дефолт) →
             # легаси: дописываем в sp (порядок sp→nudge→section) — byte-identical откат.
             # #285 B4: на unified ВСЕГДА user-role хвост (OFF-ветка system-append запрещена — кеш-префикс цел).
-            if _tail_directives_enabled() or state.get("unified_execute"):
-                _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
-                                          budget=_compact_budget(), summary=history_summary)
-                _tail = [d for d in (nudge, _avail, _sec, _recur, _stale) if d]  # #333: _recur после _sec
-                # #298: время ПЕРЕД директивами #247 — директива остаётся ПОСЛЕДНЕЙ инструкцией
-                # хвоста. #356 R2 (субагент): якорь ОДИН на промпт — когда директива уйдёт
-                # ОТДЕЛЬНЫМ trailing-user (хвост истории = assistant/tool: guard/форс-проход),
-                # время кладёт ТА ветка; сюда — только когда его понесёт последний user истории.
-                _trailing356 = bool(_tail) and not (
-                    _msgs and isinstance(_msgs[-1], HumanMessage))
-                if time_tail_line and not _trailing356:
-                    _msgs = _append_time_tail(_msgs, time_tail_line)
-                if _tail:
-                    _directive = "\n\n".join(_tail)
-                    # #247 (R1 MAJOR Codex high+medium): директива РОЛЬЮ user — OpenAI-совместимые провайдеры
-                    # (Mercury/Оса) принимают user в конце ВСЕГДА; трейлинг system после истории/tool —
-                    # непроверенный контракт. Приклеиваем к последнему user-сообщению (без двойного user);
-                    # иначе (хвост = tool/assistant, напр. guard-нудж после refusal) — отдельным user.
-                    if _msgs and isinstance(_msgs[-1], HumanMessage):
-                        _msgs = [*_msgs[:-1],
-                                 HumanMessage(content=f"{_msgs[-1].content}\n\n{_directive}")]
-                    elif _pre_exec376:
-                        # #376 v2 (самопроверка 2026-07-16: 4/8 глитчей нарастали с историей):
-                        # на pre-exec ходе хвост = НАША пара (Tool) — служебный хвост отдельной
-                        # user-репликой ПОСЛЕ результата модель принимает за реплику юзера
-                        # («Поняла, буду опираться…», «Слушаю, чем могу помочь?»). Клеим хвост
-                        # к последнему НАСТОЯЩЕМУ Human (вопрос юзера прямо над парой) — пара
-                        # остаётся замыкающей, инструкции внутри вопроса. Якорь времени — в том
-                        # же блоке (контракт #298 сохранён: время идёт с директивой).
-                        _tt = (f"{time_tail_line}\n\n{_directive}"
-                               if time_tail_line else _directive)
-                        _msgs = _glue376_tail_to_last_human(_msgs, _tt)
-                    else:
-                        # #356 R1 субагент CRITICAL: директива отдельным trailing-user
-                        # (хвост = assistant/tool: guard-нудж после refusal ИЛИ форс
-                        # свежести после пересказа) ОБЯЗАНА нести якорь времени - иначе
-                        # последняя инструкция хода без «Сейчас …» (класс #298 заново:
-                        # относительные даты на форс-проходе). Порядок время→директива
-                        # (директива - последняя инструкция, контракт #247/#298).
-                        _tt = (f"{time_tail_line}\n\n{_directive}"
-                               if time_tail_line else _directive)
-                        _msgs = [*_msgs, HumanMessage(content=_tt)]
-            else:
+            # #383 Ф2: сборка вынесена в замыкание (логика НЕ менялась — те же ветки #247/#298/#376/#356)
+            # ради ДВУХ prompt-view (§4 плана): legacy_msgs = _assemble_msgs(_avail, sp) — нетронутая
+            # сегодняшняя сборка (фолбэк и OFF получают РОВНО её); sgr_msgs — та же сборка с availability
+            # из sgr_tools и SGR-блоком в системном промпте (строит _sgr_structured_step).
+            def _assemble_msgs(avail_arg, sp_arg):
+                if _tail_directives_enabled() or state.get("unified_execute"):
+                    _m = build_model_input(sp_arg, state["messages"], enabled=_compact_enabled(),
+                                           budget=_compact_budget(), summary=history_summary)
+                    _tail = [d for d in (nudge, avail_arg, _sec, _recur, _stale) if d]  # #333: _recur после _sec
+                    # #298: время ПЕРЕД директивами #247 — директива остаётся ПОСЛЕДНЕЙ инструкцией
+                    # хвоста. #356 R2 (субагент): якорь ОДИН на промпт — когда директива уйдёт
+                    # ОТДЕЛЬНЫМ trailing-user (хвост истории = assistant/tool: guard/форс-проход),
+                    # время кладёт ТА ветка; сюда — только когда его понесёт последний user истории.
+                    _trailing356 = bool(_tail) and not (
+                        _m and isinstance(_m[-1], HumanMessage))
+                    if time_tail_line and not _trailing356:
+                        _m = _append_time_tail(_m, time_tail_line)
+                    if _tail:
+                        _directive = "\n\n".join(_tail)
+                        # #247 (R1 MAJOR Codex high+medium): директива РОЛЬЮ user — OpenAI-совместимые провайдеры
+                        # (Mercury/Оса) принимают user в конце ВСЕГДА; трейлинг system после истории/tool —
+                        # непроверенный контракт. Приклеиваем к последнему user-сообщению (без двойного user);
+                        # иначе (хвост = tool/assistant, напр. guard-нудж после refusal) — отдельным user.
+                        if _m and isinstance(_m[-1], HumanMessage):
+                            _m = [*_m[:-1],
+                                  HumanMessage(content=f"{_m[-1].content}\n\n{_directive}")]
+                        elif _pre_exec376:
+                            # #376 v2 (самопроверка 2026-07-16: 4/8 глитчей нарастали с историей):
+                            # на pre-exec ходе хвост = НАША пара (Tool) — служебный хвост отдельной
+                            # user-репликой ПОСЛЕ результата модель принимает за реплику юзера
+                            # («Поняла, буду опираться…», «Слушаю, чем могу помочь?»). Клеим хвост
+                            # к последнему НАСТОЯЩЕМУ Human (вопрос юзера прямо над парой) — пара
+                            # остаётся замыкающей, инструкции внутри вопроса. Якорь времени — в том
+                            # же блоке (контракт #298 сохранён: время идёт с директивой).
+                            _tt = (f"{time_tail_line}\n\n{_directive}"
+                                   if time_tail_line else _directive)
+                            _m = _glue376_tail_to_last_human(_m, _tt)
+                        else:
+                            # #356 R1 субагент CRITICAL: директива отдельным trailing-user
+                            # (хвост = assistant/tool: guard-нудж после refusal ИЛИ форс
+                            # свежести после пересказа) ОБЯЗАНА нести якорь времени - иначе
+                            # последняя инструкция хода без «Сейчас …» (класс #298 заново:
+                            # относительные даты на форс-проходе). Порядок время→директива
+                            # (директива - последняя инструкция, контракт #247/#298).
+                            _tt = (f"{time_tail_line}\n\n{_directive}"
+                                   if time_tail_line else _directive)
+                            _m = [*_m, HumanMessage(content=_tt)]
+                    return _m
+                _sp_local = sp_arg
                 if nudge:  # транзиентная подсказка guard — дописываем к промпту на ОДИН проход
-                    sp = f"{sp}\n\n{nudge}"
+                    _sp_local = f"{_sp_local}\n\n{nudge}"
                 if _sec:
-                    sp = f"{sp}\n\n{_sec}"
+                    _sp_local = f"{_sp_local}\n\n{_sec}"
                 if _recur:  # #333: легаси-ветка (#247 OFF) — симметрично _sec
-                    sp = f"{sp}\n\n{_recur}"
+                    _sp_local = f"{_sp_local}\n\n{_recur}"
                 # #194: компакция истории как prompt-view. OFF → [SystemMessage(sp), *messages] (как было).
                 # Канон state["messages"] не мутируется. #232: summary= durable-выжимка (потребление).
-                _msgs = build_model_input(sp, state["messages"], enabled=_compact_enabled(),
-                                          budget=_compact_budget(), summary=history_summary)
+                _m = build_model_input(_sp_local, state["messages"], enabled=_compact_enabled(),
+                                       budget=_compact_budget(), summary=history_summary)
                 if time_tail_line:  # #298: дата+время эфемерным хвостом (легаси-режим #247)
-                    _msgs = _append_time_tail(_msgs, time_tail_line)
+                    _m = _append_time_tail(_m, time_tail_line)
+                return _m
+
+            _msgs = _assemble_msgs(_avail, sp)
+            # #383 Ф2: SGR-шаг за флагом (гейт-функция + детерминированные условия §2B) —
+            # structured-вызов ВМЕСТО bind_tools; любой сбой/неактивность → легаси ниже с
+            # НЕТРОНУТЫМ _msgs (две prompt-view §4). OFF/не-канарейка: ветка не исполняется
+            # и react_sgr не импортируется (изоляция OFF, R1 sol M7).
+            if state.get("unified_execute") and _sgr_planner_for(tenant_id):
+                _sgr_out = _sgr_structured_step(
+                    bound=bound,
+                    allowed_read=state.get("router_allowed_read_domains"),
+                    allowed_write=state.get("router_allowed_write_domains"),
+                    guard_nudge=nudge or "", stale_note=_stale or "",
+                    assemble=_assemble_msgs, sp=sp,
+                    llm=llm, fallback_llm=fallback_llm,
+                    provider_key=provider_key,
+                    fallback_provider_key=_FALLBACK_PROVIDER_KEY,
+                    fallback_model_name=_fallback_model_name, model_name=_model_name,
+                    timeout_s=_react_timeout_s, tenant_id=tenant_id, session=session,
+                    run_id=state.get("turn_key") or "",
+                    user_text=_last_human_text(state["messages"]))
+                _sgr_field = _sgr_out["sgr"]
+                if _sgr_out["fallback_fired"]:
+                    # CR R1 sol MINOR + R2 оба (не терять на «оба structured упали → легаси»):
+                    # телеметрия structured-фолбэка — В ОБЩИЕ trace-поля БЕЗУСЛОВНО, как
+                    # легаси-фолбэк (#159/#184): попытка primary не должна выглядеть
+                    # «не вызывался». Легаси-инвок ниже при СВОЁМ фолбэке перепишет
+                    # primary_* своими значениями (последняя ошибка побеждает).
+                    _fallback_fired = True
+                    _primary_provider, _primary_model = provider_key, _model_name
+                    _primary_error = _sgr_out["primary_error"]
+                if _sgr_out["resp"] is not None:
+                    resp = _sgr_out["resp"]
+                    _latency_ms = _sgr_out["latency_ms"]
+                    _used_provider, _used_model = _sgr_out["provider"], _sgr_out["model"]
+                    _sgr_done, _sgr_usage_done = True, bool(_sgr_out["usage_recorded"])
             # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
             #   (1) учёт пишем на ФАКТИЧЕСКИ отработавший provider_key/model — Оса при срабатывании
             #       запаса, не Mercury (иначе таблица «расход по провайдерам» врёт — R1 MAJOR);
@@ -3520,40 +3748,46 @@ def _build_graph(llm: Any, all_tools: list, *,
             #       ронял бы happy-path primary, хотя Mercury в порядке; ленивость это исключает;
             #   (4) лог с exc_info=True — полный traceback причины перехода.
             # Если запас тоже упал — исключение всплывает во внешний guard handle_turn → safe-reply.
-            _bound_primary = llm.bind_tools(bound)
-            _t0 = _time.perf_counter()  # #192: латентность вызова для трейса
-            if fallback_llm is not None:
-                try:
+            # #383 Ф2: при SGR-успехе (_sgr_done) легаси-вызов НЕ выполняется — resp уже готов;
+            # при любом SGR-сбое/неактивности исполняется ровно прежний путь с нетронутым _msgs.
+            if not _sgr_done:
+                _bound_primary = llm.bind_tools(bound)
+                _t0 = _time.perf_counter()  # #192: латентность вызова для трейса
+                if fallback_llm is not None:
+                    try:
+                        resp = invoke_with_per_call_timeout(
+                            _bound_primary, _msgs, timeout_seconds=_react_timeout_s,
+                            provider=_used_provider)  # #343: per-provider breaker keying
+                    except Exception as _e:  # noqa: BLE001 — INVOKE primary упал/завис (сеть/5xx/таймаут) → запас
+                        logger.warning("react_loop: primary LLM invoke сбой (%s) → fallback Оса",
+                                       type(_e).__name__, exc_info=True)
+                        _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
+                        resp = invoke_with_per_call_timeout(
+                            fallback_llm.bind_tools(bound), _msgs, timeout_seconds=_react_timeout_s,
+                            provider=_FALLBACK_PROVIDER_KEY)  # #343: Оса → СВОЙ breaker-bucket
+                        _used_provider, _used_model = _FALLBACK_PROVIDER_KEY, _fallback_model_name
+                        _fallback_fired = True
+                else:
+                    # Без запаса: зависший primary → LLMCallTimeout всплывает во внешний guard → safe-reply
+                    # (раньше висел бы без ограничения по времени).
                     resp = invoke_with_per_call_timeout(
                         _bound_primary, _msgs, timeout_seconds=_react_timeout_s,
                         provider=_used_provider)  # #343: per-provider breaker keying
-                except Exception as _e:  # noqa: BLE001 — INVOKE primary упал/завис (сеть/5xx/таймаут) → запас
-                    logger.warning("react_loop: primary LLM invoke сбой (%s) → fallback Оса",
-                                   type(_e).__name__, exc_info=True)
-                    _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
-                    resp = invoke_with_per_call_timeout(
-                        fallback_llm.bind_tools(bound), _msgs, timeout_seconds=_react_timeout_s,
-                        provider=_FALLBACK_PROVIDER_KEY)  # #343: Оса → СВОЙ breaker-bucket
-                    _used_provider, _used_model = _FALLBACK_PROVIDER_KEY, _fallback_model_name
-                    _fallback_fired = True
-            else:
-                # Без запаса: зависший primary → LLMCallTimeout всплывает во внешний guard → safe-reply
-                # (раньше висел бы без ограничения по времени).
-                resp = invoke_with_per_call_timeout(
-                    _bound_primary, _msgs, timeout_seconds=_react_timeout_s,
-                    provider=_used_provider)  # #343: per-provider breaker keying
-            _latency_ms = int((_time.perf_counter() - _t0) * 1000)
+                _latency_ms = int((_time.perf_counter() - _t0) * 1000)
         # #175: учёт расхода LLM (деньги/#150) — по КАЖДОМУ вызову узла. Полностью guarded
         # (извлечение+запись): любой сбой учёта НЕ должен ронять ход пользователя.
-        try:
-            _p, _c = _extract_usage(resp)
-            _record_react_usage(
-                bind=(session.get_bind() if session is not None else None),
-                tenant_id=tenant_id, provider_key=_used_provider, model=_used_model,
-                prompt_tokens=_p, completion_tokens=_c,
-                run_id=state.get("turn_key") or "")
-        except Exception:  # noqa: BLE001 — учёт не валит ход
-            logger.warning("react_loop: usage handling failed", exc_info=True)
+        # #383 Ф2: SGR-успех уже учтён per-attempt в _sgr_structured_step (синтетический
+        # AIMessage usage не несёт — здесь бы записались нули поверх реальной записи).
+        if not (_sgr_done and _sgr_usage_done):
+            try:
+                _p, _c = _extract_usage(resp)
+                _record_react_usage(
+                    bind=(session.get_bind() if session is not None else None),
+                    tenant_id=tenant_id, provider_key=_used_provider, model=_used_model,
+                    prompt_tokens=_p, completion_tokens=_c,
+                    run_id=state.get("turn_key") or "")
+            except Exception:  # noqa: BLE001 — учёт не валит ход
+                logger.warning("react_loop: usage handling failed", exc_info=True)
         return {
             "messages": [resp],
             "turn_pass_count": (state.get("turn_pass_count") or 0) + 1,  # анти-петля
@@ -3584,6 +3818,11 @@ def _build_graph(llm: Any, all_tools: list, *,
                 "primary_provider_key": _primary_provider,
                 "primary_model": _primary_model,
                 "primary_error": _primary_error,
+                # #383 Ф2: PII-free сводка SGR-шага — ТОЛЬКО когда флаг+тенант совпали
+                # (иначе ключ отсутствует вовсе: OFF-трейс байт-в-байт; g-068 — своё
+                # поле, смысл общих не меняем). Детекция петель #267: (kind, action,
+                # args_hash) между проходами.
+                **({"sgr": _sgr_field} if _sgr_field is not None else {}),
             }],
         }
 
