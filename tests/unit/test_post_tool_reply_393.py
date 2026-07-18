@@ -1,0 +1,294 @@
+"""#393 — филлер вместо отчёта о сделанном на пост-tool проходах («сделала, но сказала не то»).
+
+Класс #376. На ходу с УСПЕШНЫМ мутирующим act финальная реплика ОБЯЗАНА называть результат
+(имя списка + для add сами пункты), а не отписку/дамп. Вариант владельца D:
+  1) заземление голоса — перед финальным проходом инжектим чистую человеческую сводку результата;
+  2) страховка — если реплика всё равно не называет результат, подменяем детерминированной
+     заземлённой репликой (тёплый шаблон), точка финализации handle_turn (прецедент _declined_reply).
+Фикс PATH-AGNOSTIC (легаси + unified), НЕ гейтится _unified_execute_for.
+
+Прод-репро (tenant_max_40921122, 18.07, SGR OFF, guard_scope=legacy):
+  A. «Добавь в список Дача грабли, лопату и перчатки» → add_checklist_items ok → «Хорошо, приняла
+     к сведению.» (филлер, БД корректна).
+  B. «Удали список Дача» → confirm → «да» → archive_checklist ok → «Вот твои списки дел: …»
+     (дамп чужих списков вместо «убрала Дачу»); филлер именно на resumed/пост-tool проходе.
+"""
+from __future__ import annotations
+
+from uuid import uuid4
+
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+from sreda.runtime import react_loop
+from sreda.runtime.react_loop import handle_turn
+from sreda.runtime.react_result_report import (
+    collect_successful_writes,
+    fallback_reply,
+    grounding_note,
+    reply_grounds_result,
+)
+from sreda.services.checklists import ChecklistService
+from tests.unit.conftest import seed_telegram_user
+
+
+# ─────────────────────────── синтетика для чистых функций ───────────────────────────
+
+def _ai_call(name: str, args: dict, cid: str = "c1") -> AIMessage:
+    return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": cid}])
+
+
+def _tm(content: str, *, name: str = "add_checklist_items", cid: str = "c1",
+        kind: str | None = "ok") -> ToolMessage:
+    art = {"result_kind": kind} if kind else None
+    return ToolMessage(content=content, name=name, tool_call_id=cid, artifact=art)
+
+
+_OKV2_ADD = ('okv2:added:{"added_count":3,"duplicate_count":0,'
+             '"checklist_id":"checklist_' + "a" * 24 + '",'
+             '"created":["грабли","лопату","перчатки"]}')
+
+
+def _add_msgs() -> list:
+    return [
+        HumanMessage(content="Добавь в список Дача грабли, лопату и перчатки"),
+        _ai_call("add_checklist_items",
+                 {"list_id_or_title": "Дача", "items": ["грабли", "лопату", "перчатки"]}),
+        _tm(_OKV2_ADD),
+    ]
+
+
+def _archive_msgs() -> list:
+    return [
+        HumanMessage(content="Удали список Дача"),
+        _ai_call("archive_checklist", {"list_id_or_title": "Дача"}),
+        _tm("ok:archived:checklist_" + "a" * 24, name="archive_checklist"),
+    ]
+
+
+# ─────────────────────────── collect_successful_writes ───────────────────────────
+
+def test_collect_add_names_list_and_items_393():
+    acts = collect_successful_writes(_add_msgs())
+    assert len(acts) == 1, acts
+    assert acts[0].target == "Дача"
+    assert set(acts[0].items) >= {"грабли", "лопату", "перчатки"}
+
+
+def test_collect_archive_names_target_393():
+    acts = collect_successful_writes(_archive_msgs())
+    assert len(acts) == 1 and acts[0].target == "Дача" and acts[0].items == ()
+
+
+def test_collect_excludes_confirm_decline_393():
+    """МУТ-guard: на confirm-ОТКАЗе обёртка вернула «Хорошо, не трогаю.» с result_kind=ok —
+    это НЕ успех (нет ok:/okv2: префикса). Иначе отменённый archive → ложный успех (хуже филлера)."""
+    msgs = [HumanMessage(content="Удали список Дача"),
+            _ai_call("archive_checklist", {"list_id_or_title": "Дача"}),
+            _tm("Хорошо, не трогаю.", name="archive_checklist")]
+    assert collect_successful_writes(msgs) == ()
+
+
+def test_collect_excludes_error_result_393():
+    """МУТ-guard: error:not_found (список не найден) — не успех."""
+    msgs = [HumanMessage(content="Удали список Дача"),
+            _ai_call("archive_checklist", {"list_id_or_title": "Дача"}),
+            _tm("error:not_found: 'Дача'", name="archive_checklist")]
+    assert collect_successful_writes(msgs) == ()
+
+
+def test_collect_excludes_pure_read_393():
+    """Чистое чтение (list_checklists) — не мутирующий act, не заземляем."""
+    msgs = [HumanMessage(content="какие у меня списки"),
+            _ai_call("list_checklists", {}),
+            _tm("Кино; Поход", name="list_checklists")]
+    assert collect_successful_writes(msgs) == ()
+
+
+def test_collect_scopes_to_current_turn_393():
+    """Окно — после ПОСЛЕДНЕГО HumanMessage: прошлоходовая запись не считается."""
+    msgs = [HumanMessage(content="добавь в дача грабли"),
+            _ai_call("add_checklist_items", {"list_id_or_title": "Дача", "items": ["грабли"]}),
+            _tm(_OKV2_ADD),
+            HumanMessage(content="спасибо")]
+    assert collect_successful_writes(msgs) == ()
+
+
+# ─────────────────────────── reply_grounds_result (детектор) ───────────────────────────
+
+def test_detector_add_filler_not_grounded_393():
+    acts = collect_successful_writes(_add_msgs())
+    assert reply_grounds_result("Хорошо, приняла к сведению.", acts) is False
+
+
+def test_detector_add_named_items_grounded_393():
+    acts = collect_successful_writes(_add_msgs())
+    assert reply_grounds_result("Добавила грабли, лопату и перчатки.", acts) is True
+
+
+def test_detector_add_morphology_tolerant_393():
+    """Устойчивость к морфологии (класс #180): «грабли/лопата/перчатки» в другой форме — назван."""
+    acts = collect_successful_writes(_add_msgs())
+    assert reply_grounds_result("Записала грабли, лопата и перчатки в Дачу.", acts) is True
+
+
+def test_detector_archive_dump_not_grounded_393():
+    """Repro-B: дамп ЧУЖИХ списков не называет «Дача» → не заземлён."""
+    acts = collect_successful_writes(_archive_msgs())
+    assert reply_grounds_result(
+        "Вот твои списки дел: Кино, Поход, Дела на сегодня.", acts) is False
+
+
+def test_detector_archive_named_grounded_393():
+    acts = collect_successful_writes(_archive_msgs())
+    assert reply_grounds_result("Убрала список «Дача».", acts) is True
+
+
+# ─────────────────────────── fallback_reply / grounding_note ───────────────────────────
+
+def _assert_clean_user_text(txt: str) -> None:
+    low = txt.lower()
+    assert "—" not in txt, f"длинное тире запрещено: {txt!r}"
+    assert "checklist_" not in low and "okv2" not in low, f"тех-данные в тексте: {txt!r}"
+    assert "list=" not in low and "id=" not in low, f"сырые аргументы: {txt!r}"
+    # без англицизмов/латиницы в отправляемом тексте
+    assert not any("a" <= c <= "z" for c in low), f"латиница в тексте: {txt!r}"
+
+
+def test_fallback_add_names_result_and_clean_393():
+    acts = collect_successful_writes(_add_msgs())
+    r = fallback_reply(acts)
+    assert "Дача" in r
+    low = r.lower()
+    assert "грабл" in low and "лопат" in low and "перчатк" in low, r
+    _assert_clean_user_text(r)
+
+
+def test_fallback_archive_names_result_and_clean_393():
+    acts = collect_successful_writes(_archive_msgs())
+    r = fallback_reply(acts)
+    assert "Дача" in r
+    _assert_clean_user_text(r)
+
+
+def test_grounding_note_carries_names_393():
+    """Часть 1: сводка для голоса несёт имя списка + пункты (чтобы голос их озвучил)."""
+    note = grounding_note(collect_successful_writes(_add_msgs()))
+    assert "Дача" in note
+    assert "грабл" in note.lower() and "лопат" in note.lower() and "перчатк" in note.lower()
+
+
+# ─────────────────────────── e2e через handle_turn (легаси-путь) ───────────────────────────
+
+class _StubLLM:
+    def __init__(self, scripted: list[AIMessage]) -> None:
+        self._scripted, self._i = scripted, 0
+
+    def bind_tools(self, tools):  # noqa: ANN001
+        return self
+
+    def invoke(self, messages):  # noqa: ANN001
+        msg = self._scripted[min(self._i, len(self._scripted) - 1)]
+        self._i += 1
+        return msg
+
+
+class _CapturingStub(_StubLLM):
+    """Записывает последний вход модели — для проверки инъекции сводки (часть 1)."""
+
+    def __init__(self, scripted: list[AIMessage]) -> None:
+        super().__init__(scripted)
+        self.captured: list = []
+
+    def invoke(self, messages):  # noqa: ANN001
+        self.captured = list(messages)
+        return super().invoke(messages)
+
+
+@pytest.mark.asyncio
+async def test_e2e_add_filler_substituted_names_result_393(db_session):
+    """Repro-A (P0): успешный add + филлер → финал НАЗЫВАЕТ список и пункты (страховка)."""
+    u = seed_telegram_user(db_session); db_session.commit()
+    stub = _StubLLM([
+        AIMessage(content="", tool_calls=[{
+            "name": "add_checklist_items",
+            "args": {"list_id_or_title": "Дача", "items": ["грабли", "лопату", "перчатки"]},
+            "id": "c1"}]),
+        AIMessage(content="Хорошо, приняла к сведению."),  # филлер
+    ])
+    reply = await handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id=f"react:t:{uuid4().hex}", llm=stub,
+        user_text="Добавь в список Дача грабли, лопату и перчатки",
+        inbound_message_id="m1", channel="max")
+    s = str(reply).lower()
+    assert "приняла к сведению" not in s, f"филлер не подменён: {reply!r}"
+    assert "дача" in s, reply
+    assert "грабл" in s and "лопат" in s and "перчатк" in s, reply
+
+
+@pytest.mark.asyncio
+async def test_e2e_archive_resumed_filler_substituted_names_result_393(db_session):
+    """Repro-B (P0): archive через confirm → «да» → филлер-дамп → финал НАЗЫВАЕТ «Дача»."""
+    u = seed_telegram_user(db_session); db_session.commit()
+    # список должен существовать, иначе archive → not_found
+    ChecklistService(db_session).create_list(
+        tenant_id=u.tenant_id, user_id=u.user_id, title="Дача")
+    db_session.commit()
+    thread = f"react:t:{uuid4().hex}"
+    r1 = await handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id, thread_id=thread,
+        llm=_StubLLM([AIMessage(content="", tool_calls=[{
+            "name": "archive_checklist", "args": {"list_id_or_title": "Дача"}, "id": "c1"}])]),
+        user_text="Удали список Дача", inbound_message_id="m1", channel="max")
+    assert "архивир" in str(r1).lower() or "убер" in str(r1).lower(), r1  # confirm-пауза
+    r2 = await handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id, thread_id=thread,
+        llm=_StubLLM([AIMessage(content="Вот твои списки дел: Кино, Поход, Дела на сегодня.")]),
+        user_text="да", inbound_message_id="m2", channel="max")
+    s = str(r2).lower()
+    assert "кино" not in s and "поход" not in s, f"дамп чужих списков не подменён: {r2!r}"
+    assert "дача" in s, r2
+
+
+@pytest.mark.asyncio
+async def test_e2e_grounded_voice_not_substituted_393(db_session):
+    """Негативный контроль (#121): голос НАЗВАЛ результат → НЕ подменяем (не убить живость)."""
+    u = seed_telegram_user(db_session); db_session.commit()
+    voiced = "Готово, добавила в «Дача»: грабли, лопату и перчатки. Что-нибудь ещё?"
+    stub = _StubLLM([
+        AIMessage(content="", tool_calls=[{
+            "name": "add_checklist_items",
+            "args": {"list_id_or_title": "Дача", "items": ["грабли", "лопату", "перчатки"]},
+            "id": "c1"}]),
+        AIMessage(content=voiced),
+    ])
+    reply = await handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id=f"react:t:{uuid4().hex}", llm=stub,
+        user_text="Добавь в список Дача грабли, лопату и перчатки",
+        inbound_message_id="m1", channel="max")
+    assert "что-нибудь ещё" in str(reply).lower(), f"живой голос подменён: {reply!r}"
+
+
+@pytest.mark.asyncio
+async def test_e2e_grounding_note_injected_into_model_input_393(db_session):
+    """Часть 1: перед финальным проходом сводка результата (имя+пункты) попадает во ВХОД модели."""
+    u = seed_telegram_user(db_session); db_session.commit()
+    stub = _CapturingStub([
+        AIMessage(content="", tool_calls=[{
+            "name": "add_checklist_items",
+            "args": {"list_id_or_title": "Дача", "items": ["грабли", "лопату", "перчатки"]},
+            "id": "c1"}]),
+        AIMessage(content="Хорошо, приняла к сведению."),
+    ])
+    await handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id=f"react:t:{uuid4().hex}", llm=stub,
+        user_text="Добавь в список Дача грабли, лопату и перчатки",
+        inbound_message_id="m1", channel="max")
+    blob = "\n".join(str(getattr(m, "content", "")) for m in stub.captured)
+    # отличительный маркер именно НАШЕЙ сводки (имена «Дача»/«грабли» и так в истории —
+    # проверяем, что инжектнут grounding_note, а не просто присутствие имён).
+    assert "успешно выполнила" in blob, "grounding_note не инжектнут во вход финального прохода"
+    assert "Дача" in blob and "грабл" in blob.lower(), blob

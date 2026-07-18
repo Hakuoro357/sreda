@@ -2152,6 +2152,13 @@ def _freshness_gate_enabled() -> bool:
     return bool(get_settings().react_freshness_gate_enabled)
 
 
+def _post_tool_report_enabled() -> bool:
+    """#393: kill-switch заземления реплики на результат мутирующего act (default ON; OFF = откат
+    без деплоя, g-065). Гейтит ОБЕ части: grounding_note (chat) + страховку (финализация)."""
+    from sreda.config.settings import get_settings
+    return bool(get_settings().react_post_tool_report_enabled)
+
+
 def _unified_enabled() -> bool:
     """#285 Фаза A: флаг единого пути. OFF (дефолт) → полиси-код на пути не исполняется вовсе."""
     from sreda.config.settings import get_settings
@@ -3636,6 +3643,21 @@ def _build_graph(llm: Any, all_tools: list, *,
             _avail = _unified_availability_directive(bound) if state.get("unified_execute") else None
             # #stale: директива грациозного возврата к протухшему вопросу (только unified, только когда стоит)
             _stale = state.get("stale_pause_note") if state.get("unified_execute") else None
+            # #393 (класс #376): заземление голоса — если предыдущий проход УСПЕШНО исполнил
+            # мутирующий act, кладём чистую человеческую сводку результата (имя списка + пункты) в
+            # контекст, чтобы живой голос (#121) озвучил её ТЕПЛО, назвав имена. PATH-AGNOSTIC (обе
+            # ветви _assemble_msgs). collect_* отсекает confirm-отказ/no-op/error и чистые чтения →
+            # на первом проходе (записи ещё нет) и на не-write ходах note пустой (само-гейт).
+            _ground393 = ""
+            if _post_tool_report_enabled():
+                try:
+                    from sreda.runtime.react_result_report import (
+                        collect_successful_writes as _csw393,
+                        grounding_note as _gn393,
+                    )
+                    _ground393 = _gn393(_csw393(state["messages"]))
+                except Exception:  # noqa: BLE001 — подсказка best-effort, ход не роняем
+                    logger.warning("react_loop: grounding note (#393) failed", exc_info=True)
             # #247: кеш-дисциплина. ON → системный промпт СТАБИЛЕН (кеш-префикс цел), динамику (nudge+section)
             # шлём в ХВОСТ отдельным сообщением после истории (свежесть → лучше следование). OFF (дефолт) →
             # легаси: дописываем в sp (порядок sp→nudge→section) — byte-identical откат.
@@ -3648,7 +3670,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                 if _tail_directives_enabled() or state.get("unified_execute"):
                     _m = build_model_input(sp_arg, state["messages"], enabled=_compact_enabled(),
                                            budget=_compact_budget(), summary=history_summary)
-                    _tail = [d for d in (nudge, avail_arg, _sec, _recur, _stale) if d]  # #333: _recur после _sec
+                    # #393: _ground393 в хвост (последняя инструкция — «назови результат»); само-гейт пустотой
+                    _tail = [d for d in (nudge, avail_arg, _sec, _recur, _stale, _ground393) if d]  # #333: _recur после _sec
                     # #298: время ПЕРЕД директивами #247 — директива остаётся ПОСЛЕДНЕЙ инструкцией
                     # хвоста. #356 R2 (субагент): якорь ОДИН на промпт — когда директива уйдёт
                     # ОТДЕЛЬНЫМ trailing-user (хвост истории = assistant/tool: guard/форс-проход),
@@ -3695,6 +3718,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                     _sp_local = f"{_sp_local}\n\n{_sec}"
                 if _recur:  # #333: легаси-ветка (#247 OFF) — симметрично _sec
                     _sp_local = f"{_sp_local}\n\n{_recur}"
+                if _ground393:  # #393: сводка результата — и в легаси-ветке (#247 OFF), симметрично _sec/_recur
+                    _sp_local = f"{_sp_local}\n\n{_ground393}"
                 # #194: компакция истории как prompt-view. OFF → [SystemMessage(sp), *messages] (как было).
                 # Канон state["messages"] не мутируется. #232: summary= durable-выжимка (потребление).
                 _m = build_model_input(_sp_local, state["messages"], enabled=_compact_enabled(),
@@ -5452,6 +5477,27 @@ async def handle_turn(
         # вопроса паузы (_pending_q, снят ДО инвока), не из LLM/tool-output (Codex high #321 R2).
         if _declined_confirm:
             text = _declined_reply(_pending_q)
+        # #393 (класс #376): СТРАХОВКА от филлера — если после УСПЕШНОГО мутирующего act финальная
+        # реплика НЕ называет результат (отписка «приняла к сведению» / мисроут-дамп), подменяем
+        # детерминированной заземлённой репликой (тёплый шаблон с именами, fallback_reply). Часть 1
+        # (grounding_note в chat) уже помогла голосу назвать результат — здесь ловим оставшиеся
+        # промахи. PATH-AGNOSTIC (НЕ гейтится _unified_execute_for: issue P0 «все тенанты», репро на
+        # легаси). Success-детект по артефакту (result_kind ok + ok:/okv2: префикс) → confirm-ОТКАЗ
+        # («Хорошо, не трогаю.») сюда НЕ попадает; _declined_confirm-текст (unified) не трогаем (elif).
+        elif _post_tool_report_enabled():
+            try:
+                from sreda.runtime.react_result_report import (
+                    collect_successful_writes,
+                    fallback_reply,
+                    reply_grounds_result,
+                )
+                _writes393 = collect_successful_writes(result.get("messages") or [])
+                if _writes393 and not reply_grounds_result(text, _writes393):
+                    _fb393 = fallback_reply(_writes393)
+                    if _fb393:
+                        text = _fb393
+            except Exception:  # noqa: BLE001 — заземление best-effort, ход пользователя не роняем
+                logger.warning("react_loop: post-tool report (#393) failed", exc_info=True)
         reply = _Reply(_postformat(text) or "Готово.")
         # #192: финал → done + структура. ВЕСЬ блок под флагом И guarded (R1 CRITICAL Codex high):
         # collect_tool_calls/HMAC/json НЕ должны выполняться при OFF (спящий прод) и НЕ должны ронять

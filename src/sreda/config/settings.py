@@ -616,6 +616,16 @@ class Settings(BaseSettings):
     react_freshness_gate_enabled: bool = Field(
         default=True, validation_alias="SREDA_REACT_FRESHNESS_GATE"
     )
+    # #393: заземление финальной реплики на РЕЗУЛЬТАТ успешного мутирующего действия
+    # (класс #376 «сделала, но сказала не то»). ON (дефолт) = фикс активен: (1) grounding_note
+    # инжектится в контекст перед финальным проходом (голос озвучит имена тепло, #121);
+    # (2) страховка — если реплика всё равно не называет результат, подменяем детерминированной
+    # заземлённой репликой (fallback_reply) в финализации handle_turn. PATH-AGNOSTIC (легаси И
+    # unified, НЕ гейтится _unified_execute_for — issue P0 «все тенанты», репро на легаси).
+    # OFF = kill-switch БЕЗ деплоя (g-065): реплики снова полностью модель-сочинённые.
+    react_post_tool_report_enabled: bool = Field(
+        default=True, validation_alias="SREDA_REACT_POST_TOOL_REPORT"
+    )
     # #197: провайдер рассуждающей модели для chat/fact-пути (eval #173 → deepseek-v4-flash). Строится
     # через get_chat_llm(provider=...). Недоступен/мисконфиг → fail-open в task (Фредди), scope web-only.
     react_preflight_chat_provider: str = Field(
