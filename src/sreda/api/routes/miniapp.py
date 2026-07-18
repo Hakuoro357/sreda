@@ -212,6 +212,32 @@ def _require_miniapp_auth(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                     detail=f"signup_blocked:{exc.reason}",
                 )
+            except IntegrityError:
+                # Audit 2026-07-18 (api-admin #6): race-recovery в паритет с
+                # MAX-веткой ниже (Codex R3 MAJOR). Mini-app при первой
+                # загрузке параллельно fire'ит 4-5 fetch'ей — все попадают
+                # сюда для нового TG-юзера (Mini App открыт до /start).
+                # Параллельные INSERT'ы получают IntegrityError → catch +
+                # rollback + re-resolve вместо generic 500 provision_failed
+                # (иначе первое открытие приложения новым TG-юзером показывало
+                # «Не удалось загрузить данные» до retry).
+                session.rollback()
+                logger.info(
+                    "miniapp auth: lazy provision race for tg=%s — "
+                    "another request created tenant первым, re-resolving",
+                    account_id,
+                )
+                resolved = resolve_tenant_from_telegram_id(session, account_id)
+                if resolved is None:
+                    # Резолв failed even after rollback — что-то еще
+                    # сломано (не race), пропускаем как provision_failed.
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="provision_failed_after_race",
+                    )
+                tenant_id, user_id = resolved
+                # skip the rest of the new-user branch (logging, checks)
+                onboarding = None
             except Exception:
                 session.rollback()
                 logger.exception(
@@ -222,18 +248,22 @@ def _require_miniapp_auth(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="provision_failed",
                 )
-            logger.info(
-                "miniapp auth: lazily provisioned tg=%s tenant=%s user=%s new=%s",
-                account_id, onboarding.tenant_id, onboarding.user_id,
-                onboarding.is_new_user,
-            )
-            if onboarding.tenant_id is None or onboarding.user_id is None:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="provision_incomplete",
+            # Skip block если race-fallback уже set'нул tenant_id/user_id
+            # (onboarding=None означает что provision сделал другой
+            # parallel request — как в MAX-ветке ниже).
+            if onboarding is not None:
+                logger.info(
+                    "miniapp auth: lazily provisioned tg=%s tenant=%s user=%s new=%s",
+                    account_id, onboarding.tenant_id, onboarding.user_id,
+                    onboarding.is_new_user,
                 )
-            tenant_id = onboarding.tenant_id
-            user_id = onboarding.user_id
+                if onboarding.tenant_id is None or onboarding.user_id is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="provision_incomplete",
+                    )
+                tenant_id = onboarding.tenant_id
+                user_id = onboarding.user_id
         else:
             tenant_id, user_id = resolved
             # #138 Ф5-5c: soft-delete гейт + last_bot_key-штамп существующего юзера —
@@ -577,14 +607,22 @@ async def client_diagnostic(request: Request) -> dict:
         body = await request.json()
     except Exception:
         body = {}
+    # Audit 2026-07-18 (api-admin #2): НЕ логируем body целиком — это
+    # unauthenticated endpoint, произвольный внешний клиент заливал бы любой
+    # объёмный/произвольный контент в warning-лог (log forging, раздувание).
+    # Оставляем только allowlist known-полей, каждое — обрезанное.
+    def _clip(v, limit=200):
+        s = repr(v)
+        return s if len(s) <= limit else s[:limit] + "..."
+
     logger.warning(
-        "miniapp client-diagnostic: reason=%r has_tg=%r hash_keys=%r ua=%r ip=%s body=%r",
-        (body.get("reason") if isinstance(body, dict) else None),
-        (body.get("has_tg") if isinstance(body, dict) else None),
-        (body.get("hash_keys") if isinstance(body, dict) else None),
-        (body.get("ua") if isinstance(body, dict) else None),
+        "miniapp client-diagnostic: reason=%s has_tg=%s hash_keys=%s ua=%s ip=%s extra_keys=%s",
+        _clip(body.get("reason") if isinstance(body, dict) else None),
+        _clip(body.get("has_tg") if isinstance(body, dict) else None),
+        _clip(body.get("hash_keys") if isinstance(body, dict) else None),
+        _clip(body.get("ua") if isinstance(body, dict) else None),
         request.client.host if request.client else "?",
-        body,
+        _clip(sorted(body.keys()) if isinstance(body, dict) else type(body).__name__),
     )
     return {"ok": True}
 
@@ -831,6 +869,14 @@ def subscribe(
     # DeprecatedPlanError; surface it as 400 deprecated_plan for the Mini App.
     if not plan.is_active:
         raise HTTPException(status_code=400, detail="deprecated_plan")
+    # Audit 2026-07-18 (api-admin #10): generic-guard в паритет с каталогом
+    # /plans (который фильтрует планы отключённых фич) — прямой POST
+    # /subscribe с известным plan_key retired-фичи не должен проходить.
+    # Сейчас retired-фичи покрыты tombstone _EDS_PLAN_KEYS выше; guard —
+    # hardening на будущий retirement. Ответ — тот же disabled-tombstone
+    # (200, no mutation), что и для EDS.
+    if is_feature_disabled(plan.feature_key):
+        return {"ok": False, "message": DISABLED_FEATURE_MESSAGE}
     try:
         result = billing.start_simple_subscription(ctx.tenant_id, plan_key)
     except DeprecatedPlanError as exc:

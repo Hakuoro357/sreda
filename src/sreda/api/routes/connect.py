@@ -5,10 +5,8 @@ from html import escape
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
-from sqlalchemy.orm import Session
 
 from sreda.api.deps import enforce_connect_rate_limit
-from sreda.db.session import get_db_session
 
 router = APIRouter(tags=["connect"])
 logger = logging.getLogger(__name__)
@@ -26,10 +24,9 @@ _EDS_DISABLED_PAGE_MESSAGE = "Это умение отключено."
     response_class=HTMLResponse,
     dependencies=[Depends(enforce_connect_rate_limit)],
 )
-def open_eds_connect_form(
-    token: str,
-    session: Session = Depends(get_db_session),
-) -> HTMLResponse:
+def open_eds_connect_form(token: str) -> HTMLResponse:
+    # Аудит 2026-07-18 (api-admin #12): tombstone не тянет DB-сессию —
+    # обработчик только отдаёт статичную tombstone-страницу.
     return HTMLResponse(_render_error_page(_EDS_DISABLED_PAGE_MESSAGE), status_code=200)
 
 
@@ -38,11 +35,7 @@ def open_eds_connect_form(
     response_class=HTMLResponse,
     dependencies=[Depends(enforce_connect_rate_limit)],
 )
-async def submit_eds_connect_form(
-    token: str,
-    request: Request,
-    session: Session = Depends(get_db_session),
-) -> HTMLResponse:
+async def submit_eds_connect_form(token: str, request: Request) -> HTMLResponse:
     return HTMLResponse(_render_error_page(_EDS_DISABLED_PAGE_MESSAGE), status_code=200)
 
 

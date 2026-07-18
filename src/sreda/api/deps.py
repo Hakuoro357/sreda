@@ -59,10 +59,23 @@ def _miniapp_limiter() -> InMemoryRateLimiter:
     )
 
 
+@lru_cache(maxsize=1)
+def _max_limiter() -> InMemoryRateLimiter:
+    # MAX webhook: параметры зеркалим у TG (тот же класс messenger-webhook
+    # трафика), но bucket отдельный — флуд одного канала не душит другой
+    # (аудит 2026-07-18 api-admin #3 / svc-security #9).
+    settings = get_settings()
+    return InMemoryRateLimiter(
+        max_requests=settings.rate_limit_telegram_max_requests,
+        window_seconds=settings.rate_limit_telegram_window_seconds,
+    )
+
+
 def reset_rate_limiters() -> None:
     _connect_limiter.cache_clear()
     _telegram_limiter.cache_clear()
     _miniapp_limiter.cache_clear()
+    _max_limiter.cache_clear()
 
 
 def _client_ip(request: Request) -> str:
@@ -102,6 +115,17 @@ def enforce_miniapp_rate_limit(request: Request) -> None:
     key = _client_ip(request)
     if not limiter.check(key):
         logger.warning("miniapp rate-limit hit for %s", key)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="rate_limited",
+        )
+
+
+def enforce_max_rate_limit(request: Request) -> None:
+    limiter = _max_limiter()
+    key = _client_ip(request)
+    if not limiter.check(key):
+        logger.warning("max webhook rate-limit hit for %s", key)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="rate_limited",

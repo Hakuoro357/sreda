@@ -72,6 +72,9 @@ class UserRow:
     # Дата регистрации = tenants.created_at (момент создания аккаунта).
     # Formatted UTC через _fmt_dt (как approved_at); None → "—".
     registered_at: str | None = None
+    # #187: True = tenant soft-deleted (deleted_at NOT NULL) — admin UI
+    # показывает бейдж «удалён» + кнопку restore вместо мутаций.
+    is_deleted: bool = False
 
 
 @dataclass
@@ -94,6 +97,10 @@ def get_all_users(session: Session) -> list[UserRow]:
     # Sort key: newest tenants float to the top of the table.
     tenants_created_at: dict[str, datetime | None] = {
         t.id: _ensure_utc(t.created_at) for t in tenant_rows
+    }
+    # #187: признак soft-delete для admin UI (бейдж + restore-кнопка).
+    tenants_deleted: dict[str, bool] = {
+        t.id: t.deleted_at is not None for t in tenant_rows
     }
     users = session.query(User).all()
 
@@ -158,6 +165,7 @@ def get_all_users(session: Session) -> list[UserRow]:
                 is_pending=approved_at is None,
                 welcome_v2_status=welcome_v2_status,
                 registered_at=_fmt_dt(tenants_created_at.get(u.tenant_id)),
+                is_deleted=tenants_deleted.get(u.tenant_id, False),
             )
         )
     # Newest tenants first. None goes to the end.

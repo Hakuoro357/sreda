@@ -21,6 +21,7 @@ import logging
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
 
+from sreda.api.deps import enforce_max_rate_limit
 from sreda.config.settings import get_settings
 from sreda.services.max_inbound import handle_max_update
 from sreda.services.webhook_security import (
@@ -79,7 +80,13 @@ def _verify_max_secret(
 @router.post(
     "/webhook",
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(_verify_max_secret)],
+    # Dependency order mirrors the TG webhook: rate-limit first (cheap reject
+    # of hostile traffic), then the secret check. Паритет с TG
+    # (аудит 2026-07-18 api-admin #3 / svc-security #9).
+    dependencies=[
+        Depends(enforce_max_rate_limit),
+        Depends(_verify_max_secret),
+    ],
 )
 async def max_webhook(
     payload: dict,

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timedelta
+from ipaddress import ip_address
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -26,6 +28,8 @@ from sreda.config.settings import get_settings
 from sreda.db.session import privileged_session
 
 _MSK_TZ = ZoneInfo("Europe/Moscow")
+
+logger = logging.getLogger(__name__)
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
@@ -203,11 +207,28 @@ _LOGIN_COOKIE_KW = dict(
 )
 
 
+def _is_trusted_proxy(host: str) -> bool:
+    """Доверенный ingress-peer: loopback (nginx на той же VDS) или private-LAN.
+    Непарсящийся host (например TestClient «testclient») → НЕ доверенный."""
+    try:
+        ip = ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private
+
+
 def _login_client_ip(request: Request) -> str:
+    """Client IP для rate-limit login-challenge'ей.
+
+    X-Forwarded-For принимаем ТОЛЬКО от доверенного proxy (loopback/private
+    peer — nginx на той же машине / LAN-ingress). Иначе при прямом доступе к
+    app атакующий ротирует XFF и обходит per-IP rate-limit challenge'ей
+    (аудит 2026-07-18 svc-security #5)."""
+    peer = request.client.host if request.client else ""
     xff = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    if xff:
+    if xff and _is_trusted_proxy(peer):
         return xff
-    return request.client.host if request.client else "?"
+    return peer or "?"
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -952,7 +973,7 @@ def admin_traces(
     request: Request,
     tail: int = Query(default=50, ge=1, le=500),
     min_total_ms: int = Query(default=0, ge=0, le=600_000),
-    user_id: str = Query(default="", max_length=64, regex=r"^[a-zA-Z0-9_]*$"),
+    user_id: str = Query(default="", max_length=64, pattern=r"^[a-zA-Z0-9_]*$"),
     principal: AdminPrincipal = Depends(require_admin_token),
     session=Depends(_get_session),
 ):
@@ -1037,7 +1058,7 @@ def admin_tenant_reset(
 ):
     """Full tenant reset: delete subscriptions, skill states, all events,
     outbox — as if the user just registered."""
-    from sreda.db.models.billing import TenantSubscription  # noqa: keep cycles/orders
+    from sreda.db.models.billing import TenantSubscription  # keep cycles/orders
     from sreda.db.models.core import OutboxMessage, Tenant
     from sreda.db.models.inbound_event import InboundEvent
     from sreda.db.models.skill_platform import TenantSkillConfig, TenantSkillState
@@ -1048,51 +1069,72 @@ def admin_tenant_reset(
     if tenant is None:
         return HTMLResponse(f"Tenant {tenant_id} not found", status_code=404)
 
+    # #187 (аудит 2026-07-18 api-admin #8): soft-deleted тенант НЕ мутируем —
+    # инвариант «нет мутаций удалённого», тот же гейт, что is_tenant_active
+    # на пользовательских путях (miniapp/channel-link). Tenant уже загружен →
+    # проверяем флаг напрямую.
+    if tenant.deleted_at is not None:
+        return RedirectResponse(
+            url="/admin/users?reset=err&msg=tenant_deleted",
+            status_code=303,
+        )
+
     d: dict[str, int] = {}
 
     # #181 Фаза B: EDS Monitor полностью ретайрен — connect-слой
     # (connect_sessions / tenant_eds_accounts) и его secure_records дропнуты
     # миграцией; reset их больше не чистит.
 
-    # Events and outbox
-    d["inbound_events"] = session.query(InboundEvent).filter_by(
-        tenant_id=tenant_id
-    ).delete()
-    d["outbox"] = session.query(OutboxMessage).filter_by(
-        tenant_id=tenant_id
-    ).delete()
-
-    # Subscriptions
-    d["subscriptions"] = session.query(TenantSubscription).filter_by(
-        tenant_id=tenant_id
-    ).delete()
-
-    # Skill states and configs
-    d["skill_states"] = session.query(TenantSkillState).filter_by(
-        tenant_id=tenant_id
-    ).delete()
-    d["skill_configs"] = session.query(TenantSkillConfig).filter_by(
-        tenant_id=tenant_id
-    ).delete()
-
     # 152-ФЗ Часть 2: audit log admin reset action до финального commit'а,
     # чтобы запись попала в одну транзакцию с deletes.
     from sreda.services.audit import audit_event
 
-    audit_event(
-        session,
-        actor_type="admin",
-        actor_id=principal.actor_id,
-        action="admin.tenant.reset",
-        resource_type="tenant",
-        resource_id=tenant_id,
-        metadata={
-            "deleted_counts": {k: v for k, v in d.items() if v > 0},
-        },
-        commit=False,
-    )
+    try:
+        # Events and outbox
+        d["inbound_events"] = session.query(InboundEvent).filter_by(
+            tenant_id=tenant_id
+        ).delete()
+        d["outbox"] = session.query(OutboxMessage).filter_by(
+            tenant_id=tenant_id
+        ).delete()
 
-    session.commit()
+        # Subscriptions
+        d["subscriptions"] = session.query(TenantSubscription).filter_by(
+            tenant_id=tenant_id
+        ).delete()
+
+        # Skill states and configs
+        d["skill_states"] = session.query(TenantSkillState).filter_by(
+            tenant_id=tenant_id
+        ).delete()
+        d["skill_configs"] = session.query(TenantSkillConfig).filter_by(
+            tenant_id=tenant_id
+        ).delete()
+
+        audit_event(
+            session,
+            actor_type="admin",
+            actor_id=principal.actor_id,
+            action="admin.tenant.reset",
+            resource_type="tenant",
+            resource_id=tenant_id,
+            metadata={
+                "deleted_counts": {k: v for k, v in d.items() if v > 0},
+            },
+            commit=False,
+        )
+
+        session.commit()
+    except Exception:  # noqa: BLE001
+        # rollback-guard (аудит 2026-07-18 api-admin #5): при сбое — откат и
+        # ЧЕСТНЫЙ err-редирект, а не «reset=ok» на пустом commit'е после
+        # чужого rollback.
+        session.rollback()
+        logger.exception("admin tenant reset failed: tenant_id=%s", tenant_id)
+        return RedirectResponse(
+            url="/admin/users?reset=err&msg=reset_failed",
+            status_code=303,
+        )
 
     parts = [f"{k}={v}" for k, v in d.items() if v > 0]
     msg = "+".join(parts) if parts else "nothing+to+delete"
@@ -1328,16 +1370,26 @@ async def admin_tenant_suspend(
     # Phase 2 (Codex MINOR fix 2026-05-07): bump updated_at для audit/debug.
     from datetime import UTC as _UTC
     sub.updated_at = datetime.now(_UTC)
-    audit_event(
-        session,
-        actor_type="admin",
-        actor_id=principal.actor_id,
-        action="admin.tenant.suspend",
-        resource_type="tenant",
-        resource_id=tenant_id,
-        commit=False,
-    )
-    session.commit()
+    try:
+        audit_event(
+            session,
+            actor_type="admin",
+            actor_id=principal.actor_id,
+            action="admin.tenant.suspend",
+            resource_type="tenant",
+            resource_id=tenant_id,
+            commit=False,
+        )
+        session.commit()
+    except Exception:  # noqa: BLE001
+        # rollback-guard (аудит 2026-07-18 api-admin #5): честный
+        # err-редирект вместо ложного «ok».
+        session.rollback()
+        logger.exception("admin tenant suspend failed: tenant_id=%s", tenant_id)
+        return RedirectResponse(
+            url="/admin/users?suspend=err&msg=suspend_failed",
+            status_code=303,
+        )
     return RedirectResponse(
         url=f"/admin/users?suspend=ok&tenant={tenant_id}",
         status_code=303,
@@ -1373,16 +1425,26 @@ async def admin_tenant_unsuspend(
     # Phase 2 (Codex MINOR fix 2026-05-07): bump updated_at для audit/debug.
     from datetime import UTC as _UTC
     sub.updated_at = datetime.now(_UTC)
-    audit_event(
-        session,
-        actor_type="admin",
-        actor_id=principal.actor_id,
-        action="admin.tenant.unsuspend",
-        resource_type="tenant",
-        resource_id=tenant_id,
-        commit=False,
-    )
-    session.commit()
+    try:
+        audit_event(
+            session,
+            actor_type="admin",
+            actor_id=principal.actor_id,
+            action="admin.tenant.unsuspend",
+            resource_type="tenant",
+            resource_id=tenant_id,
+            commit=False,
+        )
+        session.commit()
+    except Exception:  # noqa: BLE001
+        # rollback-guard (аудит 2026-07-18 api-admin #5): честный
+        # err-редирект вместо ложного «ok».
+        session.rollback()
+        logger.exception("admin tenant unsuspend failed: tenant_id=%s", tenant_id)
+        return RedirectResponse(
+            url="/admin/users?unsuspend=err&msg=unsuspend_failed",
+            status_code=303,
+        )
     return RedirectResponse(
         url=f"/admin/users?unsuspend=ok&tenant={tenant_id}",
         status_code=303,

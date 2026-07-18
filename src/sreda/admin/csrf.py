@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import secrets
 
 from fastapi import Form, Header, HTTPException, Request
 from urllib.parse import urlsplit
@@ -33,22 +34,29 @@ _BIND_COOKIES = ("admin_tg_session", "admin_session")
 # Item G: single-fire warning when no real secret is configured.
 _WARNED_NO_SECRET = False
 
+# Аудит 2026-07-18 (api-admin #11): статический литерал «sreda-admin-csrf»
+# заменён на per-process random — одинаковый fallback-secret на всех deploy'ях
+# был молчаливой деградацией энтропии. Побочка: csrf-токены инвалидируются при
+# рестарте процесса — безвредно (GET re-render'ит форму со свежим токеном);
+# в prod всегда задан encryption_key → этот путь там инертен.
+_FALLBACK_SECRET: bytes | None = None
+
 
 def _secret() -> bytes:
-    global _WARNED_NO_SECRET
+    global _WARNED_NO_SECRET, _FALLBACK_SECRET
     s = get_settings()
     base = getattr(s, "encryption_key", None) or getattr(s, "admin_token", None)
     if not base:
-        # Prod always has encryption_key → inert there; но молча падать на
-        # литерал небезопасно (одинаковый secret на всех deploy'ях). Логируем раз.
         if not _WARNED_NO_SECRET:
             logger.warning(
                 "admin CSRF: neither encryption_key nor admin_token is set — "
-                "falling back to a STATIC csrf secret (dev-only, insecure). "
-                "Set SREDA_ENCRYPTION_KEY in prod."
+                "using a PER-PROCESS random csrf secret (dev-only; tokens "
+                "invalidate on process restart). Set SREDA_ENCRYPTION_KEY in prod."
             )
             _WARNED_NO_SECRET = True
-        base = "sreda-admin-csrf"
+        if _FALLBACK_SECRET is None:
+            _FALLBACK_SECRET = secrets.token_bytes(32)
+        return _FALLBACK_SECRET
     return str(base).encode("utf-8")
 
 

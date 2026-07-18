@@ -628,6 +628,16 @@
     return escHtml(s).replace(/"/g, "&quot;");
   }
 
+  // Audit 2026-07-18 (api-admin #1 MAJOR): href из внешних данных
+  // (recipe source_url — LLM-экстракт из чужих веб-страниц) — разрешаем
+  // только http(s). Без фильтра `javascript:...` в href выполнил бы JS
+  // по клику в контексте Mini App (тот же stored-XSS без единой кавычки).
+  function safeHttpUrl(u) {
+    if (!u) return "";
+    var s = String(u).trim();
+    return /^https?:\/\//i.test(s) ? s : "";
+  }
+
   function findPlan(planKey) {
     if (!state.plans || !state.plans.plans) return null;
     for (var i = 0; i < state.plans.plans.length; i++) {
@@ -751,7 +761,7 @@
       var route = it.route || "";
       // Route is a URL fragment like "#/reminders"; _nav expects a path.
       var path = route.replace(/^#/, "");
-      html += '<div class="card card-link" onclick="window._nav(\'' + escHtml(path) + '\')">';
+      html += '<div class="card card-link" onclick="window._nav(\'' + escAttr(path) + '\')">';
       html += '<div>';
       html += '<div class="card-title">' + escHtml(it.icon || "") + " " + escHtml(it.title) + '</div>';
       if (it.subtitle) {
@@ -813,7 +823,7 @@
       html += '<div class="section-title">Активные</div>';
       for (var i = 0; i < activeSkills.length; i++) {
         var sk = activeSkills[i];
-        html += '<div class="card card-link" onclick="window._nav(\'/skill/' + escHtml(sk.feature_key) + '\')">';
+        html += '<div class="card card-link" onclick="window._nav(\'/skill/' + escAttr(sk.feature_key) + '\')">';
         html += '<div>';
         html += '<div class="card-title">' + escHtml(sk.icon || "") + " " + escHtml(sk.title);
         html += ' <span class="status-active">\u2713</span></div>';
@@ -942,7 +952,7 @@
         html += '<div class="card-subtitle">' + escHtml(formatRRule(r.recurrence_rule)) + '</div>';
       }
       html += '<div class="text-right mt-8">';
-      html += '<button class="btn btn-danger btn-small" onclick="window._cancelReminder(\'' + escHtml(r.id) + '\', \'' + escHtml(r.title).replace(/\'/g, "") + '\')">Отменить</button>';
+      html += '<button class="btn btn-danger btn-small" onclick="window._cancelReminder(\'' + escAttr(r.id) + '\', \'' + escAttr(r.title).replace(/\'/g, "") + '\')">Отменить</button>';
       html += '</div>';
       html += '</div>';
     }
@@ -1310,15 +1320,15 @@
       if (it.category !== currentCategory) {
         currentCategory = it.category;
         var label = _SHOPPING_CATEGORY_LABELS[currentCategory] || currentCategory;
-        html += '<div class="section-title" data-shop-cat="' + escHtml(currentCategory) + '">' + escHtml(label) + '</div>';
+        html += '<div class="section-title" data-shop-cat="' + escAttr(currentCategory) + '">' + escHtml(label) + '</div>';
       }
       // data-shop-item lets the handler find the card for surgical
       // remove-with-animation instead of a full re-render.
-      html += '<div class="card shop-item" data-shop-item="' + escHtml(it.id) + '" data-shop-cat="' + escHtml(it.category) + '" ';
+      html += '<div class="card shop-item" data-shop-item="' + escAttr(it.id) + '" data-shop-cat="' + escAttr(it.category) + '" ';
       html += 'style="display:flex;align-items:center;gap:12px;transition:opacity 0.25s ease,max-height 0.35s ease,padding 0.35s ease,margin 0.35s ease;overflow:hidden;max-height:200px">';
       // Check-box — tap to mark bought. CSS transitions give a brief
       // "check" animation before the card collapses.
-      html += '<div class="shop-check" onclick="window._markShoppingBought(\'' + escHtml(it.id) + '\',this)" ';
+      html += '<div class="shop-check" onclick="window._markShoppingBought(\'' + escAttr(it.id) + '\',this)" ';
       html += 'style="width:28px;height:28px;border:2px solid var(--tg-theme-hint-color,#aaa);';
       html += 'border-radius:6px;flex-shrink:0;cursor:pointer;display:flex;align-items:center;justify-content:center;';
       html += 'color:transparent;font-weight:bold;font-size:18px;transition:background 0.2s,color 0.2s,border-color 0.2s">';
@@ -1332,7 +1342,7 @@
       }
       html += '</div>';
       // Delete icon
-      html += '<div onclick="window._deleteShoppingItem(\'' + escHtml(it.id) + '\')" ';
+      html += '<div onclick="window._deleteShoppingItem(\'' + escAttr(it.id) + '\')" ';
       html += 'style="font-size:20px;color:var(--tg-theme-destructive-text-color,#e04b4b);cursor:pointer;padding:4px 8px">\u00d7</div>';
       html += '</div>';
     }
@@ -1784,11 +1794,11 @@
       }
       html += '<div class="text-right mt-8" style="display:flex;gap:8px;justify-content:flex-end">';
       html += '<button class="btn btn-small" ' +
-              'onclick="window._editFamilyMember(\'' + escHtml(m.id) + '\')" ' +
+              'onclick="window._editFamilyMember(\'' + escAttr(m.id) + '\')" ' +
               'style="background:rgba(0,0,0,0.06);padding:4px 10px;font-size:16px;min-width:34px" ' +
               'title="Редактировать">\u270F\uFE0F</button>';  // ✏️
       html += '<button class="btn btn-danger btn-small" ' +
-              'onclick="window._deleteFamilyMember(\'' + escHtml(m.id) + '\', \'' + escHtml(m.name).replace(/\'/g, "") + '\')" ' +
+              'onclick="window._deleteFamilyMember(\'' + escAttr(m.id) + '\', \'' + escAttr(m.name).replace(/\'/g, "") + '\')" ' +
               'style="padding:4px 10px;font-size:16px;min-width:34px" ' +
               'title="Удалить">\uD83D\uDDD1\uFE0F</button>';  // 🗑️
       html += '</div>';
@@ -1840,7 +1850,7 @@
     for (var i = 0; i < items.length; i++) {
       var r = items[i];
       var badge = _RECIPE_SOURCE_BADGES[r.source] || "❔";
-      html += '<div class="card card-link" onclick="window._nav(\'/recipes/' + escHtml(r.id) + '\')">';
+      html += '<div class="card card-link" onclick="window._nav(\'/recipes/' + escAttr(r.id) + '\')">';
       html += '<div>';
       html += '<div class="card-title">' + badge + " " + escHtml(r.title) + '</div>';
       var sub = "на " + r.servings + " чел";
@@ -1875,7 +1885,13 @@
     html += '<h1>' + badge + ' ' + escHtml(detail.title) + '</h1>';
     html += '<div class="card-subtitle">Источник: ' + escHtml(sourceLabel);
     if (detail.source_url) {
-      html += ' <a href="' + escHtml(detail.source_url) + '">ссылка</a>';
+      // Audit 2026-07-18 (api-admin #1 MAJOR): source_url — LLM-экстракт из
+      // внешней страницы. Рендерим ссылку только для http(s) (javascript:
+      // и прочие scheme отбрасываем) и экранируем через escAttr.
+      var _srcUrl = safeHttpUrl(detail.source_url);
+      if (_srcUrl) {
+        html += ' <a href="' + escAttr(_srcUrl) + '">ссылка</a>';
+      }
     }
     html += '</div>';
     html += '<div class="card-subtitle">На ' + detail.servings + ' чел</div>';
@@ -1918,7 +1934,7 @@
     }
 
     html += '<div class="mt-16 text-right">';
-    html += '<button class="btn btn-danger btn-small" onclick="window._deleteRecipe(\'' + escHtml(detail.id) + '\', \'' + escHtml(detail.title).replace(/\'/g, "") + '\')">Удалить</button>';
+    html += '<button class="btn btn-danger btn-small" onclick="window._deleteRecipe(\'' + escAttr(detail.id) + '\', \'' + escAttr(detail.title).replace(/\'/g, "") + '\')">Удалить</button>';
     html += '</div>';
 
     return html;
@@ -1980,9 +1996,9 @@
         }
         html += '</div>';
         if (acc.status === "scheduled_for_disconnect") {
-          html += '<button class="btn btn-success btn-small" onclick="window._edsRestore(\'' + escHtml(acc.id) + '\')">Вернуть</button>';
+          html += '<button class="btn btn-success btn-small" onclick="window._edsRestore(\'' + escAttr(acc.id) + '\')">Вернуть</button>';
         } else {
-          html += '<button class="btn btn-danger btn-small" onclick="window._edsCancel(\'' + escHtml(acc.id) + '\', \'' + escHtml(acc.login_masked) + '\')">Отвязать</button>';
+          html += '<button class="btn btn-danger btn-small" onclick="window._edsCancel(\'' + escAttr(acc.id) + '\', \'' + escAttr(acc.login_masked) + '\')">Отвязать</button>';
         }
         html += '</div></div>';
       } else if (sub.is_free_slot) {
@@ -1998,7 +2014,7 @@
         if (sub.slot_type === "free") {
           html += '<div class="text-right mt-8"><button class="btn btn-danger" onclick="window._removeSlot()">Отменить подписку</button></div>';
         } else {
-          html += '<div class="text-right mt-8"><button class="btn btn-danger" onclick="window._cancelEds(\'' + escHtml(sub.cancel_type || "base") + '\')">Отменить подписку</button></div>';
+          html += '<div class="text-right mt-8"><button class="btn btn-danger" onclick="window._cancelEds(\'' + escAttr(sub.cancel_type || "base") + '\')">Отменить подписку</button></div>';
         }
       }
 
@@ -2054,9 +2070,9 @@
     html += '</div>';
 
     if (skill.is_active) {
-      html += '<button class="btn btn-danger mt-8" onclick="window._cancelSkill(\'' + escHtml(featureKey) + '\', \'' + escHtml(skill.plan_key) + '\')">Отключить</button>';
+      html += '<button class="btn btn-danger mt-8" onclick="window._cancelSkill(\'' + escAttr(featureKey) + '\', \'' + escAttr(skill.plan_key) + '\')">Отключить</button>';
     } else {
-      html += '<button class="btn btn-primary mt-8" onclick="window._subscribeSkill(\'' + escHtml(skill.plan_key) + '\', \'' + escHtml(skill.title) + '\', ' + (skill.price_rub || 0) + ')">Подключить</button>';
+      html += '<button class="btn btn-primary mt-8" onclick="window._subscribeSkill(\'' + escAttr(skill.plan_key) + '\', \'' + escAttr(skill.title) + '\', ' + (skill.price_rub || 0) + ')">Подключить</button>';
     }
 
     return html;
@@ -2078,7 +2094,7 @@
 
     for (var i = 0; i < available.length; i++) {
       var p = available[i];
-      html += '<div class="card card-link" onclick="window._nav(\'/catalog/' + escHtml(p.plan_key) + '\')">';
+      html += '<div class="card card-link" onclick="window._nav(\'/catalog/' + escAttr(p.plan_key) + '\')">';
       html += '<div>';
       html += '<div class="card-title">' + escHtml(p.icon || "") + " " + escHtml(p.title) + '</div>';
       html += '<div class="card-subtitle">' + escHtml(p.description) + '</div>';
@@ -2100,7 +2116,7 @@
     var html = '<h1>' + escHtml(plan.title) + '</h1>';
     html += '<div class="description">' + escHtml(plan.description) + '</div>';
     html += '<div class="price-large">' + formatPrice(plan.price_rub) + '</div>';
-    html += '<button class="btn btn-primary" onclick="window._subscribeSkill(\'' + escHtml(plan.plan_key) + '\', \'' + escHtml(plan.title) + '\', ' + (plan.price_rub || 0) + ')">Подключить</button>';
+    html += '<button class="btn btn-primary" onclick="window._subscribeSkill(\'' + escAttr(plan.plan_key) + '\', \'' + escAttr(plan.title) + '\', ' + (plan.price_rub || 0) + ')">Подключить</button>';
 
     return html;
   }
@@ -3074,7 +3090,7 @@
       '<h2 style="margin:0 0 12px 0;font-size:18px">Редактировать: ' + escHtml(member.name) + '</h2>' +
 
       '<label class="card-subtitle" style="display:block;margin:8px 0 4px 0">Имя</label>' +
-      '<input id="_fm_name" type="text" style="' + inputStyle + '" value="' + escHtml(member.name) + '">' +
+      '<input id="_fm_name" type="text" style="' + inputStyle + '" value="' + escAttr(member.name) + '">' +
 
       '<label class="card-subtitle" style="display:block;margin:12px 0 4px 0">Кто</label>' +
       '<select id="_fm_role" style="' + inputStyle + '">' + roleOptions + '</select>' +

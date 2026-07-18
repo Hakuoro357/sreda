@@ -268,6 +268,21 @@ def create_app() -> FastAPI:
                     "admin_session", sess, max_age=86400, path="/admin",
                     httponly=True, samesite="strict", secure=True,
                 )
+        elif request.url.path.startswith("/miniapp"):
+            # Audit 2026-07-18 (cross-security N3): базовый security-набор для
+            # miniapp-ответов (аналог admin-ветки выше). nosniff + no-referrer
+            # (initData живёт в JS/hash и не должна уехать через Referer при
+            # переходе по внешней ссылке — напр. recipe source_url) + no-store
+            # для JSON API с персональными данными. HTML-эндпойнт уже ставит
+            # свои no-store/no-cache — setdefault их не затирает. Полноценный
+            # CSP потребует ухода от inline-handler'ов (nonce) — отдельный
+            # срез; frame-ancestors не ставим осознанно: miniapp работает в
+            # нативных WebView мессенджеров (TG/MAX), где заголовок не
+            # применяется, а при iframe-встраивании MAX мог бы сломать встраивание.
+            response.headers.setdefault("X-Content-Type-Options", "nosniff")
+            response.headers.setdefault("Referrer-Policy", "no-referrer")
+            if request.url.path.startswith("/miniapp/api/"):
+                response.headers.setdefault("Cache-Control", "no-store")
         return response
 
     return app
