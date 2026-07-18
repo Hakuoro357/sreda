@@ -7,10 +7,15 @@ generic-confirm («…Подтверждаешь?») на каждом пунк�
 подтвердил «да» = по калибровочному контракту #285 Фазы A (confirm_resolution=yes на
 ярусе (б)) — зафиксированные промахи сигнала, чистое трение.
 
-Фикс (#389): add_shopping_items — аддитивная, видимая, обратимая операция (позиция
-владельца в issue) → прямой бинд ВСЕГДА (осознанное точечное исключение из пилляра
-«нет молчаливой записи», только этот инструмент). Деструктив shopping
-(remove_*/clear_*) и НЕ доказанные данными семьи/инструменты — под confirm как раньше.
+Фикс (#389, R2): add_shopping_items — аддитивная, видимая, обратимая операция (позиция
+владельца в issue) → прямой бинд при ОТСУТСТВИИ конкурирующего write-домена роутера
+(aw ⊆ write-доменов инструмента; субагент R1 MAJOR: «добавь в список дел купить молоко»
+даёт aw={checklists} → кандидат+confirm примиряет расхождение «роутер vs модель»).
+Осознанное точечное исключение из пилляра «нет молчаливой записи», только этот
+инструмент (двухключевой import-time гвард: реестр + owner-allowlist). Деструктив
+исключение #389 НЕ получает: его candidate-confirm при aw=∅ — прежнее B2-поведение,
+не гарантия этого фикса; при aw={shopping} деструктив идёт штатным прямым ярусом (а),
+где его страхует собственный destructive-confirm (_confirm_wrap).
 """
 
 from __future__ import annotations
@@ -68,9 +73,10 @@ def test_full_phrase_still_direct():
 # ─────────── границы фикса: деструктив и чужие семьи НЕ трогаем ───────────
 
 def test_shopping_destructive_and_edits_still_candidates():
-    """Деструктив/правки shopping НЕ авто-исполняются: remove/clear/update/mark —
-    кандидаты под confirm при allowed_write=∅ (чеклист приёмки #389: ни одна
-    destructive-операция не теряет подтверждение)."""
+    """Деструктив/правки shopping исключение #389 НЕ получают: remove/clear/update/mark
+    при allowed_write=∅ — кандидаты под confirm (прежнее B2-поведение, фикс его не
+    трогает; чеклист приёмки #389: ни одна destructive-операция не теряет
+    подтверждение относительно поведения до фикса)."""
     for name in ("remove_shopping_items", "clear_bought_shopping",
                  "update_shopping_item", "update_shopping_items_category",
                  "mark_shopping_bought"):
@@ -142,3 +148,7 @@ def test_autoexec_registry_guard_mechanism():
         _validate_unified_autoexec_registry(frozenset({"list_shopping"}))  # read-класс
     with pytest.raises(RuntimeError, match="аддитивн"):
         _validate_unified_autoexec_registry(frozenset({"remove_shopping_items"}))  # деструктив
+    # R2 sol MINOR: add_* другого инструмента гвард ловит owner-allowlist'ом —
+    # расширение реестра требует явного решения владельца, не только префикса.
+    with pytest.raises(RuntimeError, match="owner-allowlist"):
+        _validate_unified_autoexec_registry(frozenset({"add_task"}))

@@ -1792,13 +1792,17 @@ def _generic_confirm_wrap(inner: Any) -> Any:
 # aw={checklists}, прямой shopping-write тут противоречил бы роутеру → кандидат+confirm
 # (confirm примиряет расхождение «роутер vs выбор модели», как до #389).
 _UNIFIED_AUTOEXEC_WRITE_TOOLS = frozenset({"add_shopping_items"})
+# Вторая «рука» гварда (R2 sol MINOR): owner-approved allowlist. Расширение реестра выше
+# требует ОДНОВРЕМЕННОЙ правки этого списка — т.е. отдельного осознанного решения владельца
+# с прод-данными; «add_task тоже add_* — пройдёт» больше не проходит (валидатор упадёт).
+_UNIFIED_AUTOEXEC_OWNER_ALLOWLIST = frozenset({"add_shopping_items"})
 
 
 def _validate_unified_autoexec_registry(registry: frozenset | None = None) -> None:
     """#389 R2 (субагент MINOR-1): гвард реестра МЕХАНИЗМОМ, не комментом (прецедент #180).
-    Каждый член: существует в манифесте, op-class == write, имя аддитивно (add_*) —
-    неосторожная будущая правка/опечатка падает на импорте, а не молчит на проде.
-    По образцу _validate_tool_op_metadata (families.py)."""
+    Каждый член: существует в манифесте, op-class == write, имя аддитивно (add_*) И входит
+    в owner-approved allowlist — неосторожная будущая правка/опечатка падает на импорте,
+    а не молчит на проде. По образцу _validate_tool_op_metadata (families.py)."""
     from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST, TOOL_OP_CLASS
     reg = _UNIFIED_AUTOEXEC_WRITE_TOOLS if registry is None else registry
     for n in reg:
@@ -1808,6 +1812,10 @@ def _validate_unified_autoexec_registry(registry: frozenset | None = None) -> No
             raise RuntimeError(f"autoexec-реестр #389: {n!r} не write-класса")
         if not n.startswith("add_"):
             raise RuntimeError(f"autoexec-реестр #389: {n!r} не аддитивный (ожидается add_*)")
+        if n not in _UNIFIED_AUTOEXEC_OWNER_ALLOWLIST:
+            raise RuntimeError(
+                f"autoexec-реестр #389: {n!r} вне owner-allowlist — расширение требует "
+                f"явного решения владельца с прод-данными")
 
 
 _validate_unified_autoexec_registry()
