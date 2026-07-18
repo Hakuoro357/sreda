@@ -43,10 +43,15 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 
 import sqlalchemy as sa
 from alembic import op
+
+# audit 2026-07-18 db-migrations #9: orphan-count уходил через print мимо
+# alembic-лога — переведено на logger (по образцу 20260622_0063).
+logger = logging.getLogger("alembic.runtime.migration")
 
 revision = "20260709_0081"
 down_revision = "20260709_0080"
@@ -182,9 +187,11 @@ def upgrade() -> None:
     n_w = bind.execute(
         sa.text("SELECT count(*) FROM react_checkpoint_write WHERE tenant_id IS NULL")
     ).scalar()
-    print(
-        f"0081 orphans: checkpoint={n_cp} write={n_w} — остаются NULL "
-        "(maintenance-only), карантин/удаление = owner-решение Ф5"
+    logger.info(
+        "0081 orphans: checkpoint=%s write=%s — остаются NULL "
+        "(maintenance-only), карантин/удаление = owner-решение Ф5",
+        n_cp,
+        n_w,
     )
 
 

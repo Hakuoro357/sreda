@@ -18,6 +18,22 @@ from sreda.db.base import Base
 class AgentThread(Base):
     __tablename__ = "agent_threads"
 
+    # UNIQUE на тройку (миграция 20260718_0085; audit 2026-07-18
+    # runtime-core #5 / cross-concurrency FC-2): `_get_or_create_thread`
+    # (`runtime/executor.py`) ищет ровно по (tenant_id, channel_type,
+    # external_chat_id) через `one_or_none()` — дубль строки (гонка
+    # get-or-create без констрейнта) ронял КАЖДЫЙ enqueue_action с
+    # MultipleResultsFound навсегда. Теперь гонка = громкий IntegrityError
+    # вместо необратимого дубля.
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "channel_type",
+            "external_chat_id",
+            name="uq_agent_threads_tenant_channel_chat",
+        ),
+    )
+
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id"), index=True)

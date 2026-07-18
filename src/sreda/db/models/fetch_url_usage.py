@@ -9,7 +9,7 @@ pre-flight (socksio+proxy+TCP-probe PORT2); расход безвозврате�
 `release_tavily`). Это снимает весь класс ошибок refund-классификации (ProxyError vs ConnectError-post-TLS).
 
 Mirror WebSearchUsage: композитный UNIQUE на тройку для атомарного INSERT…ON CONFLICT; дублируем Index в модели,
-чтобы `create_all` в тестах (SQLite) дал тот же констрейнт, что миграция 0070 на проде.
+чтобы `create_all` в тестах (SQLite) дал тот же констрейнт, что миграция 20260630_0073 на проде.
 """
 
 from __future__ import annotations

@@ -1,3 +1,12 @@
 # Migrations
 
-Alembic migration files will live here.
+Alembic migration files live here.
+
+## Ограничение offline-режима (`alembic upgrade --sql`)
+
+Data-миграции `20260427_0027`, `20260427_0028`, `20260428_0029`,
+`20260709_0081` исполняются через `op.get_bind()` и в offline-режиме
+НЕ представимы: прогон `--sql` либо упадёт (0081 требует
+`SREDA_ENCRYPTION_KEY` в env), либо молча сгенерирует DDL без data-шагов.
+Репетиция прод-наката на дампе это ограничение не покрывает — учитывайте
+при верификации (audit 2026-07-18 db-migrations #9).

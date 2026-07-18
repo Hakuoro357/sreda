@@ -55,7 +55,15 @@ NO_RLS_TABLES: frozenset[str] = frozenset({
     "signup_attempts",           # operational: identity пишет журнал попыток без RLS
     "poller_offsets",            # operational: состояние поллеров
     "poller_heartbeats",         # operational: heartbeat поллеров
-    "step_execution_ledger",     # legacy plan-execute, owner-исключение (заморожена)
+    # legacy plan-execute, owner-исключение. НЕ «заморожена» (устаревшее
+    # обоснование, audit 2026-07-18 db-migrations #5): таблица живая —
+    # пишется `runtime/planner/step_ledger.py`, читается recovery.py /
+    # recovery_scanner.py / tool_runtime.py. Колонки tenant_id у неё НЕТ
+    # вообще, поэтому tenant-политика невозможна конструктивно; после флипа
+    # DSN на app-роль строки читаемы/писабельны кросс-тенантно (грант 0078).
+    # Осознанный hardening-пробел: PII там нет (operation_id — opaque,
+    # step_id структурный), легитимные пути ходят по своему execution_id.
+    "step_execution_ledger",
 })
 
 #: Куда sreda_identity имеет INSERT-грант (Ф1, провижн-bundle) — нужна INSERT-политика.

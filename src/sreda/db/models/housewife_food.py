@@ -374,6 +374,17 @@ class MenuPlanItem(Base):
             "menu_plan_id",
             "day_of_week",
         ),
+        # UNIQUE на слот недельной сетки (миграция 20260718_0085; audit
+        # 2026-07-18 svc-housewife #2 / cross-concurrency FC-2): LLM-дубли
+        # создавали две строки одного (day_of_week, meal_type) в одном плане,
+        # после чего `update_item` (`services/housewife_menu.py`) падал на
+        # `one_or_none()` навсегда. Дубль = громкий IntegrityError.
+        UniqueConstraint(
+            "menu_plan_id",
+            "day_of_week",
+            "meal_type",
+            name="uq_menu_plan_items_plan_day_meal",
+        ),
         # #138 Ф3-a: composite-FK гарантирует совпадение tenant_id с родителем.
         ForeignKeyConstraint(
             ["menu_plan_id", "tenant_id"],

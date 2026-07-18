@@ -1,6 +1,7 @@
 from sreda.db.models.admin_alerts import AdminAlertSeen
 from sreda.db.models.admin_auth import AdminLoginChallenge, AdminSession
 from sreda.db.models.admin_dashboard import AdminDashboardSnapshot
+from sreda.db.models.audit import AuditLog
 from sreda.db.models.audit_feed import AuditOutboxEvent, UserDataChangeFeedEvent
 from sreda.db.models.billing import (
     PaymentOrder,
@@ -24,9 +25,11 @@ from sreda.db.models.core import (
     Workspace,
 )
 from sreda.db.models.fetch_url_usage import FetchUrlUsage
+from sreda.db.models.free_tier import FreeTierUsage
 from sreda.db.models.react_checkpoint import ReactCheckpoint, ReactCheckpointWrite
 from sreda.db.models.react_summary import ReactSummary
 from sreda.db.models.react_trace import ReactTurnTrace
+from sreda.db.models.reply_buttons import ReplyButtonCache
 from sreda.db.models.housewife import FamilyMember, FamilyReminder
 from sreda.db.models.housewife_food import (
     MenuPlan,
@@ -36,7 +39,7 @@ from sreda.db.models.housewife_food import (
     ShoppingListItem,
 )
 from sreda.db.models.inbound_event import InboundEvent
-from sreda.db.models.memory import AssistantMemory
+from sreda.db.models.memory import AssistantMemory, MemoryCategory
 from sreda.db.models.message_jobs import MessageJob
 from sreda.db.models.planner import (
     PlannerExecution,
@@ -76,6 +79,7 @@ __all__ = [
     "AuditOutboxEvent",
     "Assistant",
     "AssistantMemory",
+    "AuditLog",
     "ChannelLinkToken",
     "Checklist",
     "ChecklistItem",
@@ -90,9 +94,11 @@ __all__ = [
     "FamilyMember",
     "FamilyReminder",
     "FetchUrlUsage",
+    "FreeTierUsage",
     "InboundEvent",
     "MenuPlan",
     "MenuPlanItem",
+    "MemoryCategory",
     "MessageJob",
     "PlannerExecution",
     "PlannerGap",
@@ -101,6 +107,7 @@ __all__ = [
     "ToolOperationResult",
     "Recipe",
     "RecipeIngredient",
+    "ReplyButtonCache",
     "RuntimeConfig",
     "ShoppingListItem",
     "SubscriptionPlan",

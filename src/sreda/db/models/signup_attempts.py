@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Integer, String
+from sqlalchemy import DateTime, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sreda.db.base import Base
@@ -56,6 +56,17 @@ CHANNEL_MAX = "max"
 
 class SignupAttempt(Base):
     __tablename__ = "signup_attempts"
+
+    # Parity с миграцией 0041 (`ix_signup_attempts_lookup`) — rate-limit
+    # COUNT `SignupAbuseGuard` идёт по (channel, source_id_hash) с окном по
+    # attempted_at; без индекса в create_all-окружениях это полный скан
+    # (дрейф модель↔миграция — audit 2026-07-18 db-migrations #3).
+    __table_args__ = (
+        Index(
+            "ix_signup_attempts_lookup",
+            "channel", "source_id_hash", "attempted_at",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     channel: Mapped[str] = mapped_column(String(16), nullable=False)

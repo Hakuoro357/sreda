@@ -64,8 +64,8 @@ class AssistantMemory(Base):
 
     # "core" | "episodic" — tier values enumerated in repository.
     tier: Mapped[str] = mapped_column(String(16))
-    # #262: пользовательская категория. Финальное состояние = NOT NULL (миграция 0059); save() всегда
-    # резолвит Common, поэтому модель совместима с nullable-окном деплоя (0057→0058→0059). Держим
+    # #262: пользовательская категория. Финальное состояние = NOT NULL (миграция 20260630_0072); save() всегда
+    # резолвит Common, поэтому модель совместима с nullable-окном деплоя (0070→0071→0072). Держим
     # nullable=False в модели, чтобы create_all-тесты НЕ принимали NULL (иначе дрейф модель↔прод, #74).
     # Скоуп факта↔категории гарантирует composite FK выше.
     category_id: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -121,7 +121,7 @@ class MemoryCategory(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     # Без per-column index — лукапы идут по композитному ix_memory_categories_tenant_user (см. __table_args__);
-    # миграция 0057 создаёт только его, поэтому index=True здесь дал бы дрейф create_all↔Postgres (R2).
+    # миграция 20260630_0070 создаёт только его, поэтому index=True здесь дал бы дрейф create_all↔Postgres (R2).
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"))
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
     # 'common' у системной Common; NULL у пользовательских.

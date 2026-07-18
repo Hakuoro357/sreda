@@ -7,9 +7,23 @@ threads of the same tenant (DM + group, MAX + Telegram) process in
 parallel.
 
 Cross-channel idempotency lives in the composite ``UNIQUE (channel,
-external_update_id)`` constraint — Telegram redelivery and equivalent
-MAX retries are both swallowed at INSERT time without ever reaching
-the worker loop.
+external_update_id, bot_key)`` constraint (migration 20260718_0085) —
+Telegram redelivery and equivalent MAX retries are both swallowed at
+INSERT time without ever reaching the worker loop. ``bot_key`` is part
+of the key because Telegram ``update_id`` counters are independent
+per-bot: update 42 of bot ``sreda`` and update 42 of bot ``sreda_home``
+are DIFFERENT events (same defect class as fixed for
+``inbound_messages`` by migration 20260603_0048; audit 2026-07-18
+db-migrations #1).
+
+``message_payload`` хранит ПОЛНЫЙ raw webhook update (текст сообщения,
+имена, chat-данные) — это PII. Шифруется через ``JSONEncryptedString``
+(AES-256-GCM, envelope ``v2:``; legacy plaintext JSON читается
+прозрачно), как и остальные payload'ы переписки в системе (audit
+2026-07-18 cross-security N1). Retention покрыт: терминальные строки
+(done/failed/dead_letter) чистятся в ``maintenance/retention_cleanup.py``
+(``MESSAGE_JOBS_DAYS = 30``, cutoff по ``enqueued_at``, audit-fix
+2026-07-18).
 
 Lease fencing fields (``worker_id`` / ``attempt`` / ``lease_expires_at``)
 back the conditional-UPDATE pattern that prevents a slow original
@@ -30,16 +44,10 @@ from sqlalchemy import (
     UniqueConstraint,
     text as sql_text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.types import JSON
 
 from sreda.db.base import Base
-
-
-# Cross-dialect JSON column type. Postgres dialect uses JSONB (indexable,
-# native operators); SQLite (tests) falls back to TEXT-backed JSON.
-_JSONB = JSON().with_variant(JSONB(), "postgresql")
+from sreda.db.types import JSONEncryptedString
 
 
 class MessageJob(Base):
@@ -55,7 +63,22 @@ class MessageJob(Base):
     thread_id: Mapped[str] = mapped_column(String(64), nullable=False)
     channel: Mapped[str] = mapped_column(String(32), nullable=False)
     external_update_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    message_payload: Mapped[dict] = mapped_column(_JSONB, nullable=False)
+    # Which bot received this update (20260718_0085). NOT NULL + default
+    # ("sreda" = legacy single-bot): production producer
+    # (``workers/message_queue.enqueue_message``) обязан выставлять bot_key
+    # ЯВНО — default это только safety net, чтобы insert без bot_key не
+    # нарушал NOT NULL (тот же контракт, что у ``OutboxMessage.bot_key``).
+    # Без явного bot_key дедуп-ключ снова схлопнет два бота в один
+    # namespace — см. docstring модуля.
+    bot_key: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="sreda",
+        server_default=sql_text("'sreda'"),
+    )
+    # Полный raw webhook update — PII, зашифрован через JSONEncryptedString
+    # (cross-security N1, audit 2026-07-18). ORM отдаёт/принимает dict как
+    # раньше; в БД лежит ``v2:``-шифротекст. Строки, записанные ДО
+    # миграции 0085 (plaintext JSON), читаются прозрачно (envelope-sniffing).
+    message_payload: Mapped[dict] = mapped_column(JSONEncryptedString(), nullable=False)
     status: Mapped[str] = mapped_column(
         String(16),
         nullable=False,
@@ -92,12 +115,15 @@ class MessageJob(Base):
     )
 
     __table_args__ = (
-        # Cross-channel dedup. Telegram redelivery, MAX retry, future
-        # channels — all collapse on the same composite key.
+        # Cross-channel + cross-bot dedup (20260718_0085): Telegram
+        # redelivery, MAX retry, future channels — all collapse on the
+        # same composite key. bot_key обязателен в ключе: update_id
+        # независимы per-bot (см. docstring модуля).
         UniqueConstraint(
             "channel",
             "external_update_id",
-            name="uq_message_jobs_channel_external_update_id",
+            "bot_key",
+            name="uq_message_jobs_channel_bot_update",
         ),
         # Enum check — keeps state machine values honest.
         CheckConstraint(

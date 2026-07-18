@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, Integer, String
+from sqlalchemy import Date, DateTime, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sreda.db.base import Base
@@ -29,6 +29,20 @@ from sreda.db.base import Base
 
 class FreeTierUsage(Base):
     __tablename__ = "free_tier_usage"
+
+    # Композитный UNIQUE на тройку — нужен для UPSERT-pattern в
+    # `services/free_tier._get_or_create`. На проде создаёт миграция 0024
+    # (`ix_free_tier_usage_unique`, unique=True); дублируем в модели,
+    # чтобы `create_all` в тестах (SQLite) давал тот же констрейнт
+    # (дрейф модель↔миграция — audit 2026-07-18 db-migrations #2;
+    # эталон оформления — `web_search.py`).
+    __table_args__ = (
+        Index(
+            "ix_free_tier_usage_unique",
+            "tenant_id", "user_id", "day",
+            unique=True,
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)

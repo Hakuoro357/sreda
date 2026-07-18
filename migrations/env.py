@@ -12,15 +12,16 @@ SRC_DIR = ROOT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from sreda.config.settings import get_settings
-from sreda.db.base import Base
-from sreda.db.models import core as _core_models  # noqa: F401
-import sreda.db.models.plan_library  # noqa: F401  (#135)
-from sreda.db.models import housewife as _housewife_models  # noqa: F401
-from sreda.db.models import skill_platform as _skill_platform_models  # noqa: F401
-from sreda.db.models import user_profile as _user_profile_models  # noqa: F401
-from sreda.db.models import memory as _memory_models  # noqa: F401
-from sreda.db.models import inbound_event as _inbound_event_models  # noqa: F401
+from sreda.config.settings import get_settings  # noqa: E402
+from sreda.db.base import Base  # noqa: E402
+
+# Audit 2026-07-18 db-migrations #4: импортируем ПОЛНЫЙ пакет моделей, а не
+# подмножество — иначе ``Base.metadata`` неполон (~50 таблиц не зарегистрированы)
+# и `alembic --autogenerate`, который периодически запускают для сверки,
+# предлагает drop_table на половину схемы (готовая ловушка). Пакетный
+# ``__init__`` импортирует все модули моделей, включая plan_library (#135),
+# audit и memory (AuditLog/MemoryCategory экспортированы там же).
+import sreda.db.models  # noqa: E402,F401
 
 config = context.config
 

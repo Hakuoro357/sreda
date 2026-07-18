@@ -120,6 +120,23 @@ class User(Base):
         String(64), nullable=True,
     )
 
+    __table_args__ = (
+        # Partial unique: один MAX-аккаунт = один User (миграция
+        # 20260718_0085; audit 2026-07-18 svc-inbound #1 / cross-concurrency
+        # FC-2). Collision-check в `channel_linking.consume_link` идёт без
+        # блокировки — только БД-констрейнт превращает гонку в громкий
+        # IntegrityError вместо тихого дубля (дубль = AmbiguousExternalIdentity
+        # и молчаливый drop MAX-входа навсегда). Partial: TG-only юзеры с
+        # NULL не ограничены. where-clause обязан быть sa_text(), не строкой.
+        Index(
+            "uq_users_max_account_id",
+            "max_account_id",
+            unique=True,
+            postgresql_where=sa_text("max_account_id IS NOT NULL"),
+            sqlite_where=sa_text("max_account_id IS NOT NULL"),
+        ),
+    )
+
 
 class Assistant(Base):
     __tablename__ = "assistants"
@@ -220,7 +237,7 @@ class OutboxMessage(Base):
     # (без ключа) НЕ ограничены — аддитивно, ничего из легаси не схлопывается.
     idempotency_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
-    # #344 F5 — atomic-claim lease (аддитивно, миграция 0083). claim НЕ вводит
+    # #344 F5 — atomic-claim lease (аддитивно, миграция 20260711_0084). claim НЕ вводит
     # новых ЗНАЧЕНИЙ status: строка остаётся 'pending' во время lease. Воркер
     # клеймит строку атомарным UPDATE (claim_token = свой токен, lease_expires_at =
     # now+lease) и коммитит ДО доставки → второй воркер не выберет claimed-строку
@@ -229,7 +246,7 @@ class OutboxMessage(Base):
     # эти поля не читает и доставляет 'pending' как раньше → rollback-safe (§4).
     claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # NB: индекс объявлен в __table_args__ как ЧАСТИЧНЫЙ с ЯВНЫМ именем, совпадающим
-    # с миграцией 0083 (ix_outbox_lease_expires_at). Без index=True на колонке — иначе
+    # с миграцией 20260711_0084 (ix_outbox_lease_expires_at). Без index=True на колонке — иначе
     # create_all создал бы второй, НЕчастичный индекс с другим именем (расхождение
     # metadata↔alembic, autogenerate-churn; R1 MINOR).
     lease_expires_at: Mapped[datetime | None] = mapped_column(
