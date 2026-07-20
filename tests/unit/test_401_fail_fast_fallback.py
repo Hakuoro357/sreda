@@ -38,53 +38,25 @@ def _capture_get_chat_llm(monkeypatch):
     return calls
 
 
-def test_react_primary_fail_fast_when_fallback_available(monkeypatch):
-    """Запас (Оса) доступен → primary строится с max_retries=0 (5xx сразу в фолбэк, без ретрая)."""
-    monkeypatch.setenv("SREDA_REACT_OSA_FALLBACK", "1")
+def test_react_primary_no_failfast_when_has_fallback_omitted(monkeypatch):
+    """Opus MINOR (#180, механизм): has_fallback НЕ передан (None) → БЕЗОПАСНЫЙ дефолт с ретраем
+    (max_retries НЕ ставим), ДАЖЕ если флаг osa ВКЛ. Флаг-only авто-гейт УБРАН: флаг ON без реально
+    построенной Осы дал бы max_retries=0 при недостижимом резерве (transient 5xx → safe-reply без ретраев)."""
+    monkeypatch.setenv("SREDA_REACT_OSA_FALLBACK", "1")  # флаг ВКЛ, но ФАКТ запаса не передан
     st_mod.get_settings.cache_clear()
     calls = _capture_get_chat_llm(monkeypatch)
     try:
-        react_loop.react_primary_llm("inception-mercury2")
+        react_loop.react_primary_llm("inception-mercury2")  # has_fallback опущен → None
     finally:
         st_mod.get_settings.cache_clear()
-    assert calls, "get_chat_llm не вызван"
-    assert calls[-1].get("max_retries") == 0, \
-        f"primary при доступном запасе должен строиться с max_retries=0: {calls[-1]}"
-
-
-def test_react_primary_keeps_retry_when_fallback_off(monkeypatch):
-    """Флаг OFF (запаса нет) → retry primary НЕ трогаем (дефолтный клиентский retry сохранён)."""
-    monkeypatch.delenv("SREDA_REACT_OSA_FALLBACK", raising=False)
-    st_mod.get_settings.cache_clear()
-    calls = _capture_get_chat_llm(monkeypatch)
-    try:
-        react_loop.react_primary_llm("inception-mercury2")
-    finally:
-        st_mod.get_settings.cache_clear()
-    assert calls, "get_chat_llm не вызван"
-    assert "max_retries" not in calls[-1], \
-        f"без запаса retry primary трогать нельзя (последний рубеж): {calls[-1]}"
-
-
-@pytest.mark.parametrize("primary", ["groq-gpt-oss-120b", "groq-gpt-oss-120b-low"])
-def test_react_primary_keeps_retry_when_primary_already_osa(monkeypatch, primary):
-    """primary уже Groq/Оса → запаса нет (Groq+Groq) → retry сохранён (max_retries не форсим)."""
-    monkeypatch.setenv("SREDA_REACT_OSA_FALLBACK", "1")
-    st_mod.get_settings.cache_clear()
-    calls = _capture_get_chat_llm(monkeypatch)
-    try:
-        react_loop.react_primary_llm(primary)
-    finally:
-        st_mod.get_settings.cache_clear()
-    assert calls, "get_chat_llm не вызван"
-    assert "max_retries" not in calls[-1], \
-        f"primary уже Оса — retry не трогаем: {calls[-1]}"
+    assert calls and "max_retries" not in calls[-1], \
+        f"без явного has_fallback fail-fast нельзя (безопасный дефолт с ретраем): {calls[-1] if calls else None}"
 
 
 def test_react_primary_no_failfast_when_fallback_build_fails(monkeypatch):
     """R1 sol+terra MAJOR: has_fallback=False (запас НЕ построился, хоть флаг ON) → retry сохранён.
-    Иначе primary был бы max_retries=0 при НЕДОСТИЖИМОМ резерве → transient 5xx → safe-reply без ретраев."""
-    monkeypatch.setenv("SREDA_REACT_OSA_FALLBACK", "1")
+    Явный False БЬЁТ флаг ON. Иначе primary был бы max_retries=0 при НЕДОСТИЖИМОМ резерве."""
+    monkeypatch.setenv("SREDA_REACT_OSA_FALLBACK", "1")  # флаг ON, но фактически запас не построился
     st_mod.get_settings.cache_clear()
     calls = _capture_get_chat_llm(monkeypatch)
     try:
@@ -96,7 +68,8 @@ def test_react_primary_no_failfast_when_fallback_build_fails(monkeypatch):
 
 
 def test_react_primary_failfast_explicit_has_fallback(monkeypatch):
-    """has_fallback=True (запас реально построен) → max_retries=0, независимо от флага в env."""
+    """has_fallback=True (запас реально построен) → max_retries=0, НЕЗАВИСИМО от флага в env
+    (гейт по ФАКТУ, а не по флагу)."""
     monkeypatch.delenv("SREDA_REACT_OSA_FALLBACK", raising=False)  # даже с флагом «OFF» в env
     st_mod.get_settings.cache_clear()
     calls = _capture_get_chat_llm(monkeypatch)

@@ -519,29 +519,32 @@ def react_primary_llm(provider: str = "", settings: Any = None,
                       *, has_fallback: bool | None = None) -> Any:
     """#401: основной ReAct-LLM (Фредди/Mercury) с fail-fast на серверную ошибку.
 
-    Инцидент 20.07: openai-клиент primary по умолчанию ретраит 5xx (`max_retries=2`, эксп.
-    бэкофф) ВНУТРИ одного `invoke` → на медленно-500-ящем Mercury накопилось ~40с ПОД wall-clock
-    60с перед фолбэком на Осу (которая сама отвечает 3-5с). Когда запас РЕАЛЬНО доступен, строим
-    primary с `max_retries=0`: серверная ошибка/сетевой сбой primary НЕ ретраит сам себя, а СРАЗУ
-    поднимает исключение → ручной try/except в chat-узле уводит ход в фолбэк немедленно.
+    Инцидент 20.07: openai-клиент primary по умолчанию ретраит серверную ошибку (`max_retries=2`,
+    эксп. бэкофф) ВНУТРИ одного `invoke` → на медленно-500-ящем Mercury накопилось ~40с ПОД
+    wall-clock 60с перед фолбэком на Осу (которая сама отвечает 3-5с). Когда запас РЕАЛЬНО построен,
+    строим primary с `max_retries=0`: ошибка primary НЕ ретраит сама себя, а СРАЗУ поднимает
+    исключение → ручной try/except в chat-узле уводит ход в фолбэк немедленно.
 
-    `has_fallback` (R1 sol+terra MAJOR): ФАКТ построенного резерва от вызывающего —
-    `react_fallback_llm(...) is not None`. Гейтим fail-fast по РЕАЛЬНОМУ запасу, а НЕ по флагу:
-    флаг ВКЛ, но Groq-ключа нет → `react_fallback_llm` вернёт None → без этого primary остался бы
-    max_retries=0 при недостижимом резерве (transient 5xx → safe-reply без ретраев). None →
-    авто-гейт по `_react_fallback_available` (флаг+not-Groq) для standalone/back-compat вызовов.
+    NB (осознанный компромисс — decision-log): `max_retries=0` снимает клиентский retry для ВСЕХ
+    классов (5xx И 429/сетевой блип), т.к. openai-клиент не умеет per-status. Для 429/блипа Mercury
+    ход уходит на Осу сразу (best-effort; у Осы свой per-provider breaker #343, своя корзина).
 
-    Без запаса `max_retries` НЕ трогаем — дефолтный клиентский retry остаётся последним рубежом
-    (сетевой блип ЕДИНСТВЕННОГО провайдера ретраить стоит: другого нет). Гейт best-effort: сбой
-    чтения settings → дефолтный retry (безопасная сторона)."""
+    `has_fallback` (R1 sol+terra MAJOR; Opus MINOR): ФАКТ реально построенного резерва от
+    вызывающего — `react_fallback_llm(...) is not None`. **ОБЯЗАТЕЛЕН для fail-fast** — max_retries=0
+    ставим ТОЛЬКО при `has_fallback=True`. `None` (вызывающий не передал факт) → БЕЗОПАСНЫЙ ДЕФОЛТ С
+    РЕТРАЕМ (max_retries НЕ трогаем) + WARNING. Авто-гейт по флагу УБРАН (механизм, не дисциплина
+    вызова #180): флаг osa ВКЛ БЕЗ реально построенной Осы дал бы max_retries=0 при НЕДОСТИЖИМОМ
+    резерве (transient 5xx → safe-reply без ретраев) — ровно дефект, ради которого has_fallback введён.
+    Все прод-call-site передают `has_fallback=(react_fallback_llm(prov) is not None)` явно."""
     from sreda.services.llm import get_chat_llm
     _kw: dict = {}
-    try:
-        _ff = has_fallback if has_fallback is not None else _react_fallback_available(provider, settings)
-        if _ff:
-            _kw["max_retries"] = 0  # #401: 5xx primary не ретраим — сразу фолбэк (запас построен)
-    except Exception:  # noqa: BLE001 — гейт best-effort; сомнение → дефолтный retry клиента
-        logger.warning("react_loop: primary fail-fast gate failed → default retry", exc_info=True)
+    if has_fallback is None:
+        # Безопасный дефолт: без ЯВНОГО факта построенного резерва fail-fast НЕ включаем (иначе можно
+        # молча оставить primary без достижимого фолбэка). Прод-вызовы передают has_fallback всегда.
+        logger.warning("react_loop: react_primary_llm без явного has_fallback → дефолт с ретраем "
+                       "(fail-fast требует has_fallback=True)")
+    elif has_fallback:
+        _kw["max_retries"] = 0  # #401: ошибку primary не ретраим — сразу фолбэк (запас построен)
     return get_chat_llm(provider=provider, settings=settings, **_kw)
 
 
@@ -3591,7 +3594,8 @@ def _build_graph(llm: Any, all_tools: list, *,
         # #401: под-тайминги вызова — раздельно попытка primary / вызов резерва (наблюдаемость
         # под #396; один агрегат latency_ms не давал разложить инцидент 20.07 «primary-ретраи vs
         # фолбэк»). Инициализация ДО развилок: финальный llm_calls-дикт читает их на всех ветках
-        # (chat/fact, task, SGR). None → поле опускается (OFF-трейс и happy-path без резерва чисты).
+        # (chat/fact, task, SGR). primary_latency_ms ставится ВСЕГДА (реальный invoke был);
+        # fallback_latency_ms — ТОЛЬКО когда сработал резерв (иначе опускается: happy-path/OFF-трейс).
         _primary_latency_ms, _fallback_latency_ms = None, None
         # #401 (R1 sol MINOR): длительность SGR-попытки, если она была и упала в легаси — легаси-ветка
         # аккумулирует её в итоговый latency_ms (иначе итог не отражает SGR+легаси). 0 без SGR.
@@ -3934,7 +3938,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                 "latency_ms": _latency_ms, "retries": (1 if _fallback_fired else 0),
                 "fallback_fired": _fallback_fired,
                 # #401: под-тайминги — раздельно попытка primary / вызов резерва (#396). latency_ms
-                # остаётся ИТОГОМ (back-compat). None → поле опускается (OFF/happy-path без резерва).
+                # остаётся ИТОГОМ (back-compat). primary_latency_ms присутствует ВСЕГДА (реальный
+                # вызов); fallback_latency_ms опускается на happy-path (резерв не сработал) и на OFF.
                 **({"primary_latency_ms": _primary_latency_ms} if _primary_latency_ms is not None else {}),
                 **({"fallback_latency_ms": _fallback_latency_ms} if _fallback_latency_ms is not None else {}),
                 "cache_read": _extract_cache_read(resp),  # #230 Срез 0a: наблюдаемость prompt-кеша (не деньги)
