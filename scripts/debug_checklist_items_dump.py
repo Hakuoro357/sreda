@@ -1,37 +1,39 @@
-"""Read-only debug: dump all checklist items для чек-листов инцидента 2026-04-28.
+"""Read-only debug: dump all checklist items для указанных чек-листов
+(диагностика рассинхрона). Без UPDATE/DELETE.
 
-Без UPDATE/DELETE — только чтение для диагностики рассинхрона.
-(Checklist-id'ы нечувствительны; tenant/user id здесь не храним —
-audit 2026-07-18.)
+R1 C9 (2026-07-18): checklist_id'ы больше НЕ захардкожены (были прод-id +
+названия списков в публичном репо) — из argv, fail-fast.
+
+Usage:
+    python scripts/debug_checklist_items_dump.py <checklist_id> [<checklist_id> ...]
 """
+import sys
+
 from sreda.db.session import get_db_session
 from sreda.db.models.checklists import ChecklistItem
 
 
-SHORT = {
-    "checklist_3195dbe3ca87461ba77807fe": "archived: Дела",
-    "checklist_7302d7b66011408d8186335b": "active:   Глобальные дела на даче",
-    "checklist_f08cbbb603ff4dc39c5c4050": "active:   Забрать с дачи",
-}
-
-
-def main() -> None:
+def main(argv: list[str]) -> int:
+    checklist_ids = [a.strip() for a in argv if a.strip()]
+    if not checklist_ids:
+        raise SystemExit(
+            "Usage: debug_checklist_items_dump.py <checklist_id> [<checklist_id> ...]"
+        )
     sess = next(get_db_session())
     items = (
         sess.query(ChecklistItem)
-        .filter(ChecklistItem.checklist_id.in_(SHORT.keys()))
+        .filter(ChecklistItem.checklist_id.in_(checklist_ids))
         .order_by(ChecklistItem.checklist_id, ChecklistItem.position)
         .all()
     )
-    print(f"Total items across all 3 lists: {len(items)}")
-    print()
+    print(f"Total items across {len(checklist_ids)} list(s): {len(items)}\n")
     for it in items:
-        label = SHORT[it.checklist_id]
         print(
-            f"{label} | [{it.status}] pos={it.position} "
+            f"{it.checklist_id} | [{it.status}] pos={it.position} "
             f"created={it.created_at} title={it.title!r}"
         )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main(sys.argv[1:]))

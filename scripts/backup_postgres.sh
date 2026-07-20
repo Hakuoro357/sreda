@@ -32,6 +32,17 @@ DUMP="$DEST/sreda-$DATE.dump"
 # called from cron, so HOME/.pgpass discovery is unreliable.
 export PGPASSFILE="$PGPASSFILE_PATH"
 
+# M18 (R1): под cron окружение пустое → SREDA_BACKUP_OFFSITE_CMD (док велит
+# класть его в /etc/sreda/.env) был всегда пуст, offsite-копия молча не
+# запускалась. Подхватываем env-файл при наличии (set -a экспортит всё),
+# уважая `set -u`. Нет файла → offsite ниже честно скипается с WARN.
+if [ -f /etc/sreda/.env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . /etc/sreda/.env
+    set +a
+fi
+
 mkdir -p "$DEST"
 ts() { date -u +'%Y-%m-%d %H:%M:%S UTC'; }
 log() { echo "$(ts) $*" >> "$LOG"; }

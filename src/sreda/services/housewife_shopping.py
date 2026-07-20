@@ -19,6 +19,7 @@ turn.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -214,9 +215,21 @@ def _guess_category(title: str) -> str:
         return DEFAULT_CATEGORY
     for cat, keywords in _CATEGORY_KEYWORDS:
         for kw in keywords:
-            if kw in low:
+            if kw in _WHOLE_WORD_KEYWORDS:
+                # MINOR (R1): короткие слова («бад») подстрокой ложно матчили
+                # «бадьян»/«бадминтон» → классификация в «лекарства». Матчим
+                # целым словом (границы — не рус/лат буква).
+                if re.search(rf"(?<![а-яёa-z]){re.escape(kw)}(?![а-яёa-z])", low):
+                    return cat
+            elif kw in low:
                 return cat
     return DEFAULT_CATEGORY
+
+
+# MINOR (R1): keywords, требующие матча ЦЕЛЫМ словом (короткие, ложно
+# срабатывающие подстрокой). Остальные — префикс/подстрока как раньше
+# (напр. «таблетк» → «таблетка/таблетки»).
+_WHOLE_WORD_KEYWORDS: frozenset[str] = frozenset({"бад"})
 
 
 @dataclass(slots=True)

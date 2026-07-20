@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -308,3 +309,25 @@ def test_no_pii_literals_in_scripts() -> None:
             if lit in text:
                 offenders.append(f"{path.relative_to(ROOT)}: {lit[:4]}…")
     assert offenders == []
+
+
+# R1 C9: прод entity-id (task_/checklist_/reminder_/rem_ + 24 hex) — это
+# конкретные строки БД конкретного пользователя. В one-shot скриптах публичного
+# репо их хардкодить нельзя (id + пользовательский контент рядом) — только из
+# argv/env. Страж ловит регрессию класса, который закрыл C9.
+_PROD_ENTITY_ID_RE = re.compile(r"\b(?:task|checklist|reminder|rem)_([0-9a-f]{24})\b")
+
+
+def test_no_prod_entity_ids_in_scripts() -> None:
+    offenders: list[str] = []
+    for path in sorted(SCRIPTS.rglob("*")):
+        if path.suffix not in (".py", ".sh", ".ps1") or "__pycache__" in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for hex_part in _PROD_ENTITY_ID_RE.findall(text):
+            # Синтетические mock/replay-id (низкая энтропия: `aaaa…`, `0000…`,
+            # `1234…`) — не прод; реальный uuid4.hex[:24] имеет ≥8 разных hex.
+            if len(set(hex_part)) < 8:
+                continue
+            offenders.append(f"{path.relative_to(ROOT)}: {hex_part[:10]}…")
+    assert offenders == [], f"хардкод прод entity-id в скриптах: {offenders}"

@@ -60,7 +60,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
       - name: Прогон functional-свита
-        run: uv run --all-extras python -m pytest tests/functional -q
+        # M17 (R1): раньше при полностью skipped E2E (importorskip без приватного
+        # пакета) job был ЗЕЛЁНЫМ, ничего не утверждая — ложный гейт. Теперь:
+        # реальный провал тракта → падаем с его кодом; всё skipped (тракт не
+        # исполнился) → падаем явно; есть passed → зелёный по-настоящему.
+        run: |
+          out=$(uv run --all-extras python -m pytest tests/functional -q 2>&1)
+          code=$?
+          echo "$out"
+          if [ "$code" -ne 0 ]; then
+            exit "$code"
+          fi
+          if ! echo "$out" | grep -qE "[1-9][0-9]* passed"; then
+            echo "::error::functional E2E-тракт НИЧЕГО не исполнил (весь skipped) — приватный пакет sreda-private-features не установлен на этом runner'е, тракт не гейтит. Установите плагин на CI-runner (M17)."
+            exit 1
+          fi
 
   pg-integration:
     name: pg-integration (реальный Postgres, класс #331)

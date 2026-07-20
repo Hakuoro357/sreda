@@ -55,28 +55,28 @@ _SCRIPT_PATH = (
     / "204_cancel_legacy_voice_subs.py"
 )
 _MOD_NAME = "script_204_cancel_legacy_voice_subs"
-# Audit 2026-07-18: скрипт больше не хранит прод-tenant-id'ы в коде — читает
-# их из env. Тест подставляет те же синтетические-для-теста id, что сидит
-# ниже (TENANT_A/TENANT_B), ДО exec_module (константа считается при импорте).
-os.environ.setdefault(
-    "SREDA_204_EXPECTED_TENANTS",
-    "tenant_tg_1089832184,tenant_tg_755682022",
-)
-_spec = importlib.util.spec_from_file_location(_MOD_NAME, _SCRIPT_PATH)
-mod = importlib.util.module_from_spec(_spec)
-# Register before exec so @dataclass(field(default_factory=...)) can resolve
-# the module's own namespace (dataclasses looks it up via sys.modules).
-sys.modules[_MOD_NAME] = mod
-_spec.loader.exec_module(mod)
-
-# Canonical production tenant ids. The plan/checklist write the set as
-# shorthand ``{tg_1089832184, tg_755682022}``, but the real ``Tenant.id``
-# is ``tenant_tg_<digits>`` (see onboarding.py:292
-# ``tenant_id = f"tenant_tg_{telegram_id}"``). The script defines the
-# expected set the same way — assert the two agree so a future edit can't
-# silently drift the canonical id format.
-TENANT_A = "tenant_tg_1089832184"
-TENANT_B = "tenant_tg_755682022"
+# adv-2 (R1): СИНТЕТИЧЕСКИЕ-для-теста tenant-id (НЕ прод — раньше здесь сидели
+# реальные tenant_tg_<...> из инцидента). Скрипт читает SREDA_204_EXPECTED_
+# TENANTS при импорте; module-scope ``setdefault`` РАНЬШЕ не восстанавливался →
+# утечка в os.environ на всю pytest-сессию (и держал реальные id). Теперь
+# ставим env ДО exec_module и ВОССТАНАВЛИВАЕМ в finally. Формат id — как в
+# onboarding (``tenant_tg_<digits>``): assert ниже ловит дрейф формата.
+TENANT_A = "tenant_tg_99000010"
+TENANT_B = "tenant_tg_99000011"
+_prev_204_env = os.environ.get("SREDA_204_EXPECTED_TENANTS")
+os.environ["SREDA_204_EXPECTED_TENANTS"] = f"{TENANT_A},{TENANT_B}"
+try:
+    _spec = importlib.util.spec_from_file_location(_MOD_NAME, _SCRIPT_PATH)
+    mod = importlib.util.module_from_spec(_spec)
+    # Register before exec so @dataclass(field(default_factory=...)) can resolve
+    # the module's own namespace (dataclasses looks it up via sys.modules).
+    sys.modules[_MOD_NAME] = mod
+    _spec.loader.exec_module(mod)
+finally:
+    if _prev_204_env is None:
+        os.environ.pop("SREDA_204_EXPECTED_TENANTS", None)
+    else:
+        os.environ["SREDA_204_EXPECTED_TENANTS"] = _prev_204_env
 
 VOICE_FEATURE = "voice_transcription"
 HOUSEWIFE_FEATURE = "housewife_assistant"

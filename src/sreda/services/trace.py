@@ -277,12 +277,19 @@ def deserialize_from_outbox(payload_trace: dict[str, Any]) -> TraceContext:
         )
     # audit-fix 2026-07-18 (svc-ops MINOR #2): re-anchor так, чтобы новое
     # событие воркера (``outbox.delivered``) легло сразу ПОСЛЕ последнего
-    # десериализованного (last_at_ms + реально прошедшее время), а не на
-    # ≈0 ms — раньше ``started_monotonic = time.monotonic()`` давал финальному
-    # событию at_ms≈0 и в блоке трейса оно рендерилось «0ms outbox.delivered»
-    # ДО событий uvicorn-процесса, ломая хронологию разбора латентности.
+    # десериализованного, а не на ≈0 ms (иначе рендерилось «0ms outbox.delivered»
+    # ДО событий uvicorn, ломая хронологию).
+    #
+    # R1 MINOR: якорь от ``started_at`` (РЕАЛЬНАЯ задержка от НАЧАЛА хода,
+    # включая dwell в очереди outbox) — last_at_ms терял это время. ``max`` с
+    # last_at_ms сохраняет хронологию (delivered не раньше последнего события).
     last_at_ms = max((e.at_ms for e in ctx.events), default=0)
-    ctx.started_monotonic = time.monotonic() - (last_at_ms / 1000.0)
+    _now = datetime.now(UTC)
+    _start = ctx.started_at
+    if _start.tzinfo is None:
+        _start = _start.replace(tzinfo=UTC)
+    _elapsed_ms = max((_now - _start).total_seconds() * 1000.0, float(last_at_ms))
+    ctx.started_monotonic = time.monotonic() - (_elapsed_ms / 1000.0)
     return ctx
 
 

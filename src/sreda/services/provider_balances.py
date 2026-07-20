@@ -439,8 +439,19 @@ def fetch_balances(settings: Settings, *, force_refresh: bool = False) -> list[P
     with _fetch_lock:
         with _cache_lock:
             hit = _cache.get(cache_key)
-            if not force_refresh and hit is not None and (now - hit[1]) < _CACHE_TTL:
-                return hit[0]
+            if hit is not None:
+                # MINOR (R1): проигравший race за _fetch_lock переиспользует
+                # результат ПОБЕДИТЕЛЯ даже при force_refresh — победитель уже
+                # сделал форсированный fetch, N параллельных force-refresh'ей не
+                # должны сериализоваться и по 5 раз тянуть сеть. Признак «это
+                # результат победителя ТЕКУЩЕГО цикла»: он записан ПОСЛЕ того как
+                # мы вошли (hit[1] > now из line 431). Соло-force_refresh со
+                # старым (до нас) TTL-кэшем по-прежнему обходит кэш и фетчит.
+                if force_refresh:
+                    if hit[1] > now:
+                        return hit[0]
+                elif (time.monotonic() - hit[1]) < _CACHE_TTL:
+                    return hit[0]
 
         balances = [
             _fetch_openrouter(settings),

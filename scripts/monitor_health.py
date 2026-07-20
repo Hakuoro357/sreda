@@ -963,14 +963,18 @@ def save_state(state: dict[str, ProbeState]) -> None:
 # ---------------------------------------------------------------------------
 # Alerting
 # ---------------------------------------------------------------------------
-def send_telegram_alert(text: str) -> None:
+def send_telegram_alert(text: str) -> bool:
+    """M19 (R1): возвращает True ТОЛЬКО при реальной доставке. Caller
+    персистит alert-state (transition/last_alert_at) лишь на True — иначе
+    пропущенная доставка (нет токена/chat_id/сеть) «съедала» переход
+    OK→DOWN и инцидент глох, а при появлении chat_id уже не пере-фаерился."""
     token = _ENV.get("SREDA_TELEGRAM_BOT_TOKEN")
     if not token:
         print("[alert] no bot token, skipping send", file=sys.stderr)
-        return
+        return False
     if not ADMIN_CHAT_ID:
         print("[alert] no SREDA_ADMIN_TELEGRAM_CHAT_ID, skipping send", file=sys.stderr)
-        return
+        return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     proxy = _proxy_for_url(url)
     # #324: слать алерт через egress SOCKS — иначе при флапе прямого маршрута сам
@@ -986,8 +990,11 @@ def send_telegram_alert(text: str) -> None:
             )
         if r.status_code != 200 or not r.json().get("ok"):
             print(f"[alert] send failed: {r.status_code} {r.text[:200]}", file=sys.stderr)
+            return False
+        return True
     except Exception as e:
         print(f"[alert] send exception: {e}", file=sys.stderr)
+        return False
 
 
 def format_alert(name: str, prev_status: Severity, new: ProbeResult,
@@ -1033,6 +1040,17 @@ def _fmt_duration(delta: timedelta) -> str:
 # Main loop
 # ---------------------------------------------------------------------------
 def main() -> int:
+    # M19 (R1): без ADMIN_CHAT_ID алерты недоставимы — fail fast ДО проб.
+    # Иначе пробы бежали бы, переходы OK→DOWN «консюмились» в state, а когда
+    # chat_id позже настроят — edge уже потерян, инцидент не пере-фаерится.
+    if not ADMIN_CHAT_ID:
+        print(
+            "[monitor] SREDA_ADMIN_TELEGRAM_CHAT_ID не задан — алерты "
+            "недоставимы, пробы не запускаю (fail fast, M19).",
+            file=sys.stderr,
+        )
+        return 2
+
     host = socket.gethostname()
     state = load_state()
     now = datetime.now(timezone.utc)
@@ -1057,13 +1075,30 @@ def main() -> int:
                 except Exception:
                     pass
 
+            delivered = False
             if should_alert:
                 msg = format_alert(result.name, prev_status, result, host, prev)
-                send_telegram_alert(msg)
+                delivered = send_telegram_alert(msg)
 
-                last_alert_iso = now.isoformat() if result.status != "ok" else (prev.last_alert_at if prev else None)
-            else:
-                last_alert_iso = prev.last_alert_at if prev else None
+            # M19 (R1): хотели заалертить (non-ok переход), но НЕ доставили →
+            # НЕ консюмим переход: оставляем prev-состояние (обновив только
+            # last_message), чтобы СЛЕДУЮЩИЙ тик пере-фаернул тот же edge OK→DOWN.
+            # Раньше состояние обновлялось безусловно → пропущенная доставка
+            # съедала переход и инцидент глох (а last_alert_at штамповался now →
+            # кулдаун подавлял реальную отправку позже).
+            if should_alert and not delivered and result.status != "ok":
+                if prev is not None:
+                    prev.last_message = result.message
+                    state[result.name] = prev
+                # нет prev → ничего не пишем: следующий тик снова увидит переход
+                continue
+
+            # Доставлено / recovery(ok) / подавлено кулдауном → консюмим переход.
+            # last_alert_at штампуем ТОЛЬКО при реальной доставке non-ok алерта.
+            last_alert_iso = (
+                now.isoformat() if (delivered and result.status != "ok")
+                else (prev.last_alert_at if prev else None)
+            )
 
             # Audit 2026-07-18 #13: переход critical→warning (оба не-ok) НЕ
             # сбрасывает since — инцидент продолжается, иначе «Down for» в
