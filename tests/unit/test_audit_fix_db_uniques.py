@@ -421,8 +421,12 @@ def test_0085_dedup_agent_threads_repoints_references() -> None:
             )
             """
         ))
+        # R1 M2: conversation_turns несёт UNIQUE(thread_id, turn_seq) —
+        # scratch отражает его, чтобы repoint без перенумерации падал.
         conn.execute(text(
-            "CREATE TABLE conversation_turns (id TEXT PRIMARY KEY, thread_id TEXT)"
+            "CREATE TABLE conversation_turns ("
+            " id TEXT PRIMARY KEY, thread_id TEXT, turn_seq INTEGER,"
+            " UNIQUE (thread_id, turn_seq))"
         ))
         conn.execute(text(
             "CREATE TABLE agent_runs (id TEXT PRIMARY KEY, thread_id TEXT, turn_id TEXT)"
@@ -434,11 +438,13 @@ def test_0085_dedup_agent_threads_repoints_references() -> None:
             " ('thr_old', 't1', 'telegram', 'chat_1', '2026-07-01 00:00:00', NULL),"
             " ('thr_unrelated', 't1', 'max_dm', 'chat_1', '2026-07-05 00:00:00', NULL)"
         ))
+        # turn_1 (doomed) и turn_2 (survivor) оба seq=1 → без перенумерации
+        # repoint turn_1→thr_old упал бы на UNIQUE(thread_id, turn_seq).
         conn.execute(text(
             "INSERT INTO conversation_turns VALUES"
-            " ('turn_1', 'thr_new'),"
-            " ('turn_2', 'thr_old'),"
-            " ('turn_3', 'thr_unrelated')"
+            " ('turn_1', 'thr_new', 1),"
+            " ('turn_2', 'thr_old', 1),"
+            " ('turn_3', 'thr_unrelated', 1)"
         ))
         conn.execute(text(
             "INSERT INTO agent_runs VALUES"
@@ -459,6 +465,16 @@ def test_0085_dedup_agent_threads_repoints_references() -> None:
             "turn_2": "thr_old",       # уже на выжившей
             "turn_3": "thr_unrelated", # не тронут
         }
+        # R1 M2: doomed-турн перенумерован (seq 1 → survivor_max(1)+1+1=3),
+        # оба турна теперь на thr_old без нарушения UNIQUE(thread_id, turn_seq).
+        seqs = dict(
+            conn.execute(
+                text("SELECT id, turn_seq FROM conversation_turns")
+            ).all()
+        )
+        assert seqs["turn_2"] == 1        # survivor не тронут
+        assert seqs["turn_1"] == 3        # doomed сдвинут выше survivor_max
+        assert seqs["turn_3"] == 1        # unrelated не тронут
         runs = dict(
             conn.execute(text("SELECT id, thread_id FROM agent_runs")).all()
         )

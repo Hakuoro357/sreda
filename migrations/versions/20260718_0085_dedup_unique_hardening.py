@@ -55,6 +55,8 @@ Create Date: 2026-07-18
 
 from __future__ import annotations
 
+import hashlib
+
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
@@ -108,13 +110,26 @@ _DOOMED_MENU_PLAN_ITEMS = (
 )
 
 
-def _lock_tables(bind) -> None:
-    """EXCLUSIVE-лок на время дедуп→CREATE UNIQUE окна (образец 0048):
-    ни конкурентный writer не добавит дубль, ни FK-insert не укажет на
-    удаляемую строку. lock_timeout — fail-fast с откатом вместо подвисания.
-    PostgreSQL only — SQLite сериализует writer'ов сам."""
+def _set_lock_timeout(bind) -> None:
+    """Fail-fast на захвате ЛЮБОГО лока (SET LOCAL lock_timeout) вместо
+    неограниченного ожидания — включая ACCESS EXCLUSIVE, который берут
+    add_column/ALTER COLUMN на message_jobs. Ставится в начале tx, ДО
+    первого DDL. PostgreSQL only."""
     if bind.dialect.name == "postgresql":
         bind.execute(sa.text("SET LOCAL lock_timeout = '5s'"))
+
+
+def _lock_dedup_tables(bind) -> None:
+    """EXCLUSIVE-лок 6 таблиц на время дедуп→CREATE UNIQUE окна (образец 0048):
+    ни конкурентный writer не добавит дубль, ни FK-insert не укажет на
+    удаляемую строку.
+
+    2026-07-18 (R1 C2): вызывается ПОСЛЕ ALTER+шифрования payload'ов —
+    длинный per-row re-encryption НЕ должен держать EXCLUSIVE на
+    conversation_turns/agent_runs (hot path ReAct встал бы на всё окно
+    перешифровки). Здесь окно короткое: только дедуп + CREATE UNIQUE.
+    PostgreSQL only — SQLite сериализует writer'ов сам."""
+    if bind.dialect.name == "postgresql":
         bind.execute(sa.text(
             "LOCK TABLE message_jobs, users, agent_threads, menu_plan_items,"
             " conversation_turns, agent_runs IN EXCLUSIVE MODE"
@@ -197,6 +212,52 @@ def _dedup_agent_threads(bind) -> int:
             "ALTER TABLE agent_runs DROP CONSTRAINT fk_agent_runs_turn_thread"
         ))
 
+    # 2026-07-18 (R1 M2): перенумеровать turn_seq doomed-турнов ДО repoint'а.
+    # conversation_turns несёт UNIQUE(thread_id, turn_seq); survivor и doomed
+    # обычно оба нумеруют турны с 1 → «слепой» repoint на survivor упал бы на
+    # этом UNIQUE. Сдвигаем каждый doomed-турн на (max turn_seq survivor'а)+1:
+    # для штатного случая (1 survivor + 1 doomed) новые seq'и идут строго выше
+    # survivor'ских и между собой уникальны (old_seq уникальны в doomed-потоке
+    # + константа). turn_seq ни в один FK не входит — repoint agent_runs не
+    # затрагивается. Патологию (>1 doomed на одну тройку, где константный сдвиг
+    # даёт пересечение между doomed-потоками; либо второй активный турн против
+    # partial-unique ix_one_active_turn_per_thread) НЕ авто-мёржим — она громко
+    # падает на самом UNIQUE при repoint (deploy встаёт, данные целы), ручной
+    # разбор как у users.max_account_id. Коррелированная форма (без window/
+    # UPDATE...FROM) — портабельна PG/SQLite.
+    bind.execute(sa.text(
+        f"""
+        UPDATE conversation_turns
+        SET turn_seq = turn_seq + 1 + COALESCE((
+            SELECT MAX(st.turn_seq)
+            FROM conversation_turns st
+            WHERE st.thread_id = (
+                SELECT s.id
+                FROM agent_threads cur
+                JOIN agent_threads s
+                  ON s.tenant_id = cur.tenant_id
+                 AND s.channel_type = cur.channel_type
+                 AND s.external_chat_id = cur.external_chat_id
+                WHERE cur.id = conversation_turns.thread_id
+                ORDER BY s.created_at ASC, s.id ASC
+                LIMIT 1
+            )
+        ), 0)
+        WHERE EXISTS (
+            SELECT 1
+            FROM agent_threads cur
+            JOIN agent_threads smaller
+              ON smaller.tenant_id = cur.tenant_id
+             AND smaller.channel_type = cur.channel_type
+             AND smaller.external_chat_id = cur.external_chat_id
+             AND (smaller.created_at < cur.created_at
+                  OR (smaller.created_at = cur.created_at
+                      AND smaller.id < cur.id))
+            WHERE cur.id = conversation_turns.thread_id
+        )
+        """
+    ))
+
     # Repoint doomed → survivor. Коррелированная форма БЕЗ UPDATE ... FROM и
     # без alias на DML-target (образец 0048) — портабельна PG/SQLite, один
     # текст на оба диалекта. Survivor = ORDER BY (created_at, id) LIMIT 1.
@@ -257,12 +318,19 @@ def _preflight_users_max_account_id(bind) -> None:
         " GROUP BY max_account_id HAVING count(*) > 1"
     )).all()
     if rows:
-        sample = ", ".join(sorted(r[0] for r in rows)[:5])
+        # 2026-07-18 (R1 M22): сырой max_account_id — PII-lite (внешний id
+        # аккаунта MAX). В deploy-лог печатаем count + sha256-префиксы (8
+        # симв.) для сопоставления оператором, не сами значения.
+        digests = ", ".join(
+            hashlib.sha256(str(r[0]).encode("utf-8")).hexdigest()[:8]
+            for r in sorted(rows, key=lambda r: str(r[0]))[:5]
+        )
         raise RuntimeError(
             f"0085 preflight: {len(rows)} дублирующихся max_account_id в users "
-            f"(примеры: {sample}). partial unique index НЕ создан. Слейте дубли "
-            "вручную (переведите ссылки на выжившего User, второго удалите) и "
-            "повторите миграцию."
+            f"(sha256-префиксы примеров: {digests}). partial unique index НЕ "
+            "создан. Слейте дубли вручную (найдите строки отдельным "
+            "привилегированным запросом по значению, переведите ссылки на "
+            "выжившего User, второго удалите) и повторите миграцию."
         )
 
 
@@ -312,11 +380,45 @@ def _decrypt_existing_payloads(bind) -> int:
     return len(rows)
 
 
+def _preflight_downgrade_message_jobs_unique(bind) -> None:
+    """2026-07-18 (R1 M1): downgrade возвращает старый UNIQUE
+    (channel, external_update_id). Но после multi-bot трафика два разных бота
+    (bot_key) законно имеют одинаковый (channel, external_update_id) — их
+    различал только bot_key. Пересоздание старого UNIQUE упало бы на этих
+    строках уже в середине downgrade (частично применённый откат). Префлайт:
+    коллизии → громкая остановка ДО любого DDL со списком-инструкцией, данные
+    не портятся. Пусто (single-bot / нет коллизий) → no-op."""
+    rows = bind.execute(sa.text(
+        "SELECT channel, external_update_id, count(*) AS c FROM message_jobs"
+        " WHERE external_update_id IS NOT NULL"
+        " GROUP BY channel, external_update_id HAVING count(*) > 1"
+    )).all()
+    if rows:
+        raise RuntimeError(
+            f"0085 downgrade preflight: {len(rows)} коллизий "
+            "(channel, external_update_id) между разными bot_key — старый "
+            "UNIQUE (channel, external_update_id) пересоздать нельзя без потери "
+            "строк. Downgrade прерван ДО изменений. Разведите конфликтующие "
+            "строки вручную (оставьте по одной на пару channel+external_update_id "
+            "или дождитесь их выпадения из очереди) и повторите откат."
+        )
+
+
 def upgrade() -> None:
     bind = op.get_bind()
-    _lock_tables(bind)
+    _set_lock_timeout(bind)
 
-    # --- 1. message_jobs: +bot_key, дедуп, замена дедуп-констрейнта ---------
+    # --- 1. message_jobs: +bot_key + payload JSONB→Text + шифрование --------
+    # 2026-07-18 (R1 C1+C2): порядок критичен.
+    #  C1 — шифруем payload'ы ДО дедуп/архива: _dedup_message_jobs копирует
+    #       doomed-строки в архив «AS SELECT d.*»; шифруй ПОСЛЕ — архив унёс бы
+    #       plaintext PII навсегда. Поэтому ALTER→шифрование ПЕРЕД дедупом.
+    #  C2 — 6-табличный EXCLUSIVE-лок берём ПОСЛЕ шифрования (см.
+    #       _lock_dedup_tables): длинный per-row re-encryption не держит
+    #       conversation_turns/agent_runs. message_jobs при этом под ACCESS
+    #       EXCLUSIVE от своего же ALTER — но это очередь за фичефлагом, не hot
+    #       path ReAct. Всё в одной tx (атомарно с revision-стемпом,
+    #       идемпотентный ретрай при сбое — без autocommit-«полукоммитов»).
     op.add_column(
         "message_jobs",
         sa.Column(
@@ -326,13 +428,28 @@ def upgrade() -> None:
             server_default=sa.text("'sreda'"),
         ),
     )
-    _dedup_message_jobs(bind)
-    # batch_alter_table: на PG операции исполняются прямыми ALTER, на SQLite —
-    # copy-and-move (у SQLite нет ALTER CONSTRAINT/ALTER COLUMN TYPE). Один
-    # код на оба диалекта, как и портабельный SQL дедуп-хелперов (образец 0048).
-    # drop старого констрейнта — только PG: рефлексия SQLite не видит named
+    # message_payload: JSONB → Text (шифрование — следующим шагом). Старый
+    # дедуп-UNIQUE (channel, external_update_id) остаётся активен до дедуп-окна
+    # ниже (на PG гарантирует отсутствие дублей на здоровой БД). batch_alter:
+    # PG — прямой ALTER, SQLite — copy-and-move.
+    with op.batch_alter_table("message_jobs") as b:
+        b.alter_column(
+            "message_payload",
+            existing_type=_JSONB,
+            type_=sa.Text(),
+            existing_nullable=False,
+            postgresql_using="message_payload::text",
+        )
+    _encrypt_existing_payloads(bind)
+
+    # --- дедуп-окно под EXCLUSIVE-локами 6 таблиц (короткое, БЕЗ шифрования) --
+    _lock_dedup_tables(bind)
+
+    # message_jobs: дедуп по новому ключу (архив уже шифротекст — C1) + замена
+    # констрейнта. drop старого — только PG: рефлексия SQLite не видит named
     # UNIQUE в table.constraints (batch-recreate пересоздаст таблицу уже без
-    # него), и явный drop упал бы «No such constraint».
+    # него), явный drop упал бы «No such constraint».
+    _dedup_message_jobs(bind)
     with op.batch_alter_table("message_jobs") as b:
         if bind.dialect.name == "postgresql":
             b.drop_constraint(
@@ -342,15 +459,6 @@ def upgrade() -> None:
             "uq_message_jobs_channel_bot_update",
             ["channel", "external_update_id", "bot_key"],
         )
-        # --- 2. message_payload: JSONB → Text (шифрование — следующим шагом)
-        b.alter_column(
-            "message_payload",
-            existing_type=_JSONB,
-            type_=sa.Text(),
-            existing_nullable=False,
-            postgresql_using="message_payload::text",
-        )
-    _encrypt_existing_payloads(bind)
 
     # --- 3. users.max_account_id: префлайт + partial unique ------------------
     _preflight_users_max_account_id(bind)
@@ -383,6 +491,10 @@ def upgrade() -> None:
 def downgrade() -> None:
     bind = op.get_bind()
     is_pg = bind.dialect.name == "postgresql"
+
+    # 2026-07-18 (R1 M1): проверить возможность вернуть старый UNIQUE ДО любого
+    # DDL — иначе откат упал бы на полпути на multi-bot коллизиях.
+    _preflight_downgrade_message_jobs_unique(bind)
 
     # drop-ы констрейнтов — только PG (на SQLite batch-recreate пересоздаёт
     # таблицы уже без них; см. комментарий в upgrade).
