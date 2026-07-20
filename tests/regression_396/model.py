@@ -20,12 +20,27 @@ class ToolReceipt:
 
     ``result_kind`` — из ``ToolMessage.artifact['result_kind']`` («ok» / «error» /
     None). ``content`` — тело квитанции (префиксы ``ok:`` / ``okv2:`` / ``error:`` /
-    отказ-строка). ``applied`` — доказанный эффект (ok-статус И не отказ/ошибка)."""
+    отказ-строка). ``status`` — классификация исхода (R2, ревью sol+terra):
+      * ``applied``          — доказан НОВЫЙ эффект (okv2 created непусто / success-префикс);
+      * ``already_applied``  — цель уже в нужном состоянии (okv2 all-dup) — не новая строка,
+                               но состояние удовлетворено;
+      * ``failed``           — ошибка/отказ (result_kind!=ok / error:/отказ-строка);
+      * ``noop``             — write без доказанного эффекта (не различить);
+      * ``read``             — не-write инструмент."""
 
     name: str
     result_kind: str | None
     content: str
-    applied: bool
+    status: str
+
+    @property
+    def applied(self) -> bool:
+        """Эффект достигнут (новый ИЛИ уже был) — для «ответ.успех ⇒ эффект»."""
+        return self.status in ("applied", "already_applied")
+
+    @property
+    def failed(self) -> bool:
+        return self.status == "failed"
 
 
 @dataclass
@@ -40,29 +55,37 @@ class TurnOutcome:
     db_after: dict[str, int]          # таблица -> count ПОСЛЕ хода
     tool_calls: list[str]             # имена инструментов, вызванных моделью за ход
     receipts: list[ToolReceipt]       # квитанции исполненных инструментов
+    # R2 (ревью sol+terra): ЛОГИЧЕСКИЙ снимок состояния {таблица: {id: (status, title)}} —
+    # ловит in-place мутации (archive/complete/rename), которые count не видит. Пусто в
+    # синтетике инвариантов → mutated падает обратно на count-дельту.
+    state_before: dict[str, Any] = field(default_factory=dict)
+    state_after: dict[str, Any] = field(default_factory=dict)
     messages: list[Any] = field(default_factory=list)  # захваченная история (для collect_*)
     error: str = ""                   # аборт/краш хода (пусто = ок)
 
     @property
     def db_diff(self) -> dict[str, int]:
-        """Ненулевые дельты count по таблицам (мутации этого хода)."""
+        """Ненулевые дельты count по таблицам (для expect_mutations)."""
         return {k: self.db_after[k] - self.db_before[k]
                 for k in self.db_after if self.db_after[k] != self.db_before.get(k, 0)}
 
     @property
     def mutated(self) -> bool:
-        """Ход изменил БД (любая таблица выросла/уменьшилась)?"""
+        """Ход изменил состояние БД? По логическому снимку (ловит смену status/title при
+        неизменном count — archive/complete/rename), иначе по count-дельте (синтетика)."""
+        if self.state_before or self.state_after:
+            return self.state_before != self.state_after
         return any(v != 0 for v in self.db_diff.values())
 
     @property
     def has_applied_write(self) -> bool:
-        """Есть доказанный успешный write-эффект (квитанция applied)?"""
+        """Есть доказанный write-эффект (applied/already_applied)?"""
         return any(r.applied for r in self.receipts)
 
     @property
     def has_failed_tool(self) -> bool:
-        """Есть квитанция инструмента с ошибкой (result_kind != ok)?"""
-        return any(r.result_kind not in (None, "ok") for r in self.receipts)
+        """Есть упавшая квитанция инструмента (status=failed)?"""
+        return any(r.failed for r in self.receipts)
 
 
 @dataclass
@@ -73,6 +96,7 @@ class DialogOutcome:
     turns: list[TurnOutcome]
     final_db: dict[str, Any]          # прицельный снимок (титулы/статусы) для fixture-ассертов
     aborted: str = ""
+    overrun: int = 0                  # проходов модели СВЕРХ скрипта (скрытая петля/лишние вызовы)
 
     @property
     def confirm_count(self) -> int:

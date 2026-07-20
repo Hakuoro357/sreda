@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import itertools
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -17,6 +18,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from sreda.runtime.react_loop import handle_turn
 from sreda.runtime.react_result_report import collect_successful_writes, reply_grounds_result
 from sreda.services.tool_schemas.families import TOOL_OP_CLASS
+from sreda.services.tool_schemas.tool_ok_codec import is_okv2
 
 from tests.unit.conftest import SeededTelegramUser
 
@@ -38,9 +40,12 @@ class StubLLM:
         self._i = 0
         self.emitted_tool_calls: list[str] = []
         self.captured: list[Any] = []
+        self.invokes = 0            # сколько раз модель вызвана за ход
+        self.overrun = 0            # проходов СВЕРХ скрипта (скрипт исчерпан) — скрытая петля
         # ToolMessage-квитанции, увиденные за ход (union по tool_call_id всех проходов).
         # Копим по всем invoke: финальный chat-проход инжектит служебный HumanMessage
         # ПОСЛЕ ToolMessage → «окно после последнего Human» теряет квитанцию; union устойчив.
+        # tool_call_id уникален на весь диалог (см. ai_tool) → коллизий между ходами нет.
         self.tool_msgs: dict[str, ToolMessage] = {}
 
     def bind_tools(self, tools, *a, **k):  # noqa: ANN001, ARG002
@@ -48,11 +53,14 @@ class StubLLM:
 
     def invoke(self, messages, *a, **k):  # noqa: ANN001, ARG002
         self.captured = list(messages)
+        self.invokes += 1
         for m in messages:
             if isinstance(m, ToolMessage):
                 tid = getattr(m, "tool_call_id", None)
                 if tid is not None:
                     self.tool_msgs.setdefault(tid, m)
+        if self._i >= len(self._scripted):
+            self.overrun += 1       # скрипт исчерпан, а модель зовут снова — фиксируем
         msg = self._scripted[min(self._i, len(self._scripted) - 1)]
         self._i += 1
         for tc in (getattr(msg, "tool_calls", None) or []):
@@ -70,28 +78,45 @@ class ScriptedTurn:
     user_text: str
     ai: list[AIMessage]
     is_auto: bool = False   # авто-ответ на confirm («да»/«нет») — для учёта
+    # R2 (idempotency, ревью sol+terra): пин inbound_message_id → тот же turn_key в
+    # handle_turn → РЕАЛЬНЫЙ replay одного idempotency-ключа (не просто дедуп по имени).
+    inbound_id: str | None = None
 
 
 # ─────────────────────────── снимки состояния БД ───────────────────────────
+# R2 (ревью sol+terra): ЛОГИЧЕСКИЙ снимок {таблица: {id: (status, title)}}, а не просто
+# count. Ловит in-place мутации (archive/complete/rename), которые count не видит, и
+# скоупит по tenant_id И user_id (иначе запись другому юзеру того же тенанта проходила бы
+# по count). ChecklistItem без user_id → скоуп через checklist_id родителя юзера.
 
-# Таблица -> ORM-модель. Паттерн db_counts из qwen_cycle_eval; фильтр по тенанту.
-def _count_models() -> dict[str, Any]:
+
+def state_snapshot(session: Any, tenant_id: str, user_id: str) -> dict[str, dict]:
     from sreda.db.models import (
         AssistantMemory, Checklist, ChecklistItem, FamilyReminder, ShoppingListItem, Task,
     )
-    return {"shopping": ShoppingListItem, "reminders": FamilyReminder, "tasks": Task,
-            "checklists": Checklist, "checklist_items": ChecklistItem, "memories": AssistantMemory}
-
-
-def db_counts(session: Any, tenant_id: str) -> dict[str, int]:
     session.expire_all()
-    out: dict[str, int] = {}
-    for name, model in _count_models().items():
-        q = session.query(model)
-        if hasattr(model, "tenant_id"):
-            q = q.filter_by(tenant_id=tenant_id)
-        out[name] = int(q.count())
-    return out
+
+    def proj(model) -> dict[str, tuple]:
+        q = session.query(model).filter_by(tenant_id=tenant_id)
+        if hasattr(model, "user_id"):
+            q = q.filter_by(user_id=user_id)
+        return {r.id: (getattr(r, "status", None), getattr(r, "title", None)) for r in q.all()}
+
+    checklists = proj(Checklist)
+    cl_ids = set(checklists)
+    if cl_ids:
+        items = {r.id: (r.status, r.title) for r in session.query(ChecklistItem)
+                 .filter(ChecklistItem.checklist_id.in_(cl_ids)).all()}
+    else:
+        items = {}
+    return {"shopping": proj(ShoppingListItem), "reminders": proj(FamilyReminder),
+            "tasks": proj(Task), "checklists": checklists, "checklist_items": items,
+            "memories": {r.id: (None, None) for r in session.query(AssistantMemory)
+                         .filter_by(tenant_id=tenant_id, user_id=user_id).all()}}
+
+
+def counts_from_state(snap: dict[str, dict]) -> dict[str, int]:
+    return {k: len(v) for k, v in snap.items()}
 
 
 # ─────────────────────────── квитанции из истории ───────────────────────────
@@ -104,19 +129,55 @@ def _clean_history(user_text: str, ai: list[AIMessage], toolmsgs: list[ToolMessa
     return [HumanMessage(content=user_text), *ai, *toolmsgs]
 
 
-def _build_receipts(toolmsgs: list[ToolMessage], applied_tools: set[str]) -> list[ToolReceipt]:
-    """Квитанции хода. ``applied`` — доказанный успешный write (collect_successful_writes —
-    авторитетная логика #393) ИЛИ ok-квитанция write-инструмента без отказ/ошибка-префикса."""
+_REFUSAL_PREFIXES = ("Хорошо, не", "error:", "empty:", "not_found:", "ambiguous:")
+
+
+def _okv2_added(content: str) -> tuple[int, int]:
+    """(added_count, duplicate_count) из okv2-конверта; (-1,-1) если не okv2/битый."""
+    if not is_okv2(content):
+        return -1, -1
+    try:
+        import json
+        payload = json.loads(content.split(":", 2)[2])
+    except (IndexError, ValueError):
+        return -1, -1
+    if not isinstance(payload, dict):
+        return -1, -1
+    return int(payload.get("added_count", 0)), int(payload.get("duplicate_count", 0))
+
+
+def _classify_receipt(name: str, kind: str | None, content: str) -> str:
+    """Статус квитанции per-receipt (R2, ревью sol+terra: НЕ по set имён — не путать
+    успех одного вызова с упавшим одноимённым). applied / already_applied / failed /
+    noop / read."""
+    if TOOL_OP_CLASS.get(name) != "write":
+        return "read"
+    if kind not in (None, "ok") or content.startswith(_REFUSAL_PREFIXES):
+        return "failed"
+    if kind != "ok":
+        return "noop"
+    added, dup = _okv2_added(content)
+    if added >= 0:                       # add-инструмент с okv2-контрактом
+        if added > 0:
+            return "applied"             # новые строки
+        if dup > 0:
+            return "already_applied"     # всё уже было (цель удовлетворена, не новая строка)
+        return "noop"                    # ни добавлено, ни дубли → эффекта нет
+    # target-инструменты (archive/schedule…): success-префикс ok:archived / ok:scheduled …
+    if content.startswith("ok:") and not content.startswith("ok:noop"):
+        return "applied"
+    return "noop"
+
+
+def _build_receipts(toolmsgs: list[ToolMessage]) -> list[ToolReceipt]:
     out: list[ToolReceipt] = []
     for m in toolmsgs:
         name = getattr(m, "name", "") or ""
         art = getattr(m, "artifact", None)
         kind = art.get("result_kind") if isinstance(art, dict) else None
         content = str(getattr(m, "content", "") or "")
-        applied = (name in applied_tools) or (
-            kind == "ok" and TOOL_OP_CLASS.get(name) == "write"
-            and not content.startswith(("error:", "Хорошо, не")))
-        out.append(ToolReceipt(name=name, result_kind=kind, content=content, applied=applied))
+        out.append(ToolReceipt(name=name, result_kind=kind, content=content,
+                               status=_classify_receipt(name, kind, content)))
     return out
 
 
@@ -140,6 +201,7 @@ class Fixture:
     forbid_phrases: list[str] = field(default_factory=list)           # ни в одной реплике (ci-substr)
     require_phrases: list[tuple[int, str]] = field(default_factory=list)  # (ход, substr) в реплике
     max_confirms: int | None = None
+    max_tool_calls: int | None = None   # потолок tool-вызовов за диалог (петли/лишние действия)
     idempotent_group: tuple[list[int], str] | None = None
     ambiguous_cancel_turns: list[int] = field(default_factory=list)
     # #390: сырой ВЫВОД инструмента (квитанция) — источник техвыдачи, НЕЗАВИСИМ от скрипта
@@ -158,41 +220,51 @@ async def run_fixture(fx: Fixture, session: Any, user: SeededTelegramUser) -> Di
     turns_out: list[TurnOutcome] = []
     seen_tool_ids: set[str] = set()   # квитанция принадлежит ходу первого её появления
     aborted = ""
-    for st in fx.turns:
-        before = db_counts(session, user.tenant_id)
+    overrun = 0
+    for i, st in enumerate(fx.turns):
+        state_before = state_snapshot(session, user.tenant_id, user.user_id)
         stub = StubLLM(st.ai)
         try:
             reply = await handle_turn(
                 session=session, tenant_id=user.tenant_id, user_id=user.user_id,
                 thread_id=thread, llm=stub, user_text=st.user_text,
-                inbound_message_id=f"m{len(turns_out)}", channel=fx.channel)
+                inbound_message_id=st.inbound_id or f"m{i}", channel=fx.channel)
         except Exception as e:  # noqa: BLE001 — handle_turn не должен кидать; страхуемся
             aborted = f"turn-crash: {type(e).__name__}: {e}"
             break
-        after = db_counts(session, user.tenant_id)
+        state_after = state_snapshot(session, user.tenant_id, user.user_id)
+        overrun += stub.overrun
         new_ids = [tid for tid in stub.tool_msgs if tid not in seen_tool_ids]
         seen_tool_ids.update(new_ids)
         new_toolmsgs = [stub.tool_msgs[tid] for tid in new_ids]
         clean = _clean_history(st.user_text, st.ai, new_toolmsgs)
-        applied_tools = {a.tool for a in collect_successful_writes(clean)}
         turns_out.append(TurnOutcome(
             user_text=st.user_text, is_auto=st.is_auto, reply=str(reply),
             awaiting_confirm=bool(getattr(reply, "awaiting_confirm", False)),
-            db_before=before, db_after=after,
+            db_before=counts_from_state(state_before), db_after=counts_from_state(state_after),
+            state_before=state_before, state_after=state_after,
             tool_calls=list(stub.emitted_tool_calls),
-            receipts=_build_receipts(new_toolmsgs, applied_tools), messages=clean))
+            receipts=_build_receipts(new_toolmsgs), messages=clean))
 
     final_db: dict[str, Any] = {}
     if fx.expect_final is None:
-        final_db = db_counts(session, user.tenant_id)
-    return DialogOutcome(fixture_id=fx.id, turns=turns_out, final_db=final_db, aborted=aborted)
+        final_db = counts_from_state(state_snapshot(session, user.tenant_id, user.user_id))
+    return DialogOutcome(fixture_id=fx.id, turns=turns_out, final_db=final_db,
+                         aborted=aborted, overrun=overrun)
 
 
 # ─────────────────────────── удобные конструкторы AIMessage ───────────────────────────
 
 
-def ai_tool(name: str, args: dict, cid: str = "c1") -> AIMessage:
-    """AIMessage-проход с вызовом инструмента."""
+_CALL_SEQ = itertools.count()
+
+
+def ai_tool(name: str, args: dict, cid: str | None = None) -> AIMessage:
+    """AIMessage-проход с вызовом инструмента. ``cid`` УНИКАЛЕН по умолчанию (счётчик на
+    def-time фикстур) — иначе повтор ``c1`` между ходами ронял бы квитанции поздних ходов
+    (ревью sol+terra R1). Явный cid — только для мультиtool-хода, где нужен контроль."""
+    if cid is None:
+        cid = f"call_{next(_CALL_SEQ)}"
     return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": cid}])
 
 
@@ -244,6 +316,10 @@ def check_fixture(dialog: DialogOutcome, fx: Fixture, session: Any,
 
     if fx.max_confirms is not None and dialog.confirm_count > fx.max_confirms:
         problems.append(f"confirm-пауз {dialog.confirm_count} > потолка {fx.max_confirms}")
+    if fx.max_tool_calls is not None and dialog.total_tool_calls > fx.max_tool_calls:
+        problems.append(f"tool-вызовов {dialog.total_tool_calls} > потолка {fx.max_tool_calls}")
+    if dialog.overrun:
+        problems.append(f"модель вызвана {dialog.overrun}× СВЕРХ скрипта (петля/лишние проходы?)")
 
     if fx.require_clean_receipts:
         from .invariants import tech_tokens

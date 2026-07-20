@@ -14,7 +14,7 @@ import pytest
 from tests.unit.conftest import seed_telegram_user
 
 from .fixtures import F390_SHOW_LISTS, F393_ADD
-from .harness import check_fixture, run_fixture
+from .harness import Fixture, ScriptedTurn, ai_text, ai_tool, check_fixture, run_fixture
 
 
 @pytest.mark.asyncio
@@ -53,3 +53,23 @@ async def test_390_xfail_is_for_tech_leak_reason(db_session):
     # и убедимся, что источник — англ. счётчики pending/done/total в квитанции
     receipts_text = " ".join(r.content for t in dialog.turns for r in t.receipts).lower()
     assert "pending" in receipts_text and "total" in receipts_text, receipts_text
+
+
+@pytest.mark.asyncio
+async def test_362_defect_repro_is_caught_by_inv4a(db_session):
+    """Режущая способность #362: скриптуем САМ дефект — успешная запись (add_task ok) +
+    ложная отмена в реплике — и убеждаемся, что харнесс краснеет на инв.4a. Доказывает: если
+    модель/детектор вернёт «Отменила» поверх состоявшейся записи, харнесс это поймает."""
+    defect = Fixture(
+        id="362_defect_repro", bug="#362",
+        summary="дефект-репро: add_task ok + ложная отмена в реплике",
+        turns=[ScriptedTurn(
+            "Сахар утром 16 и 2",
+            [ai_tool("add_task", {"title": "сахар утром 16, вечером 2"}),
+             ai_text("Отменила, ничего не делаю.")])])
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    dialog = await run_fixture(defect, db_session, u)
+    problems = check_fixture(dialog, defect, db_session, u)
+    assert dialog.turns[0].db_diff.get("tasks") == 1, "запись должна была состояться"
+    assert any("mutated_not_cancelled" in p for p in problems), problems

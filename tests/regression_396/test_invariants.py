@@ -35,11 +35,11 @@ def _dialog(*turns: TurnOutcome) -> DialogOutcome:
 
 
 def _ok_receipt(name: str) -> ToolReceipt:
-    return ToolReceipt(name=name, result_kind="ok", content="okv2:added:...", applied=True)
+    return ToolReceipt(name=name, result_kind="ok", content="okv2:added:...", status="applied")
 
 
 def _err_receipt(name: str) -> ToolReceipt:
-    return ToolReceipt(name=name, result_kind="error", content="error:not_found", applied=False)
+    return ToolReceipt(name=name, result_kind="error", content="error:not_found", status="failed")
 
 
 # ─────────────────────────── инв.1 no_false_success ───────────────────────────
@@ -164,3 +164,43 @@ def test_inv4_catches_mutation_on_ambiguous_cancel():
 def test_inv4_silent_when_no_mutation():
     d = _dialog(_turn("Уточни, что именно отменить?"))
     assert inv_ambiguous_cancel_zero_mutations(d, turns=[0]) == []
+
+
+# ─────────── R2 (ревью sol+terra): корпус форм успеха/отмены/техвыдачи ───────────
+
+def test_inv1_catches_passive_claim_forms():
+    """Пассив/безличные («список обновлён», «задача создана», «всё внесено») без эффекта."""
+    for reply in ("Список обновлён.", "Задача создана.", "Всё внесено.",
+                  "Запись сохранена.", "Чек-лист заархивирован."):
+        d = _dialog(_turn(reply, tool_calls=["add_checklist_items"]))
+        assert inv_no_false_success(d), f"пропущена форма: {reply!r}"
+
+
+def test_inv1_silent_on_already_applied():
+    """already_applied (цель уже в нужном состоянии) — не ложный успех, даже без новой строки."""
+    r = ToolReceipt(name="add_shopping_items", result_kind="ok",
+                    content="okv2:added_with_dups:...", status="already_applied")
+    d = _dialog(_turn("Молоко уже добавила.", tool_calls=["add_shopping_items"], receipts=[r]))
+    assert inv_no_false_success(d) == []
+
+
+def test_inv4a_catches_extra_cancel_forms():
+    for reply in ("Ничего не меняла.", "Оставила без изменений.", "Не стала менять."):
+        d = _dialog(_turn(reply, tool_calls=["add_task"], receipts=[_ok_receipt("add_task")],
+                          after={**_Z, "tasks": 1}))
+        assert inv_mutated_not_cancelled(d), f"пропущена форма отмены: {reply!r}"
+
+
+def test_inv5_catches_protocol_prefixes():
+    """Сырые протокол-квитанции в реплике юзеру: ok:archived / error: / not_found:."""
+    for reply in ("Готово: ok:archived.", "error: internal ошибка", "not_found: список"):
+        d = _dialog(_turn(reply))
+        assert inv_public_no_tech(d), f"пропущена протокол-утечка: {reply!r}"
+
+
+def test_inv5_does_not_overflag_english_list_names():
+    """R2: общие сущ. (Shopping/Checklist/Done как ИМЯ) больше не флагаются (меньше ложных красных).
+    Но счётчик «done» в формате #390 всё ещё ловится _EN_TECH_RE."""
+    assert tech_tokens("Твой список Shopping — 3 дела.") == []
+    assert tech_tokens("Список Checklist готов.") == []
+    assert "done" in [x.lower() for x in tech_tokens("2 pending, 2 done")]

@@ -145,17 +145,20 @@ F362_DIRECT_WRITE = Fixture(
 F_IDEMPOTENCY = Fixture(
     id="synthetic_idempotency",
     bug="inv3",
-    summary="тот же idempotency_key (повтор «добавь молоко») ⇒ ≤1 мутация — второй add "
-            "дедупится (0 новых строк). Инв.3.",
+    summary="ОДИН idempotency_key (тот же inbound_message_id → тот же turn_key/operation_id) на "
+            "двух ходах ⇒ ≤1 мутация. R2 (ревью sol+terra): пинним inbound_id, иначе тест мерил "
+            "лишь дедуп по имени, а не replay-идемпотентность ключа. Инв.3.",
     turns=[
         ScriptedTurn(
             "добавь молоко в покупки",
             [ai_tool("add_shopping_items", {"items": [{"title": "молоко"}]}),
-             ai_text("Готово, добавила молоко.")]),
+             ai_text("Готово, добавила молоко.")],
+            inbound_id="idem-key-1"),
         ScriptedTurn(
             "добавь молоко в покупки",
             [ai_tool("add_shopping_items", {"items": [{"title": "молоко"}]}),
-             ai_text("Молоко уже в списке.")]),
+             ai_text("Молоко уже в списке.")],
+            inbound_id="idem-key-1"),   # ← ТОТ ЖЕ ключ: реальный replay
     ],
     idempotent_group=([0, 1], "shopping"),
     expect_mutations={"shopping": 1},
@@ -167,16 +170,22 @@ F_IDEMPOTENCY = Fixture(
 F_AMBIGUOUS_CANCEL = Fixture(
     id="synthetic_ambiguous_cancel",
     bug="inv4",
-    summary="неоднозначная «отмени» без явной цели (два напоминания) ⇒ 0 мутаций — уточнить, "
-            "а не удалять наугад. Инв.4.",
-    seed=lambda s, u: _seed_lists(s, u, {"дела": ["первое", "второе"]}),
+    summary="неоднозначная цель отмены ⇒ 0 мутаций. R2 (ревью sol+terra): модель РЕАЛЬНО зовёт "
+            "деструктивный archive_checklist с needle «дела», совпадающим с ДВУМЯ списками — "
+            "runtime не должен молча заархивировать ни один (резолвер+confirm-гейт). Инв.4 по "
+            "ЛОГИЧЕСКОМУ снимку (статусы), не только count.",
+    seed=lambda s, u: _seed_lists(s, u, {"дела на дачу": ["первое"], "дела на сегодня": ["второе"]}),
     turns=[
         ScriptedTurn(
-            "отмени",
-            [ai_text("Что именно отменить? Уточни, пожалуйста.")]),
+            "удали список дела",
+            [ai_tool("archive_checklist", {"list_id_or_title": "дела"}),
+             ai_text("Уточни, какой именно список удалить?")]),
     ],
     ambiguous_cancel_turns=[0],
-    forbid_mutations=["checklist_items", "checklists", "tasks", "reminders", "shopping"],
+    expect_final=lambda s, u: (
+        [] if all(_list_status(s, u, t) == "active" for t in ("дела на дачу", "дела на сегодня"))
+        else ["неоднозначная отмена заархивировала список: "
+              + repr({t: _list_status(s, u, t) for t in ("дела на дачу", "дела на сегодня")})]),
 )
 
 
