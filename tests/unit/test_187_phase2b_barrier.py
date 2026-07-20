@@ -361,7 +361,9 @@ def test_turn_paths_recheck_is_tenant_active_under_lock() -> None:
         ("_process_approved_turn_locked (TG)", tg_src),
         ("_process_approved_max_turn (MAX)", max_src),
     ):
-        adv_idx = src.find("tenant_advisory_lock(")
+        # R1 M11: TG перешёл на tenant_advisory_lock_async (MAX пока sync) —
+        # ищем по общей подстроке, инвариант «advisory до re-check» сохранён.
+        adv_idx = src.find("tenant_advisory_lock")
         recheck_idx = src.find("is_tenant_active(")
         assert adv_idx != -1, f"{name} must enter tenant_advisory_lock"
         assert recheck_idx != -1, (
@@ -419,9 +421,10 @@ def test_tg_advisory_nested_inside_asyncio_tenant_lock() -> None:
     # asyncio lock is taken in the outer fn, which then calls the locked inner fn
     assert "async with tenant_lock" in outer
     assert "_process_approved_turn_locked" in outer
-    # advisory is entered in the inner (already-locked) fn, not the outer one
-    assert "tenant_advisory_lock(" in inner
-    assert "tenant_advisory_lock(" not in outer, (
+    # advisory is entered in the inner (already-locked) fn, not the outer one.
+    # R1 M11: TG advisory теперь async (tenant_advisory_lock_async).
+    assert "tenant_advisory_lock_async(" in inner
+    assert "tenant_advisory_lock_async(" not in outer, (
         "advisory must be entered inside the asyncio-locked inner fn, not before"
     )
 

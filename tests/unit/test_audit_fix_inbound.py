@@ -116,11 +116,11 @@ def test_tg_fresh_update_still_creates_secure_record(lite_session):
 def test_max_callback_without_user_returns_none_not_bot_id():
     """Callback без ``callback.user``: явный fail (caller дропнет update),
     а НЕ fallthrough в ``message.sender`` (там БОТ — путь инцидента
-    tenant_max_290524257)."""
+    tenant_max_99000003)."""
     payload = {
         "update_type": "message_callback",
         "callback": {"callback_id": "cb1", "payload": "rem_done:rid-1"},
-        "message": {"sender": {"user_id": 290524257}},  # БОТ, автор кнопочного сообщения
+        "message": {"sender": {"user_id": 99000003}},  # БОТ, автор кнопочного сообщения
     }
     assert _extract_max_sender_user_id(payload) is None
 
@@ -128,10 +128,10 @@ def test_max_callback_without_user_returns_none_not_bot_id():
 def test_max_callback_with_user_returns_user_id():
     payload = {
         "update_type": "message_callback",
-        "callback": {"callback_id": "cb1", "user": {"user_id": 40921122}},
-        "message": {"sender": {"user_id": 290524257}},
+        "callback": {"callback_id": "cb1", "user": {"user_id": 99000001}},
+        "message": {"sender": {"user_id": 99000003}},
     }
-    assert _extract_max_sender_user_id(payload) == 40921122
+    assert _extract_max_sender_user_id(payload) == 99000001
 
 
 def test_max_message_created_still_uses_message_sender():
@@ -139,14 +139,14 @@ def test_max_message_created_still_uses_message_sender():
     payload = {
         "update_type": "message_created",
         "timestamp": 1777907183208,
-        "message": {"sender": {"user_id": 40921122}},
+        "message": {"sender": {"user_id": 99000001}},
     }
-    assert _extract_max_sender_user_id(payload) == 40921122
+    assert _extract_max_sender_user_id(payload) == 99000001
 
 
 def test_max_bot_started_still_uses_payload_user():
-    payload = {"update_type": "bot_started", "user": {"user_id": 40921122}}
-    assert _extract_max_sender_user_id(payload) == 40921122
+    payload = {"update_type": "bot_started", "user": {"user_id": 99000001}}
+    assert _extract_max_sender_user_id(payload) == 99000001
 
 
 # ---------------------------------------------------------------------------
@@ -467,8 +467,8 @@ def fresh_db(monkeypatch, tmp_path: Path):
     get_session_factory.cache_clear()
 
 
-MAX_ACCOUNT_ID = "40921122"
-MAX_CHAT_ID = "320955459"
+MAX_ACCOUNT_ID = "99000001"
+MAX_CHAT_ID = "99000002"
 TG_CHAT_ID = "100000003"
 
 

@@ -273,10 +273,13 @@ async def _process_approved_turn_locked(
     # (тесты) — no-op. Дополняет in-process tenant_lock (тот сериализует ходы в
     # одном процессе; advisory — cross-process против админ-delete). ExitStack —
     # симметричный unlock на любом пути выхода без переиндентации тела хода.
-    from contextlib import ExitStack
+    from contextlib import AsyncExitStack
 
-    from sreda.services.tenant_lifecycle import tenant_advisory_lock
-    _barrier = ExitStack()
+    # M11 (R1): async advisory lock — sync tenant_advisory_lock блокировал бы
+    # event loop на захвате PG advisory-лока (DB-roundtrip). AsyncExitStack
+    # держит симметричный unlock на любом пути выхода.
+    from sreda.services.tenant_lifecycle import tenant_advisory_lock_async
+    _barrier = AsyncExitStack()
     # #252: ранний голосовой ак — объявляем ДО outer-try, чтобы outer-finally-ловушка
     # (ниже) не упала на UnboundLocalError, если ход бросит до его установки.
     _early_ack_mid: int | None = None
@@ -285,8 +288,8 @@ async def _process_approved_turn_locked(
         # ``_process_approved_turn``) — если захват advisory-лока бросит,
         # ``finally`` ниже всё равно закроет bg_session (раньше enter_context был
         # ДО try → исключение из захвата лока утекало bg_session).
-        _barrier.enter_context(
-            tenant_advisory_lock(bg_session, onboarding.tenant_id)
+        await _barrier.enter_async_context(
+            tenant_advisory_lock_async(bg_session, onboarding.tenant_id)
         )
         # #187 дверь #6 (A3 re-check ПОД локом): ingress-гейт (handle_telegram_update)
         # проверил активность ДО спавна хода, но между гейтом и захватом лока админ
@@ -556,9 +559,9 @@ async def _process_approved_turn_locked(
                             ("daily", _qdaily, SREDA_FREE_LLM_DAILY),
                             ("monthly", _qmonthly, SREDA_FREE_LLM_MONTHLY),
                         ]
-                        if not _qledger.try_consume(
+                        if not await _qledger.try_consume_async(
                             onboarding.tenant_id, "llm_turns", 1, _qperiods
-                        ):
+                        ):  # M10 (R1): async — не блокируем event loop time.sleep'ом
                             try:
                                 await telegram_client.send_message(
                                     chat_id=str(onboarding.chat_id),
@@ -745,7 +748,7 @@ async def _process_approved_turn_locked(
         # #187 Phase 2b: отпустить advisory-lock ДО close() сессии. Лок session-
         # scoped — закрытие соединения тоже снимет его, но явный unlock держит
         # симметрию с soft_delete_tenant и не зависит от порядка GC.
-        _barrier.close()
+        await _barrier.aclose()  # M11 (R1): async close AsyncExitStack
         bg_session.close()
         tenant_ctx.reset(_tenant_tok)  # #138 Ф2: снять tenant-контекст хода
 

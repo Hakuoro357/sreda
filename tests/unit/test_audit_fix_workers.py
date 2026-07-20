@@ -278,14 +278,16 @@ _NOW = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
 
 
 def test_outbox_permanent_4xx_dead_letters_immediately(worker_db):
-    """403 «bot was blocked by the user» → failed с ПЕРВОЙ попытки
-    (бессмысленно ретраить), drop_reason фиксирует причину, claim снят."""
+    """400 «Bad Request» (payload-перманент) → failed с ПЕРВОЙ попытки
+    (бессмысленно ретраить тот же payload), drop_reason фиксирует причину,
+    claim снят. Прим.: 401/403 БОЛЬШЕ НЕ перманентны (R1 M15 — состояние
+    КАНАЛА, retryable; см. test_audit_fix_r1_privacy.py)."""
     _seed_base(worker_db)
     tg = _FailingTelegram(
         TelegramDeliveryError(
-            "Forbidden: bot was blocked by the user",
+            "Bad Request: message text is empty",
             method="sendMessage",
-            status_code=403,
+            status_code=400,
         )
     )
     worker = OutboxDeliveryWorker(telegram_client=tg)
@@ -299,7 +301,7 @@ def test_outbox_permanent_4xx_dead_letters_immediately(worker_db):
     worker_db.expire_all()
     row = worker_db.get(OutboxMessage, row.id)
     assert row.status == "failed"
-    assert row.drop_reason == "delivery_permanent_403"
+    assert row.drop_reason == "delivery_permanent_400"
     assert row.claim_token is None
     assert row.lease_expires_at is None
     assert row.id not in od._DELIVERY_ATTEMPTS
