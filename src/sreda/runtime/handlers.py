@@ -2814,7 +2814,11 @@ async def _chat_preflight(
         with trace.step("chat.gate.quota") as _meta:
             _daily_key, _monthly_key = msk_period_keys()
             _ledger = UsageLedgerService(session.get_bind())
-            _quota_ok = _ledger.try_consume(
+            # M10 (R1): _chat_preflight — async; sync try_consume при
+            # serialization-конфликте делает time.sleep, блокируя event loop.
+            # try_consume_async офлоадит DB-roundtrip в to_thread + asyncio.sleep,
+            # семантика идентична (all-or-nothing, 3 попытки).
+            _quota_ok = await _ledger.try_consume_async(
                 action.tenant_id, "llm_turns", 1,
                 [
                     ("daily", _daily_key, SREDA_FREE_LLM_DAILY),

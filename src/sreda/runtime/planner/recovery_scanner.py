@@ -88,6 +88,14 @@ _TERMINAL_EXECUTION_STATUSES: frozenset[str] = frozenset(
 # execution is terminalized as failed_needs_manual + P1 alert.
 MAX_RECOVERY_ATTEMPTS = 5
 
+# M6 (R1): множитель settle-окна для ТЕРМИНАЛИЗАЦИИ started/unknown_pending в
+# failed_needs_manual. Отменённый asyncio.to_thread нельзя убить — он мог поздно
+# закоммитить durable-запись после базового settle-окна; consumer-код read'ит
+# результат через probe. Терминализуем только по «жёсткому» окну (settle × это),
+# давая поздней записи время лечь (probe → mark_committed раньше failed). re_probe
+# продолжается до жёсткого окна с выровненным backoff (без tight-loop).
+_M6_HARD_SETTLE_FACTOR = 2
+
 
 @dataclass(frozen=True)
 class _AlertPayload:
@@ -388,8 +396,19 @@ def recover_execution(
         if updated_at.tzinfo is None:
             # Defensive: column declared tz-aware; guard anyway.
             updated_at = updated_at.replace(tzinfo=timezone.utc)
+        # M6 (R1): отменённый asyncio.to_thread нельзя убить — он мог поздно
+        # закоммитить durable-запись ПОСЛЕ settle-окна. Терминализуем
+        # started/unknown_pending → failed_needs_manual только по КОНСЕРВАТИВНОМУ
+        # (hard) окну = settle_window × фактор: даём поздней записи время лечь,
+        # прежде чем объявить сбой (иначе ложный failed при реально легшей
+        # записи). probe остаётся авторитетом — если запись легла в grace, на
+        # следующем проходе сработает mark_committed. re_probe-backoff ниже
+        # выровнен на то же hard-окно (без tight-loop). Прим.: time-based grace
+        # СНИЖАЕТ вероятность ложного failed, но не «доказывает» смерть потока
+        # (кросс-процессно недостижимо) — остаточный редкий кейс задокументирован.
+        _hard_settle_seconds = settle_window_seconds * _M6_HARD_SETTLE_FACTOR
         settle_elapsed: bool = (
-            (now - updated_at).total_seconds() > settle_window_seconds
+            (now - updated_at).total_seconds() > _hard_settle_seconds
         )
 
         # --- Decision ----------------------------------------------------
@@ -430,7 +449,9 @@ def recover_execution(
             # Earliest time THIS step's settle window elapses. The backoff
             # lease (below) uses the minimum across all re_probe steps so the
             # scanner never re-claims before any pending step could settle.
-            step_deadline = updated_at + timedelta(seconds=settle_window_seconds)
+            # M6 (R1): выровнено на hard-окно — иначе backoff в прошлом дал бы
+            # tight-loop re-claim'ов в grace-периоде между soft и hard окнами.
+            step_deadline = updated_at + timedelta(seconds=_hard_settle_seconds)
             if (
                 earliest_reprobe_deadline is None
                 or step_deadline < earliest_reprobe_deadline
@@ -713,6 +734,14 @@ def run_recovery_scan(
                 now=now_fn(),
                 settle_window_seconds=settle_window_seconds,
             )
+            # recovery_scanner MINOR (R1): успешный (без raise) проход recovery
+            # → сбросить recovery_attempt. Иначе законные re_probe-циклы (settle-
+            # окно ещё открыто) копят счётчик через claim, и ПЕРВЫЙ же реальный
+            # сбой сразу упирается в poison-ceiling. Ceiling обязан считать
+            # только ПОДРЯД идущие raise'ы (детерминированно падающий recovery).
+            _exec = exec_session.get(PlannerExecution, execution_id)
+            if _exec is not None and (_exec.recovery_attempt or 0) != 0:
+                _exec.recovery_attempt = 0
             exec_session.commit()
         except Exception:
             logger.exception(

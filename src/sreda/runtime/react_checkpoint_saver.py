@@ -260,16 +260,25 @@ class EncryptedSqlCheckpointSaver(BaseCheckpointSaver):
                 set_=set_,
             )
             s.execute(stmt)
-            self._prune_thread_locked(s, thread_id, ns)  # ретенция активного треда (см. константу)
+            # M8 (R1): передаём cp_id — prune обязан сохранить только что
+            # записанный checkpoint, даже если он не в top-N по сортировке id.
+            self._prune_thread_locked(s, thread_id, ns, keep_cp_id=cp_id)  # ретенция (см. константу)
             s.commit()
         return self._cfg(thread_id, ns, cp_id)
 
     @staticmethod
-    def _prune_thread_locked(session, thread_id: str, ns: str) -> None:
+    def _prune_thread_locked(
+        session, thread_id: str, ns: str, *, keep_cp_id: str | None = None,
+    ) -> None:
         """Обрезать тред до последних ``PRUNE_KEEP_PER_THREAD`` checkpoint'ов (та же сессия/
         транзакция, что upsert — атомарно). «Последний» = максимальный checkpoint_id (тот же
         принцип сортировки, что в get_tuple). Writes удаляются первыми (как delete_thread).
-        Дёшево при росте ниже потолка: один LIMIT-SELECT, DELETE не исполняется."""
+        Дёшево при росте ниже потолка: один LIMIT-SELECT, DELETE не исполняется.
+
+        M8 (R1): ``keep_cp_id`` — checkpoint_id только что записанного put(). Prune
+        ОБЯЗАН его сохранить, даже если он не попал в top-N по сортировке id
+        (не-монотонный/меньший id, вставленный в тред с ≥N бо́льшими id) — иначе
+        свежая запись удалялась бы в той же транзакции сразу после вставки."""
         keep = PRUNE_KEEP_PER_THREAD
         if keep <= 0:
             return
@@ -283,19 +292,23 @@ class EncryptedSqlCheckpointSaver(BaseCheckpointSaver):
             .limit(keep)
         ).scalars().all()
         if len(keep_ids) < keep:
-            return  # строк меньше потолка — резать точно нечего
+            return  # строк меньше потолка — резать точно нечего (cp_id среди них)
+        # M8: форсим текущий cp_id в keep-набор, если сортировка его не удержала.
+        keep_list = list(keep_ids)
+        if keep_cp_id is not None and keep_cp_id not in keep_list:
+            keep_list.append(keep_cp_id)
         session.execute(
             delete(ReactCheckpointWrite).where(
                 ReactCheckpointWrite.thread_id == thread_id,
                 ReactCheckpointWrite.checkpoint_ns == ns,
-                ~ReactCheckpointWrite.checkpoint_id.in_(keep_ids),
+                ~ReactCheckpointWrite.checkpoint_id.in_(keep_list),
             )
         )
         session.execute(
             delete(ReactCheckpoint).where(
                 ReactCheckpoint.thread_id == thread_id,
                 ReactCheckpoint.checkpoint_ns == ns,
-                ~ReactCheckpoint.checkpoint_id.in_(keep_ids),
+                ~ReactCheckpoint.checkpoint_id.in_(keep_list),
             )
         )
 

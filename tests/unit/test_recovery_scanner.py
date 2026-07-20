@@ -38,6 +38,7 @@ from sreda.runtime.planner.recovery import (
     TERMINAL_FAILED_NEEDS_MANUAL,
 )
 from sreda.runtime.planner.recovery_scanner import (
+    _M6_HARD_SETTLE_FACTOR,
     claim_stale_executions,
     recover_execution,
     run_recovery_scan,
@@ -425,15 +426,17 @@ class TestRecoverExecution:
         execution = session.get(PlannerExecution, exec_id)
         assert execution is not None
         assert execution.execution_status == "in_progress"  # not changed to terminal
-        # BACKOFF lease (NOT None) = step.updated_at + settle_window — so the
-        # next scan does not tight-loop re-claim before the step could settle.
-        # Codex A/B #9c R1 MAJOR.
+        # BACKOFF lease (NOT None) = step.updated_at + HARD settle window (M6 R1:
+        # settle_window × _M6_HARD_SETTLE_FACTOR) — grace для позднего to_thread
+        # commit, backoff выровнен на то же окно (без tight-loop). Codex A/B #9c.
         assert execution.recovery_lease_until is not None
         # SQLite reads DateTime back as naive; normalise to UTC before compare.
         lease = execution.recovery_lease_until
         if lease.tzinfo is None:
             lease = lease.replace(tzinfo=timezone.utc)
-        assert lease == NOW + timedelta(seconds=SETTLE_SECONDS)
+        assert lease == NOW + timedelta(
+            seconds=SETTLE_SECONDS * _M6_HARD_SETTLE_FACTOR
+        )
 
     def test_unknown_pending_settled_not_landed_yields_failed_needs_manual(
         self, session: Session
@@ -555,7 +558,8 @@ class TestRecoverExecution:
             settle_window_seconds=SETTLE_SECONDS,
         )
         assert outcome.status == "re_probe_pending"
-        deadline = NOW + timedelta(seconds=SETTLE_SECONDS)
+        # M6 (R1): backoff = updated_at + HARD settle window (settle × factor).
+        deadline = NOW + timedelta(seconds=SETTLE_SECONDS * _M6_HARD_SETTLE_FACTOR)
 
         # A claim BEFORE the backoff deadline must NOT re-claim (lease active).
         before = claim_stale_executions(

@@ -526,6 +526,11 @@ def build_cached_prefix(
     across all tenants for a given (tool_registry, template_registry,
     few_shot) snapshot."""
     specs = list(tool_specs)
+    # MINOR (R1): материализуем ВСЕ итераторы до fingerprint — _prefix_fingerprint
+    # исчерпывает composer_* через set(...), и на cache-miss template.render ниже
+    # получил бы пустые генераторы → пустые composer-блоки, закешированные под key.
+    composer_template_ids = list(composer_template_ids)
+    composer_llm_prompt_keys = list(composer_llm_prompt_keys)
     key = _prefix_fingerprint(
         specs, composer_template_ids, composer_llm_prompt_keys, few_shot_block,
     )

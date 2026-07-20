@@ -132,11 +132,14 @@ def mark_step_status(
             "'started' is set only by open_step()."
         )
 
+    # M5 (R1): row lock на check-then-update — устраняет гонку двух писателей
+    # (last-write-wins) на уровне БД; на SQLite no-op (движок сериализует сам).
+    # Recovery уже сериализован lease'ом per-execution, это второй слой.
     row = session.execute(
         select(StepExecutionLedger).where(
             StepExecutionLedger.execution_id == execution_id,
             StepExecutionLedger.step_id == step_id,
-        )
+        ).with_for_update()
     ).scalar_one_or_none()
     if row is None:
         raise LookupError(
@@ -151,7 +154,21 @@ def mark_step_status(
     # hypothetical late writer (scanner + belated _best_effort_mark in
     # separate sessions) could otherwise flip committed → unknown with
     # last-commit-wins. Same-status re-marks stay idempotent no-ops.
-    if row.status in _TERMINAL_STATUSES and row.status != status:
+    #
+    # M5 (R1): ИСКЛЮЧЕНИЕ — recovery легитимно ПОВЫШАЕТ unknown/unknown_pending
+    # → committed после того как probe_operation доказал, что durable-запись
+    # состоялась (recovery.decide_recovery → "mark_committed"). Раньше guard
+    # блокировал это как «overwrite terminal» → ledger-строка навсегда
+    # оставалась unknown, хотя запись реально легла. Защищаем ТОЛЬКО committed
+    # от понижения и cross-flip между двумя unknown-вариантами.
+    _recovery_promotion = (
+        row.status in ("unknown", "unknown_pending") and status == "committed"
+    )
+    if (
+        row.status in _TERMINAL_STATUSES
+        and row.status != status
+        and not _recovery_promotion
+    ):
         logger.warning(
             "step_ledger: refusing to overwrite terminal status %r with %r "
             "for execution_id=%r step_id=%r — first terminal write wins",
