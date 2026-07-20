@@ -87,9 +87,10 @@ def test_shopping_destructive_and_edits_still_candidates():
 
 
 def test_other_add_tools_still_candidates():
-    """Другие аддитивные семьи данными НЕ доказаны (#389 — только покупки):
-    add_task / add_checklist_items остаются кандидатами при allowed_write=∅."""
-    for name in ("add_task", "add_checklist_items"):
+    """Аддитивные семьи вне autoexec-реестра остаются кандидатами при allowed_write=∅.
+    #389 добавил add_shopping_items, #392 — add_checklist_items (обе доказаны данными
+    + owner-«да»); add_task данными НЕ доказан → кандидат под confirm (регрессия границы)."""
+    for name in ("add_task",):
         t = _tool(name)
         out = _apply_unified_policy([t], ["web"], [])
         assert len(out) == 1 and out[0] is not t, name

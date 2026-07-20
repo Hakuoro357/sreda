@@ -554,7 +554,9 @@ _CONFIRM_PHRASE = {
     "clear_menu": "очищу меню",
     "remove_family_member": "удалю члена семьи",
     "delete_checklist_item": "удалю пункт чек-листа",
-    "archive_checklist": "архивирую чек-лист",
+    # #394: юзер говорит «удали» → копия на его языке, БЕЗ внутреннего «архив*» (действие
+    # остаётся soft-delete/status=archived, обратимость не тронута — правка только копии).
+    "archive_checklist": "удаляю чек-лист",
     # move_task_to_checklist шаг 1 ОТМЕНЯЕТ исходную задачу (+напоминание) — destructive,
     # обходил бы confirm иначе (все 3 ревьюера, MAJOR).
     "move_task_to_checklist": "перенесу задачу в дела (исходная задача отменится)",
@@ -709,7 +711,7 @@ def _confirm_phrase(name: str, session: Any, tenant_id: str, user_id: str) -> An
                     cl = ChecklistService(session).find_list_by_title(
                         tenant_id=tenant_id, user_id=user_id, needle=needle)
                     if cl is not None and getattr(cl, "title", None):
-                        return f"архивирую чек-лист «{cl.title}»"
+                        return f"удаляю чек-лист «{cl.title}»"  # #394: язык юзера, без «архив*»
             except Exception:  # noqa: BLE001 — резолв best-effort, не валит confirm
                 logger.warning("react_loop: confirm-phrase archive resolve failed", exc_info=True)
             return static
@@ -1779,23 +1781,28 @@ def _generic_confirm_wrap(inner: Any) -> Any:
     )
 
 
-# #389: аддитивные write-инструменты, доказанные прод-данными как чистое трение под
-# candidate-confirm — продолжение диктовки покупок («1 литр молока», «Еще добавь в соль»)
-# не несёт императив+домен-слово в ОДНОМ сообщении → allowed_write=∅ → «Подтверждаешь?»
-# на каждом пункте; оба прод-кейса (react_turn_trace 18.07) resolved yes = промах сигнала
-# по калибровочному контракту #285 Фазы A. Точечное осознанное исключение из пилляра
-# «нет молчаливой записи» (позиция владельца в issue: добавление — аддитивно, видимо,
-# обратимо). ТОЛЬКО add_shopping_items; фикс НЕ расширяет autoexec на деструктив
-# (remove_*/clear_* остаются в общем двухъярусном контуре B2) и другие семьи — сюда
-# БЕЗ прод-данных не добавлять. R2 (субагент MAJOR): autoexec гейтится отсутствием
-# КОНКУРИРУЮЩЕГО write-домена роутера — «добавь в список дел купить молоко» даёт
-# aw={checklists}, прямой shopping-write тут противоречил бы роутеру → кандидат+confirm
-# (confirm примиряет расхождение «роутер vs выбор модели», как до #389).
-_UNIFIED_AUTOEXEC_WRITE_TOOLS = frozenset({"add_shopping_items"})
+# #389/#392: аддитивные write-инструменты, доказанные как чистое трение под
+# candidate-confirm — продолжение диктовки порциями («1 литр молока», «Еще добавь в
+# соль», «Ещё добавь уголь») не несёт императив+домен-слово в ОДНОМ сообщении →
+# allowed_write=∅ → «Подтверждаешь?» на каждом пункте. Точечное осознанное исключение из
+# пилляра «нет молчаливой записи» (позиция владельца: добавление — аддитивно, видимо,
+# обратимо), ПОШТУЧНО с owner-«да» и прод-данными:
+#   • add_shopping_items — #389 (react_turn_trace 18.07, оба кейса resolved yes = промах
+#     сигнала по калибровочному контракту #285 Фазы A);
+#   • add_checklist_items — #392 (тот же паттерн в семье чек-листов; владелец отметил
+#     живьём 20.07: «Ещё добавь уголь» в список → лишний confirm).
+# Фикс НЕ расширяет autoexec на деструктив (remove_*/clear_*/delete_*/archive_* остаются в
+# общем двухъярусном контуре B2) и на семьи БЕЗ прод-данных+owner-«да» (add_task и пр.) —
+# сюда не добавлять. R2 (субагент MAJOR): autoexec гейтится отсутствием КОНКУРИРУЮЩЕГО
+# write-домена роутера — «добавь в список дел купить молоко» даёт aw={checklists}, прямой
+# shopping-write тут противоречил бы роутеру → кандидат+confirm (confirm примиряет
+# расхождение «роутер vs выбор модели», как до #389); симметрично для add_checklist_items
+# при aw={shopping}.
+_UNIFIED_AUTOEXEC_WRITE_TOOLS = frozenset({"add_shopping_items", "add_checklist_items"})
 # Вторая «рука» гварда (R2 sol MINOR): owner-approved allowlist. Расширение реестра выше
 # требует ОДНОВРЕМЕННОЙ правки этого списка — т.е. отдельного осознанного решения владельца
 # с прод-данными; «add_task тоже add_* — пройдёт» больше не проходит (валидатор упадёт).
-_UNIFIED_AUTOEXEC_OWNER_ALLOWLIST = frozenset({"add_shopping_items"})
+_UNIFIED_AUTOEXEC_OWNER_ALLOWLIST = frozenset({"add_shopping_items", "add_checklist_items"})
 
 
 def _validate_unified_autoexec_registry(registry: frozenset | None = None) -> None:

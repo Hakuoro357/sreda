@@ -132,8 +132,12 @@ _ADD_WHERE: dict[str, str] = {
     "add_shopping_items": "список покупок",
 }
 # target-действия: (глагол, success-префикс результата, поле имени цели, тип-фраза без имени).
+# #394: archive — юзер говорит «удали» → копия на его языке, БЕЗ внутреннего «архив*»
+# (spec[0] тёплый глагол страховки; spec[3] серверный факт заряжает промпт узла chat, из-за
+# него модель раньше отвечала «заархивировала»). Механика — soft-delete/status=archived,
+# обратимость не тронута; правка только копии.
 _TARGET_SPECS: dict[str, tuple[str, str, str, str]] = {
-    "archive_checklist": ("убрала список", "ok:archived", "list_id_or_title", "заархивирован чек-лист"),
+    "archive_checklist": ("удалила список", "ok:archived", "list_id_or_title", "удалён список"),
     "schedule_reminder": ("поставила напоминание", "ok:scheduled", "title", "поставлено напоминание"),
 }
 

@@ -165,7 +165,8 @@ def test_collect_undisplayable_names_degrade_not_drop_393():
         _tm("ok:archived:checklist_" + "a" * 24, name="archive_checklist")])
     assert len(t) == 1 and t[0].target == ""
     fb = fallback_reply(t)
-    assert fb and "checklist_" not in fb.lower() and "убрала список" in fb
+    # #394: финал-копия на языке юзера («удалила список»), без внутреннего «архив*».
+    assert fb and "checklist_" not in fb.lower() and "удалила список" in fb
 
 
 def test_detector_and_fallback_undisplayable_items_use_count_393():
@@ -215,7 +216,9 @@ def test_grounding_note_has_facts_not_names_393():
 
 def test_grounding_note_archive_facts_393():
     note = grounding_note(collect_successful_writes(_archive_msgs()))
-    assert "заархивирован чек-лист" in note and "дача" not in note.lower()
+    # #394: серверный факт заряжает голос на языке юзера («удалён список»), без «архив*».
+    assert "удалён список" in note and "дача" not in note.lower()
+    assert "архив" not in note.lower()
 
 
 # ─────────────────────────── reply_grounds_result (детектор) ───────────────────────────
@@ -391,7 +394,8 @@ async def test_e2e_archive_resumed_filler_substituted_393(db_session):
         llm=_StubLLM([AIMessage(content="", tool_calls=[{
             "name": "archive_checklist", "args": {"list_id_or_title": "Дача"}, "id": "c1"}])]),
         user_text="Удали список Дача", inbound_message_id="m1", channel="max")
-    assert "архивир" in str(r1).lower() or "убер" in str(r1).lower(), r1
+    # #394: confirm-пауза на языке юзера («удаляю»), БЕЗ внутреннего «архив*» (e2e unified-путь).
+    assert "удал" in str(r1).lower() and "архив" not in str(r1).lower(), r1
     r2 = await handle_turn(
         session=db_session, tenant_id=u.tenant_id, user_id=u.user_id, thread_id=thread,
         llm=_StubLLM([AIMessage(content="Вот твои списки дел: Кино, Поход, Дела на сегодня.")]),
@@ -399,6 +403,15 @@ async def test_e2e_archive_resumed_filler_substituted_393(db_session):
     s = str(r2).lower()
     assert "кино" not in s and "поход" not in s, r2
     assert "дача" in s, r2
+    # #394: финальный ответ на языке юзера («удалила/убрала»), БЕЗ внутреннего «архив*».
+    assert "архив" not in s, r2
+    assert "удал" in s or "убр" in s, r2
+    # #394: механика не тронута — список реально soft-deleted (status=archived, обратимо).
+    from sreda.db.models.checklists import Checklist
+    cl = (db_session.query(Checklist)
+          .filter(Checklist.tenant_id == u.tenant_id, Checklist.user_id == u.user_id,
+                  Checklist.title == "Дача").one())
+    assert cl.status == "archived", cl.status
 
 
 @pytest.mark.asyncio

@@ -181,7 +181,8 @@ def test_confirm_phrase_archive_checklist_scoped_by_user_264(_scope_session):
 
     ph_owner = _confirm_phrase("archive_checklist", _scope_session, "t1", "u1b")
     out = ph_owner({"list_id_or_title": "Список"})  # фрагмент названия
-    assert "Список Б" in out and "архивирую" in out  # владелец → название (1-е лицо #265)
+    # #394: копия на языке юзера («удаляю»), без внутреннего «архив*»; название подставлено.
+    assert "Список Б" in out and "удаляю" in out and "архив" not in out.lower()
 
 
 def test_confirm_phrase_shopping_real_db_and_status_264(_scope_session):

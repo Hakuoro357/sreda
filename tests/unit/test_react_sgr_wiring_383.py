@@ -506,11 +506,13 @@ def test_sgr_return_contract(install):
 # ─────────────── п.11: confirm-парность на ВСЕХ write-мутациях среза ───────────────
 
 
-@pytest.mark.parametrize("write_tool", ["create_checklist", "add_checklist_items",
-                                        "delete_checklist_item"])
+# add_checklist_items ИСКЛЮЧЁН из confirm-parity с #392 (см. test_sgr_add_checklist_items_autoexec_392
+# ниже): он в _UNIFIED_AUTOEXEC_WRITE_TOOLS → на read-ходе aw=∅ биндится ПРЯМЫМ (аддитивно/видимо/
+# обратимо), а не кандидатом. Деструктив/создание списка (delete/create) confirm сохраняют.
+@pytest.mark.parametrize("write_tool", ["create_checklist", "delete_checklist_item"])
 def test_sgr_confirm_parity(install, write_tool):
-    """приёмка п.11: given чеклистовая мутация, для которой легаси требует подтверждение
-    (на read-ходе allowed_write=∅ → любой write = кандидат под _generic_confirm_wrap),
+    """приёмка п.11: given чеклистовая мутация ВНЕ autoexec-реестра, для которой легаси требует
+    подтверждение (на read-ходе allowed_write=∅ → write = кандидат под _generic_confirm_wrap),
     when SGR её выбирает, then пауза ДО «да» и НОЛЬ мутаций в состоянии до подтверждения.
     Юнит меряет ДИСПЕТЧ (мутация-функция не вызвана до confirm); фактическую неизменность
     ДАННЫХ в БД на всём голд-наборе меряет Ф3-живой прогон (self-verify-before-owner)."""
@@ -520,6 +522,19 @@ def test_sgr_confirm_parity(install, write_tool):
     res = _turn(llm, thread=f"parity-{write_tool}", text=CHECKLIST_TEXT)
     assert getattr(res, "awaiting_confirm", False) is True, str(res)   # пауза до «да»
     assert st["inv"].get(write_tool) is None                          # 0 мутаций до подтверждения
+
+
+def test_sgr_add_checklist_items_autoexec_392(install):
+    """#392 (кросс-фича с #383 п.11): add_checklist_items в autoexec-реестре → на read-ходе
+    «покажи список дел» (aw=∅) SGR-выбор биндится ПРЯМЫМ, БЕЗ confirm-паузы. Осознанный
+    tradeoff (позиция владельца #389/#392: добавление аддитивно/видимо/обратимо). Деструктив
+    чек-листов confirm сохраняет (test_sgr_confirm_parity + test_sgr_pause_survives_flag_off)."""
+    st = install(sgr_flag=True, sgr_tenants="t-canary")
+    llm = _SgrChat("m", sgr_responses=[_act_json("add_checklist_items", q="нечто"),
+                                       _finish_json("Добавила.")])
+    res = _turn(llm, thread="autoexec-addcl", text=CHECKLIST_TEXT)
+    assert getattr(res, "awaiting_confirm", False) is not True, str(res)  # НЕТ паузы
+    assert st["inv"].get("add_checklist_items") == 1                      # исполнен прямо
 
 
 # ─────────────── MINOR#1: golden-пин собранного OFF-промпта (анти-reorder хвоста) ───────────────
