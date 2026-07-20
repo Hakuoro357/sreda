@@ -393,14 +393,16 @@ class BillingService:
         # 2026-07-18 audit fix (#4 money-path): продление анкорится к
         # max(now, due) — раньше new_due считался от прошлого due, и при
         # просрочке >периода active_until оставался В ПРОШЛОМ (деньги списаны
-        # stub-ордером, подписка не активна). Период — из плана
-        # (billing_period_days), не захардкоженные 30 дней; при нескольких
-        # планах берём максимум, чтобы ни один не был недопокрыт.
+        # stub-ордером, подписка не активна).
+        #
+        # 2026-07-18 (R1 C7): период — ПОПЛАНОВЫЙ (anchor + plan.billing_period_days
+        # для КАЖДОЙ позиции), НЕ max по всем. Раньше max() давал 7-дневному
+        # плану 30 дней за одну оплату при смешанном batch'е (прямой финансовый
+        # эффект). Каждый PaymentOrderItem/active_until считается ниже в цикле;
+        # next_payment_due_at цикла = САМОЕ РАННЕЕ окончание (тенант платит
+        # снова, когда истекает первая подписка — не переплачивает и не
+        # недоплачивает ни одну).
         anchor_date = max(current_time, _coerce_utc(cycle.next_payment_due_at))
-        period_days = max(
-            (plan.billing_period_days or 30) for _, plan, _ in renewable_items
-        )
-        new_due_date = anchor_date + timedelta(days=period_days)
         order = self._create_paid_stub_order(
             tenant_id=tenant_id,
             cycle=cycle,
@@ -409,7 +411,13 @@ class BillingService:
             description="Продление подписок",
         )
         renewable_subscriptions = {item[0] for item in renewable_items}
+        per_sub_due_dates: list[datetime] = []
         for subscription, plan, quantity in renewable_items:
+            # C7 (R1): окно ЭТОЙ позиции = anchor + её собственный период плана.
+            sub_due_date = anchor_date + timedelta(
+                days=(plan.billing_period_days or 30)
+            )
+            per_sub_due_dates.append(sub_due_date)
             self.session.add(
                 PaymentOrderItem(
                     id=f"poi_{uuid4().hex[:24]}",
@@ -419,7 +427,7 @@ class BillingService:
                     amount_rub=plan.price_rub * quantity,
                     quantity=quantity,
                     period_start=anchor_date,
-                    period_end=new_due_date,
+                    period_end=sub_due_date,
                     calculation_type="full_cycle",
                 )
             )
@@ -429,7 +437,7 @@ class BillingService:
             # сдвига monthly-квота после первого продления становилась
             # lifetime-квотой (used >= quota навсегда).
             subscription.starts_at = anchor_date
-            subscription.active_until = new_due_date
+            subscription.active_until = sub_due_date
             subscription.quantity = quantity
             subscription.next_cycle_quantity = quantity
             subscription.cancel_at_period_end = False
@@ -444,6 +452,9 @@ class BillingService:
             subscription.next_cycle_quantity = 0
             subscription.updated_at = current_time
 
+        # C7 (R1): цикл — к САМОМУ РАННЕМУ окончанию среди позиций (первая
+        # истекающая подписка задаёт следующую дату оплаты).
+        new_due_date = min(per_sub_due_dates)
         cycle.billing_anchor_at = anchor_date
         cycle.next_payment_due_at = new_due_date
         cycle.status = "active"
