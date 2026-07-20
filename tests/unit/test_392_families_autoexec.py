@@ -7,9 +7,12 @@ owner-allowlist + гейт конкурирующего домена + import-ti
 смены статуса (mark/complete) — НИКОГДА не autoexec.
 
 Итоговый autoexec-набор: add_shopping_items (#389), add_checklist_items (#392),
-add_family_members, save_recipe, save_recipes_batch (чистые листовые семьи).
+save_recipe, save_recipes_batch (recipes имеет read-cue → страховка ловит промах).
 
-ФОРКНУТО (отдельный follow-up, решение оркестратора 2026-07-20):
+ФОРКНУТО (отдельный follow-up):
+  • add_family_members (R2 sol MAJOR) — household БЕЗ read-cue (read_cue_domains=∅ на «кто у меня
+    в семье»): семейный read не биндит list_family_members, а autoexec пишет ПРЯМО, и страховка
+    СЛЕПА (нет read-cue → нет alert) → немеряемая молчаливая PII-запись. Вернуть после household read-cue.
   • add_task — канонический пример candidate-паузы в ~8 тестах #285/#316/#320/#321; autoexec =
     непропорциональный churn confirm-сьюта (поведенчески безопасен, но форк).
   • save_core_fact/save_episode (память) — конфликт с #319 sticky-by-use (дверь серии): блокет-
@@ -39,12 +42,13 @@ def _tool(name):
 
 # инструмент → его домен (для конкурирующего кейса берём ЧУЖОЙ)
 _NEW_AUTOEXEC = [
-    "add_family_members", "save_recipe", "save_recipes_batch",
+    "save_recipe", "save_recipes_batch",
 ]
 
 # форкнуто в отдельный follow-up — НЕ в autoexec:
+#   add_family_members (household без read-cue → страховка слепа, R2 sol MAJOR),
 #   add_task (churn confirm-сьюта #285/#321), память (конфликт #319 sticky)
-_FORKED = ["add_task", "save_core_fact", "save_episode"]
+_FORKED = ["add_family_members", "add_task", "save_core_fact", "save_episode"]
 
 
 @pytest.mark.parametrize("name", _NEW_AUTOEXEC)

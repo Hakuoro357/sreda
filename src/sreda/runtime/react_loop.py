@@ -1789,16 +1789,18 @@ def _generic_confirm_wrap(inner: Any) -> Any:
 # owner-approved (#392-расширение 2026-07-20 «все безопасные семьи»):
 #   • add_shopping_items — #389 (react_turn_trace 18.07, оба кейса resolved yes);
 #   • add_checklist_items — #392 (владелец отметил живьём 20.07: «Ещё добавь уголь»);
-#   • add_family_members / save_recipe / save_recipes_batch — #392-расширение (чистые листовые:
-#     семантически аддитивно/видимо/обратимо; частоту промахов меряет страховка ниже).
-# ФОРКНУТО (в отдельный follow-up, НЕ в #392 — решение оркестратора 2026-07-20):
-#   • add_task — поведенчески безопасен (аддитив/обратим), НО канонический пример candidate-паузы
-#     в ~8 тестах #285/#316/#320/#321 (durable/redirect/stale/abandon/decline); autoexec потребовал
-#     бы репойнта/инвалидации большого пласта confirm-сьюта (churn непропорционален) → форк.
+#   • save_recipe / save_recipes_batch — #392-расширение (аддитивно/видимо/обратимо; recipes имеет
+#     read-cue → страховка ниже РЕАЛЬНО ловит промах на ходе-чтении).
+# ФОРКНУТО (в отдельный follow-up, НЕ в #392 — решение оркестратора 2026-07-20 + R2 Codex):
+#   • add_family_members — R2 sol MAJOR: у домена household НЕТ read-cue (read_cue_domains=∅ на
+#     «кто у меня в семье»), поэтому (а) семейный read-запрос не биндит list_family_members, а
+#     autoexec add_family_members пишет ПРЯМО, и (б) страховка СЛЕПА (нет read-cue → нет alert) →
+#     немеряемая молчаливая PII-запись. Вернуть в autoexec ТОЛЬКО после query-scoped household read-cue.
+#   • add_task — канонический пример candidate-паузы в ~8 тестах #285/#316/#320/#321; autoexec =
+#     непропорциональный churn confirm-сьюта (поведенчески безопасен, но форк).
 #   • save_core_fact/save_episode (память) — диктовку памяти уже решает #319 sticky-by-use (дверь
 #     серии) с безопасным «дверь закрылась → confirm» на первой записи; блокет-autoexec СНЁС бы
-#     дверь #319 (не путать с #363 — та про заземление ОТВЕТА, другая ось). Заменять ли #319 на
-#     autoexec — отдельная развилка владельцу.
+#     дверь #319 (не путать с #363 — та про заземление ОТВЕТА, другая ось). Развилка владельцу.
 # НИКОГДА не autoexec: деструктив (delete_/remove_/clear_/cancel_/archive_), правки (update_*),
 # смены статуса (mark_/complete_), перенос (move_task_to_checklist — деструктив шаг 1),
 # cross-domain read-write (generate_shopping_from_menu) — все в общем двухъярусном контуре B2.
@@ -1808,15 +1810,14 @@ def _generic_confirm_wrap(inner: Any) -> Any:
 # роутера (aw ⊆ доменов инструмента) — «добавь в список дел купить молоко» даёт aw={checklists},
 # прямой shopping-write противоречил бы роутеру → кандидат+confirm (примиряет «роутер vs модель»).
 _UNIFIED_AUTOEXEC_WRITE_TOOLS = frozenset({
-    "add_shopping_items", "add_checklist_items", "add_family_members",
-    "save_recipe", "save_recipes_batch",
+    "add_shopping_items", "add_checklist_items", "save_recipe", "save_recipes_batch",
 })
 # Вторая «рука» гварда (R2 sol MINOR): owner-approved allowlist. Расширение реестра выше требует
 # ОДНОВРЕМЕННОЙ правки этого списка — отдельного осознанного owner-решения; аддитив-префикс сам по
-# себе НЕ пропускает (напр. create_* / add_task / save_core_fact — форк/развилка, не в allowlist → упадёт).
+# себе НЕ пропускает (напр. create_* / add_task / add_family_members / save_core_fact — форк/развилка,
+# не в allowlist → упадёт).
 _UNIFIED_AUTOEXEC_OWNER_ALLOWLIST = frozenset({
-    "add_shopping_items", "add_checklist_items", "add_family_members",
-    "save_recipe", "save_recipes_batch",
+    "add_shopping_items", "add_checklist_items", "save_recipe", "save_recipes_batch",
 })
 # Аддитивные префиксы (создают/добавляют, не удаляют/меняют). Деструктив/правки/статусы сюда НЕ
 # попадают → import-time гвард их отвергает. create_ — аддитив по форме, но owner-allowlist держит
@@ -2070,9 +2071,13 @@ def _maybe_alert_degraded_turn(
 
 def _executed_autoexec_writes(messages) -> frozenset[str]:
     """#392: имена autoexec-write-инструментов (``_UNIFIED_AUTOEXEC_WRITE_TOOLS``), УСПЕШНО
-    исполненных в ТЕКУЩЕМ ходе (окно после последнего HumanMessage; artifact result_kind == 'ok').
-    Пусто, если таких нет. Переиспользует окно-скан #393 (``collect_successful_writes``), но по
-    autoexec-реестру — БЕЗ ложного успеха: отказ confirm/ошибка/no-op (result_kind ≠ ok) не считаются."""
+    исполненных в ТЕКУЩЕМ ходе (окно после последнего HumanMessage). Пусто, если таких нет.
+    Переиспользует окно-скан #393 (``collect_successful_writes``), но по autoexec-реестру.
+    R2 sol MINOR: ``run_tools`` ставит artifact.result_kind=='ok' ЛЮБОМУ не-raise возврату,
+    включая «error:…»-контент (react_loop, ветка успешного возврата). Поэтому успех считаем по
+    КОНВЕНЦИИ #115 (okv2-конверт ИЛИ «ok:»-префикс), НЕ по одному result_kind — «error:…» и прочий
+    не-успех отбрасываем (без ложных алертов)."""
+    from sreda.services.tool_schemas.tool_ok_codec import is_okv2
     msgs = list(messages or [])
     start = 0
     for i in range(len(msgs) - 1, -1, -1):
@@ -2091,7 +2096,10 @@ def _executed_autoexec_writes(messages) -> frozenset[str]:
             if tm is None:
                 continue
             art = getattr(tm, "artifact", None) or {}
-            if isinstance(art, dict) and art.get("result_kind") == "ok":
+            if not (isinstance(art, dict) and art.get("result_kind") == "ok"):
+                continue
+            content = str(getattr(tm, "content", "") or "").strip()
+            if is_okv2(content) or content.startswith("ok:"):  # success-конвенция #115, не «error:…»
                 out.add(name)
     return frozenset(out)
 
@@ -2107,17 +2115,18 @@ def _maybe_alert_write_on_read(
     TG+MAX — reuse ``send_admin_alert``, НЕ новая подсистема). Цель: (а) промах виден оператору
     сразу, (б) измеряем частоту для решения «оставлять ли autoexec».
 
-    Сигнал «чтение» детерминирован (текст юзера): ``read_cue_domains`` непусто И НЕ
-    ``write_command_signal``. Континуация диктовки «Ещё добавь X» несёт императив → НЕ флаг;
-    декларатив «меня зовут Аня» без read-cue → НЕ флаг; «покажи список дел» + молчаливый add →
-    флаг. Best-effort/PII-safe: сбой алерта НЕ влияет на ход; текст обрезан, стек PII-safe."""
+    Сигнал «чтение» детерминирован (R2 sol MINOR — точнее, чем голый read-cue): ``new_read_request_signal``
+    (маркер-запроса «покажи/какие/сколько…» И доменный кюс own-data) И НЕ ``write_command_signal``.
+    Диктовка «Ещё рецепт: борщ» несёт recipes-кюс, но НЕ маркер → new_read=False → НЕ флаг (без ложных
+    алертов на легитимный save_recipe); «покажи список дел» + молчаливый add → флаг; декларатив «меня
+    зовут Аня» без кюса → НЕ флаг. Best-effort/PII-safe: сбой алерта НЕ валит ход; текст обрезан, стек PII-safe."""
     try:
-        from sreda.runtime.react_signals import read_cue_domains, write_command_signal
+        from sreda.runtime.react_signals import new_read_request_signal, write_command_signal
         _t = user_text or ""
         if write_command_signal(_t):
-            return  # явная команда-мутация → это НЕ чтение (легитимная запись)
-        if not read_cue_domains(_t):
-            return  # нет read-cue → не «чистое чтение» (диктовка/декларатив/смолток) — не рассогласование
+            return  # явная команда-мутация (в т.ч. смешанное «покажи X и добавь Y») → не «чистое чтение»
+        if not new_read_request_signal(_t):
+            return  # не ЯВНЫЙ read-запрос (маркер+кюс) → диктовка/декларатив/слот-ответ — не рассогласование
         executed = _executed_autoexec_writes(messages)
         if not executed:
             return  # autoexec-запись в этом ходе не исполнялась → сигналить нечего
@@ -5608,6 +5617,7 @@ async def handle_turn(
                     collect_successful_writes,
                     fallback_reply,
                     reply_grounds_result,
+                    reply_has_archive_leak,
                     reply_has_tech_leak,
                 )
                 _writes393 = collect_successful_writes(result.get("messages") or [])
@@ -5619,9 +5629,11 @@ async def handle_turn(
                             # детерминированному тексту отказа ДОПИСЫВАЕМ отчёт об успехах (sol R4).
                             text = f"{text} {_fb393}"
                         elif (not reply_grounds_result(text, _writes393)
-                              or reply_has_tech_leak(text)):
-                            # подмена ЧИСТОЙ страховкой, если реплика НЕ называет результат ИЛИ несёт
-                            # машинную утечку (okv2/id=/ref=/«—» — Codex terra R3).
+                              or reply_has_tech_leak(text)
+                              or reply_has_archive_leak(text, _writes393)):
+                            # подмена ЧИСТОЙ страховкой, если реплика НЕ называет результат, несёт
+                            # машинную утечку (okv2/id=/ref=/«—» — Codex terra R3), ИЛИ на archive
+                            # содержит корень «архив» (#394/R2 sol: детектор заземления это не ловит).
                             text = _fb393
             except Exception:  # noqa: BLE001 — заземление best-effort, ход пользователя не роняем
                 logger.warning("react_loop: post-tool report (#393) failed", exc_info=True)
@@ -5691,15 +5703,17 @@ async def handle_turn(
                 _maybe_alert_degraded_turn(
                     tenant_id=tenant_id, user_id=user_id, channel=channel, turn_key=_tk_trace,
                     user_text=user_text, reply_text=str(reply), outcome=_outcome, passes=_passes_fin)
-                # #392 страховка: autoexec-запись на ходе-ЧТЕНИИ (read-cue без write-команды) →
-                # промах модели (confirm-сети больше нет) → громкий лог + admin-alert (измеряем частоту).
-                _maybe_alert_write_on_read(
-                    tenant_id=tenant_id, user_id=user_id, channel=channel, turn_key=_tk_trace,
-                    user_text=user_text, messages=_msgs_all)
             except Exception as _texc:  # noqa: BLE001 — трейс не валит ход
                 # #366: exc_info=True печатал str(exc) с SQL+ПД (g-039); PII-safe стек.
                 logger.warning("react_loop: trace finish failed type=%s at=%s",
                                _safe_tn(_texc), _safe_tb(_texc))
+        # #392 страховка — ВНЕ trace-блока (R2 terra MINOR): наблюдаемость молчаливой autoexec-записи
+        # НЕ должна гаситься при trace OFF (дефолт) / сбое persist. Собственный best-effort (функция и
+        # так глотает исключения); финальные сообщения хода — из result напрямую.
+        _maybe_alert_write_on_read(
+            tenant_id=tenant_id, user_id=user_id, channel=channel, turn_key=_tk_trace,
+            user_text=user_text,
+            messages=(result.get("messages") if isinstance(result, dict) else None))
         return reply
     except Exception as exc:  # noqa: BLE001 — цикл не должен ронять ход
         # PII-safe: тип + поколение + СТЕК-кадры (file:line:func) + типы причин, БЕЗ

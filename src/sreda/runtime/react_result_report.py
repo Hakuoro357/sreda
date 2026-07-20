@@ -74,6 +74,20 @@ def reply_has_tech_leak(text: str) -> bool:
     return bool(_TECH_LEAK_RE.search(text or ""))
 
 
+_ARCHIVE_ROOT_RE = re.compile(r"архив", re.IGNORECASE)
+
+
+def reply_has_archive_leak(reply: str, acts) -> bool:
+    """#394 (R2 sol MINOR): на archive_checklist финальная реплика НЕ должна нести корень «архив» —
+    юзер сказал «удали», отвечаем на его языке. Детектор заземления (`reply_grounds_result`) проверяет
+    лишь ИМЯ цели, поэтому живое «Заархивировала список Дача» прошло бы как заземлённое и архив утёк бы.
+    Механизм-гейт (не промпт, прецедент #180): есть успешный archive-акт И реплика содержит «архив» →
+    подменяем детерминированной страховкой (spec[0]=«удалила список»)."""
+    if not any(getattr(a, "tool", None) == "archive_checklist" for a in (acts or ())):
+        return False
+    return bool(_ARCHIVE_ROOT_RE.search(reply or ""))
+
+
 def _is_id(value: str) -> bool:
     return bool(_ID_RE.match((value or "").strip()))
 
@@ -351,4 +365,5 @@ __all__ = [
     "grounding_note",
     "fallback_reply",
     "reply_has_tech_leak",
+    "reply_has_archive_leak",
 ]

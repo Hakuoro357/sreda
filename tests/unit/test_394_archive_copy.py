@@ -25,6 +25,7 @@ from sreda.runtime.react_result_report import (
     _phrase,
     fallback_reply,
     grounding_note,
+    reply_has_archive_leak,
 )
 
 _ARCHIVE_RE = re.compile(r"архив", re.IGNORECASE)
@@ -82,3 +83,17 @@ def test_phrase_archive_named_and_nameless_394():
     assert "Дача" in named and not _ARCHIVE_RE.search(named) and _DELETE_RE.search(named)
     nameless = _phrase(_archive_act(""))
     assert not _ARCHIVE_RE.search(nameless) and _DELETE_RE.search(nameless)
+
+
+# ─────────────────────────── S-4 (R2 sol): архив-бэкстоп живого ответа ───────────────────────────
+
+def test_archive_leak_backstop_394():
+    """R2 sol MINOR: живой ответ модели «Заархивировала список Дача» ЗАЗЕМЛЁН (называет «Дача»), но
+    несёт корень «архив» → детектор заземления это не ловит; `reply_has_archive_leak` ловит →
+    финализация подменит детерминированной страховкой («удалила список»). Механизм-гейт, не промпт."""
+    acts = [_archive_act("Дача")]
+    assert reply_has_archive_leak("Заархивировала список «Дача».", acts) is True
+    assert reply_has_archive_leak("Удалила список «Дача».", acts) is False
+    # без archive-акта — не наше дело (add-акт с «архивным» ИМЕНЕМ списка не триггерит)
+    add = [WriteAct("add_checklist_items", "add", "Архив", ("молоко",), 1)]
+    assert reply_has_archive_leak("Добавила молоко в список «Архив».", add) is False

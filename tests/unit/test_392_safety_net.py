@@ -51,8 +51,17 @@ def test_detect_ignores_non_autoexec_write():
 
 
 def test_detect_ignores_failed_write():
-    """autoexec-write с НЕ-ok результатом (отказ/ошибка) → не считается исполненным."""
+    """autoexec-write с НЕ-ok result_kind (raise/слот-исход) → не считается исполненным."""
     assert _executed_autoexec_writes(_turn("add_checklist_items", kind="error")) == frozenset()
+
+
+def test_detect_ignores_error_content_with_ok_kind():
+    """R2 sol MINOR: run_tools ставит result_kind='ok' ЛЮБОМУ не-raise возврату, включая «error:…»-
+    контент. Считаем исполненной записью ТОЛЬКО по success-конвенции #115 (okv2/«ok:»), не по одному
+    result_kind — иначе ошибка/отказ дали бы ложный алерт."""
+    msgs = [HumanMessage(content="покажи список дел"), _ai("add_checklist_items"),
+            _tm("error: internal", kind="ok")]
+    assert _executed_autoexec_writes(msgs) == frozenset()
 
 
 def test_detect_scopes_to_current_turn():
@@ -105,9 +114,23 @@ def test_no_alert_when_write_command_present(monkeypatch):
 
 
 def test_no_alert_on_continuation_dictation(monkeypatch):
-    """«Ещё добавь уголь» — императив без read-cue → легитимная диктовка, нет алерта."""
+    """«Ещё добавь уголь» — императив → write_command → легитимная диктовка, нет алерта."""
     sink = _fire(monkeypatch, human="Ещё добавь уголь", tool="add_checklist_items")
     assert sink.calls == []
+
+
+def test_no_alert_on_recipe_dictation(monkeypatch):
+    """R2 sol MINOR: «Ещё один рецепт: борщ» — recipes-кюс ЕСТЬ, но НЕ маркер-запрос →
+    new_read_request_signal=False → легитимный autoexec save_recipe НЕ флагается (без ложных алертов).
+    Реальный autoexec-инструмент (не вакуумный add_task) + декларативная диктовка."""
+    sink = _fire(monkeypatch, human="Ещё один рецепт: борщ со свёклой", tool="save_recipe")
+    assert sink.calls == []
+
+
+def test_alert_fires_on_recipe_read_query(monkeypatch):
+    """Ход-ЧТЕНИЕ рецептов «какие у меня рецепты» (маркер+кюс) + молчаливый autoexec save_recipe → алерт."""
+    sink = _fire(monkeypatch, human="какие у меня рецепты", tool="save_recipe")
+    assert len(sink.calls) == 1 and "save_recipe" in sink.calls[0]["body"]
 
 
 def test_no_alert_when_no_autoexec_write(monkeypatch):
@@ -116,10 +139,10 @@ def test_no_alert_when_no_autoexec_write(monkeypatch):
     assert sink.calls == []
 
 
-def test_no_alert_when_no_read_cue(monkeypatch):
-    """Нет read-cue (декларатив/смолток «меня зовут Аня») → даже autoexec-запись НЕ флагается:
-    рассогласование «читать→запись» требует ЯВНОГО read-запроса, не любого хода без write-команды."""
-    sink = _fire(monkeypatch, human="меня зовут Аня", tool="add_task")
+def test_no_alert_when_no_read_request(monkeypatch):
+    """Нет ЯВНОГО read-запроса (декларатив «меня зовут Аня» — ни маркера, ни кюса) → даже autoexec-
+    запись НЕ флагается: рассогласование «читать→запись» требует маркер-запрос + доменный кюс."""
+    sink = _fire(monkeypatch, human="меня зовут Аня", tool="add_checklist_items")
     assert sink.calls == []
 
 

@@ -415,6 +415,30 @@ async def test_e2e_archive_resumed_filler_substituted_393(db_session):
 
 
 @pytest.mark.asyncio
+async def test_e2e_archive_grounded_but_archive_leak_substituted_394(db_session):
+    """R2 sol MINOR: модель на resume отвечает «Заархивировала список Дача» — ЗАЗЕМЛЕНО (называет
+    «Дача»), но несёт корень «архив». Детектор заземления это пропускает; архив-бэкстоп
+    (reply_has_archive_leak) подменяет детерминированной страховкой → финал «удалила список «Дача»»,
+    БЕЗ «архив*». Гарантия #394 «в финале нет архив» — механизмом, не только промптом."""
+    u = seed_telegram_user(db_session); db_session.commit()
+    ChecklistService(db_session).create_list(tenant_id=u.tenant_id, user_id=u.user_id, title="Дача")
+    db_session.commit()
+    thread = f"react:t:{uuid4().hex}"
+    await handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id, thread_id=thread,
+        llm=_StubLLM([AIMessage(content="", tool_calls=[{
+            "name": "archive_checklist", "args": {"list_id_or_title": "Дача"}, "id": "c1"}])]),
+        user_text="Удали список Дача", inbound_message_id="m1", channel="max")
+    r2 = await handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id, thread_id=thread,
+        llm=_StubLLM([AIMessage(content="Заархивировала список «Дача».")]),  # ← «архив» в живом ответе
+        user_text="да", inbound_message_id="m2", channel="max")
+    s = str(r2).lower()
+    assert "архив" not in s, r2                # бэкстоп подменил
+    assert "удал" in s and "дача" in s, r2     # страховка: «удалила список «Дача»»
+
+
+@pytest.mark.asyncio
 async def test_e2e_grounded_voice_not_substituted_393(db_session):
     """Негатив-контроль (#121): голос НАЗВАЛ результат → НЕ подменяем (не убить живость)."""
     u = seed_telegram_user(db_session); db_session.commit()

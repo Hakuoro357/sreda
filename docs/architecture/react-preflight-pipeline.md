@@ -115,18 +115,20 @@ flowchart TD
 - **write двухъярусный (B2):** сигнал+продуктивный домен → инструмент напрямую; БЕЗ сигнала → все write-инструменты
   биндятся КАНДИДАТАМИ под универсальный confirm на dispatch (`_apply_unified_policy` → `_generic_confirm_wrap`;
   превью без чтения БД; инвариант «нет молчаливой записи»). Исключение #389/#392 (autoexec): аддитивные
-  `add_shopping_items` (#389), `add_checklist_items` (#392) + `add_family_members`/`save_recipe`/
-  `save_recipes_batch` (#392-расширение 2026-07-20) — реестр `_UNIFIED_AUTOEXEC_WRITE_TOOLS` +
-  owner-allowlist, import-time гвард (манифест + write + аддитив-префикс add_/save_/create_) — биндятся
-  прямым, если роутер НЕ дал КОНКУРИРУЮЩЕГО write-домена (aw ⊆ доменов инструмента; «добавь в список
-  дел купить молоко» → aw={checklists} → для add_shopping_items кандидат+confirm, примиряющий
-  расхождение «роутер vs модель»). Мотив — чистое трение confirm'а на диктовке порциями (покупки #389,
-  чек-листы #392). ФОРКНУТО (отдельный follow-up, НЕ в #392): `add_task` (глубоко вплетён в confirm-сьют
-  #285/#321 — autoexec = непропорциональный churn) и память `save_core_fact`/`save_episode` (конфликт с
-  дверью #319 sticky-by-use, НЕ с заземлением #363). Деструктив/правки/статусы — НИКОГДА не autoexec
-  (candidate-confirm при aw=∅ — пред-существующее поведение). СТРАХОВКА (`_maybe_alert_write_on_read`,
-  вызов в finalization `handle_turn`): раз confirm-сети нет, autoexec-запись на ходе-ЧТЕНИИ (read-cue
-  есть, write-команды нет) → warning-лог + admin-alert (#395 dedup) — промах модели виден и измеряем;
+  `add_shopping_items` (#389), `add_checklist_items` (#392) + `save_recipe`/`save_recipes_batch`
+  (#392-расширение 2026-07-20) — реестр `_UNIFIED_AUTOEXEC_WRITE_TOOLS` + owner-allowlist, import-time
+  гвард (манифест + write + аддитив-префикс add_/save_/create_) — биндятся прямым, если роутер НЕ дал
+  КОНКУРИРУЮЩЕГО write-домена (aw ⊆ доменов инструмента; «добавь в список дел купить молоко» →
+  aw={checklists} → для add_shopping_items кандидат+confirm, примиряющий расхождение «роутер vs модель»).
+  Мотив — чистое трение confirm'а на диктовке порциями. ФОРКНУТО (отдельный follow-up, НЕ в #392):
+  `add_family_members` (R2 sol MAJOR: household БЕЗ read-cue → autoexec-промах немеряем страховкой),
+  `add_task` (глубоко вплетён в confirm-сьют #285/#321 — churn), память `save_core_fact`/`save_episode`
+  (конфликт с дверью #319 sticky-by-use, НЕ с заземлением #363). Деструктив/правки/статусы — НИКОГДА не
+  autoexec (candidate-confirm при aw=∅ — пред-существующее поведение). СТРАХОВКА (`_maybe_alert_write_on_read`,
+  вызов в finalization `handle_turn` ВНЕ trace-блока — R2 terra): раз confirm-сети нет, autoexec-запись
+  на ходе-ЧТЕНИИ (`new_read_request_signal`: маркер-запрос + own-data кюс, НЕ write-команда — R2 sol,
+  чтобы диктовка «ещё рецепт: X» не давала ложный alert) → warning-лог + admin-alert (#395 dedup) —
+  промах виден и измеряем; success записи считается по конвенции #115 (okv2/«ok:»), не по result_kind;
 - **промпт единый (B4):** task-персона + user-role хвост честности из ФАКТИЧЕСКОГО bound
   (`_unified_availability_directive`, #279-семантика: «под рукой в этом ходе», отмена → «сообщи и остановись»,
   заметку не пересказывать; тон — «ответь ПО СУЩЕСТВУ, опираясь на результаты»). NB: хвост узла `chat` —
