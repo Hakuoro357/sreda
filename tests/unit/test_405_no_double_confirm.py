@@ -107,3 +107,80 @@ def test_inline_bespoke_set_is_core_write_no_wrapper_overlap_405():
         assert name in _CORE_TOOL_NAMES, f"{name} не в _CORE_TOOL_NAMES"
         assert TOOL_OP_CLASS.get(name) == "write", f"{name} не write-класса"
         assert name not in _CONFIRM_PHRASE, f"{name} и inline, и в _CONFIRM_PHRASE — конфликт механизмов"
+
+
+def test_real_inline_destructives_single_interrupt_tier_b_405(db_session, monkeypatch):
+    """R3 (sol/terra R1+R2 MINOR — «докажи инвариант на РЕАЛЬНЫХ инструментах, считая interrupt()»):
+    cancel_task/delete_task/cancel_reminder из build_slice_tools на ярусе (б) единого пути
+    (allowed_write=[]) дают РОВНО ОДИН фактический interrupt() (свой inline), НЕ два. Мутация только
+    после «да»; «нет» → ноль мутаций. Не синтетика: реальные closure-инструменты через реальную политику."""
+    from datetime import date, datetime, timezone
+    from uuid import uuid4
+
+    from sreda.db.models.housewife import FamilyReminder
+    from sreda.db.models.tasks import Task
+    from sreda.runtime import react_loop
+    from sreda.runtime.planner.tool_runtime import ToolRuntimeContext, bind_tool_runtime
+    from sreda.runtime.react_loop import _apply_unified_policy, build_slice_tools
+    from tests.unit.conftest import seed_telegram_user
+
+    counter = {"n": 0, "reply": "да"}
+
+    def _fake_interrupt(*a, **k):
+        counter["n"] += 1
+        return counter["reply"]
+
+    monkeypatch.setattr(react_loop, "interrupt", _fake_interrupt)  # module-state → monkeypatch (не присваивание)
+
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    tid_c, tid_d, tid_n = (f"task_{uuid4().hex[:18]}" for _ in range(3))
+    for tid, title in ((tid_c, "отменяемая"), (tid_d, "удаляемая"), (tid_n, "сохраняемая")):
+        db_session.add(Task(id=tid, tenant_id=u.tenant_id, user_id=u.user_id, title=title,
+                            scheduled_date=date(2030, 6, 20), status="pending",
+                            created_at=now, updated_at=now))
+    rid = f"rem_{uuid4().hex[:18]}"
+    when = datetime(2030, 1, 1, 9, 0, tzinfo=timezone.utc)
+    db_session.add(FamilyReminder(id=rid, tenant_id=u.tenant_id, user_id=u.user_id, title="разминка",
+                                  trigger_at=when, next_trigger_at=when, status="pending"))
+    db_session.commit()
+    tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
+
+    def _tier_b(name):
+        # ярус (б): write-домен инструмента вне allowed_write=[] → НЕ прямой; маркер is True → identity
+        # (не generic-wrap). Если бы инструмент не был помечен — вернулась бы ДРУГАЯ (generic-обёрнутая) вещь.
+        out = _apply_unified_policy([tools[name]], allowed_read=["web"], allowed_write=[])
+        assert len(out) == 1 and out[0] is tools[name], \
+            f"{name}: ярус (б) должен вернуть помеченный инструмент как есть (identity), иначе двойной confirm"
+        return out[0]
+
+    def _invoke(name, args):
+        counter["n"] = 0
+        # УНИКАЛЬНЫЙ operation_id на каждый вызов — иначе tombstone/replay вернул бы прошлый payload БЕЗ interrupt
+        ctx = ToolRuntimeContext(operation_id=f"op_{name}_{uuid4().hex[:8]}", execution_id="e",
+                                 step_id="s", tool_name=name, tenant_id=u.tenant_id,
+                                 user_id=u.user_id, turn_key=f"tk_{uuid4().hex[:8]}")
+        with bind_tool_runtime(ctx):
+            return _tier_b(name).invoke(args)
+
+    # «да» → РОВНО один interrupt (без второго generic-confirm) + мутация состоялась
+    counter["reply"] = "да"
+    _invoke("cancel_task", {"task_ref": tid_c})
+    assert counter["n"] == 1, f"cancel_task: ожидался РОВНО один interrupt, было {counter['n']} (двойной confirm?)"
+    db_session.expire_all()
+    assert db_session.get(Task, tid_c).status == "cancelled", "cancel_task после «да» должен отменить"
+
+    _invoke("delete_task", {"task_ref": tid_d})
+    assert counter["n"] == 1, f"delete_task: ожидался один interrupt, было {counter['n']}"
+    assert db_session.get(Task, tid_d) is None, "delete_task после «да» должен удалить"
+
+    _invoke("cancel_reminder", {"reminder_ref": rid})
+    assert counter["n"] == 1, f"cancel_reminder: ожидался один interrupt, было {counter['n']}"
+
+    # «нет» → один interrupt, НОЛЬ мутаций
+    counter["reply"] = "нет"
+    _invoke("cancel_task", {"task_ref": tid_n})
+    assert counter["n"] == 1, f"decline: ожидался один interrupt, было {counter['n']}"
+    db_session.expire_all()
+    assert db_session.get(Task, tid_n).status == "pending", "«нет» → задача НЕ должна отмениться"
