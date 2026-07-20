@@ -3857,6 +3857,15 @@ def _build_graph(llm: Any, all_tools: list, *,
             # ctx per tool_call: turn_key (из state, переживает resume) + step_id=tc id
             # (из checkpointed AIMessage) → operation_id стабилен при перевыполнении узла.
             _t = _time.perf_counter()  # #192: латентность инструмента для трейса
+            # C3 (аудит 2026-07-18 R1): per-tool SAVEPOINT. Раньше сбой ОДНОГО
+            # инструмента батча делал session.rollback() (FC-1) и уносил писания
+            # УЖЕ УСПЕШНЫХ инструментов ТОГО ЖЕ батча — а их ToolMessage уже
+            # сказали модели «успех» (ложный успех + потеря данных). Теперь
+            # каждый invoke в своём savepoint: успех → RELEASE (писания уходят
+            # во внешнюю tx хода), сбой → ROLLBACK TO (откат ТОЛЬКО этого
+            # инструмента; предыдущие успешные целы). session=None → savepoint
+            # не заводим, поведение как раньше.
+            _sp = session.begin_nested() if session is not None else None
             try:
                 if turn_key:
                     op_id = allocate_operation_id(
@@ -3874,6 +3883,13 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # control-flow LangGraph (interrupt()-пауза подтверждения / Command / Send и любые
                 # будущие подклассы) — НЕ ошибка инструмента; пробросить, иначе сломается
                 # confirm/HITL-поток. Ловим БАЗОВЫЙ класс (как ToolNode самого LangGraph).
+                # C3: RELEASE savepoint (не rollback) — сохранить писания до
+                # interrupt'а как раньше (до C3 rollback тут не делался).
+                if _sp is not None:
+                    try:
+                        _sp.commit()
+                    except Exception:  # noqa: BLE001
+                        logger.warning("react_loop: savepoint release on bubble-up failed")
                 raise
             except Exception as exc:  # noqa: BLE001 — #163 Фаза 1а: исключение инструмента НЕ
                 # роняет ВЕСЬ ход. PII-safe: тип ошибки, без str(exc)/traceback (правило проекта:
@@ -3883,11 +3899,18 @@ def _build_graph(llm: Any, all_tools: list, *,
                 # инструмента → честный частичный отчёт named-P. wrote_unkeyed НЕ ставим.
                 logger.warning("react_loop: tool %s failed type=%s at=%s",
                                name, _safe_tn(exc), _safe_tb(exc))
-                # FC-1 (аудит 2026-07-18): упавший инструмент мог оставить shared session хода в
-                # failed-state (незакрытая транзакция) — без rollback следующий инструмент батча/
-                # прохода упал бы PendingRollbackError (каскадный сбой хода). Эталон — локальный
-                # try/except + rollback (executor.py:209/254; rollback идемпотентен, session=None → skip).
-                if session is not None:
+                # C3 (аудит 2026-07-18 R1): ROLLBACK TO savepoint — откатываем
+                # ТОЛЬКО писания упавшего инструмента; успешные предыдущие
+                # инструменты батча целы (раньше full session.rollback() уносил
+                # и их — ложный «успех»). savepoint также лечит failed-state
+                # session (иначе следующий инструмент упал бы PendingRollbackError).
+                if _sp is not None:
+                    try:
+                        _sp.rollback()
+                    except Exception:  # noqa: BLE001 — rollback не валит ход
+                        logger.warning("react_loop: savepoint rollback after tool failure failed")
+                elif session is not None:
+                    # savepoint не завёлся — прежнее поведение (full rollback).
                     try:
                         session.rollback()
                     except Exception:  # noqa: BLE001 — rollback не валит ход
@@ -3898,6 +3921,13 @@ def _build_graph(llm: Any, all_tools: list, *,
                     artifact={"result_kind": "error", "error_type": type(exc).__name__,
                               "latency_ms": int((_time.perf_counter() - _t) * 1000)}))
                 continue
+            # C3: инструмент отработал без исключения → RELEASE savepoint (писания
+            # этого инструмента фиксируются во внешней tx хода).
+            if _sp is not None:
+                try:
+                    _sp.commit()
+                except Exception:  # noqa: BLE001
+                    logger.warning("react_loop: savepoint release after tool success failed")
             # name в ToolMessage — ОРИГИНАЛ из tool_call (ревью R1 среза A, Claude MINOR-1):
             # OpenAI-путь матчит по tool_call_id, но Gemini-семейство матчит FunctionResponse
             # ПО ИМЕНИ — канонизированное имя рассинхронизировало бы пару. Факт канонизации

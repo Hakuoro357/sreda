@@ -267,10 +267,11 @@ async def test_turn_key_stable_with_real_inbound_id(db_session, monkeypatch):
 
 # --- FC-1: session.rollback() на tool-failure путях -----------------------------
 
-def test_tool_failure_rolls_back_shared_session(db_session):
-    """FC-1 (dispatch): исключение инструмента → session.rollback() ДО error-ToolMessage —
-    shared session не остаётся в failed-state (иначе следующий инструмент батча/прохода
-    упал бы PendingRollbackError)."""
+def test_tool_failure_rolls_back_savepoint(db_session):
+    """C3 (R1, супеседит FC-1): исключение инструмента → ROLLBACK TO
+    per-tool savepoint ДО error-ToolMessage. Раньше был full
+    session.rollback() (FC-1) — он уносил писания успешных инструментов
+    батча; теперь откат скоупится savepoint'ом (begin_nested)."""
     from unittest.mock import MagicMock
 
     u = seed_telegram_user(db_session)
@@ -296,10 +297,67 @@ def test_tool_failure_rolls_back_shared_session(db_session):
         {"messages": [HumanMessage("покажи дела")],
          "active_families": [], "turn_key": "tk-f1"},
         _cfg())
-    assert mock_session.rollback.called, "dispatch обязан откатить shared session после сбоя"
+    # C3: открыт per-tool savepoint и откатан ИМЕННО он (не весь shared session).
+    assert mock_session.begin_nested.called, "инструмент обязан идти под savepoint"
+    assert mock_session.begin_nested.return_value.rollback.called, (
+        "сбой инструмента → ROLLBACK TO savepoint"
+    )
+    assert not mock_session.rollback.called, (
+        "C3: full session.rollback() больше не зовём — откат скоупится savepoint'ом"
+    )
     tms = [m for m in out["messages"] if isinstance(m, ToolMessage)]
     assert tms and tms[0].status == "error"
     assert (tms[0].artifact or {}).get("result_kind") == "error"
+
+
+def test_c3_prior_tool_write_survives_later_tool_failure(db_session):
+    """C3 (R1): в батче из двух tool_call'ов первый ПИШЕТ в БД и успевает,
+    второй падает. Per-tool savepoint обязан сохранить писание первого —
+    раньше full session.rollback() второго уносил и его (ложный «успех»:
+    ToolMessage первого уже сказал модели, что записано)."""
+    from sreda.db.models import Tenant
+
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    tools = build_slice_tools(db_session, u.tenant_id, u.user_id)
+
+    def _write() -> str:
+        db_session.add(Tenant(id="c3_survivor", name="c3"))
+        db_session.flush()
+        return "ok: записал"
+
+    def _boom() -> str:
+        raise RuntimeError("db is down")
+
+    _stub_names = {"list_reminders", "list_tasks"}
+    tools = [t for t in tools if t.name not in _stub_names] + [
+        StructuredTool.from_function(
+            func=_write, name="list_reminders", description="stub: пишущий"),
+        StructuredTool.from_function(
+            func=_boom, name="list_tasks", description="stub: падающий"),
+    ]
+    scripted = [
+        AIMessage(content="", tool_calls=[
+            {"name": "list_reminders", "args": {}, "id": "call_w"},
+            {"name": "list_tasks", "args": {}, "id": "call_b"},
+        ]),
+        AIMessage(content="частично готово."),
+    ]
+    g = react_loop._build_graph(
+        _StubLLM(scripted), tools, tenant_id=u.tenant_id, user_id=u.user_id,
+        today_str="2030-01-01", session=db_session, persona_overlay="")
+    out = g.invoke(
+        {"messages": [HumanMessage("сделай оба")],
+         "active_families": [], "turn_key": "tk-c3"},
+        _cfg())
+    # C3: писание первого инструмента ВЫЖИЛО после сбоя второго.
+    assert db_session.get(Tenant, "c3_survivor") is not None, (
+        "писание успешного инструмента не должно откатываться из-за сбоя другого"
+    )
+    tms = [m for m in out["messages"] if isinstance(m, ToolMessage)]
+    kinds = {(m.name, (m.artifact or {}).get("result_kind")) for m in tms}
+    assert ("list_reminders", "ok") in kinds
+    assert ("list_tasks", "error") in kinds
 
 
 @pytest.mark.asyncio

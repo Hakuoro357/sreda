@@ -21,6 +21,7 @@ Telegram side-effects — is inside the graph (``sreda.runtime.graph``).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from sreda.config.bot_registry import TelegramBotRegistry, telegram_client_for
@@ -109,6 +111,36 @@ def _extract_run_id(payload_json: str) -> str | None:
         return None
     run_id = payload.get("run_id")
     return str(run_id) if run_id else None
+
+
+def _hash_chat_id(value: object) -> str:
+    """2026-07-18 (R1 C4): external_chat_id — внешний идентификатор чата (PII).
+    В логи пишем короткий sha256-префикс, не сырое значение."""
+    return "sha256:" + hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+
+def _redact_run_input_json(run: AgentRun) -> None:
+    """2026-07-18 (R1 C4): run терминален (completed/failed/reaped) — сырой
+    input_json больше не нужен для исполнения (реплей completed отсекается в
+    process_job, failed/reaped не переисполняются). Санитайзим PII-токены
+    (URL/креды/e-mail/мед-данные) at-rest через privacy_guard: обычный
+    текст диалога сохраняется (history по params.text работает), но секреты
+    больше не лежат в plaintext-колонке весь срок жизни AgentRun.
+    Best-effort — не роняем финализацию run'а."""
+    try:
+        raw = run.input_json
+        if not raw or raw == "{}":
+            return
+        from sreda.services.privacy_guard import get_default_privacy_guard
+
+        data = json.loads(raw)
+        redacted = get_default_privacy_guard().sanitize_structure(data).sanitized_value
+        run.input_json = json.dumps(redacted, ensure_ascii=False)
+    except Exception:  # noqa: BLE001 — редактирование PII не должно валить run
+        logger.exception(
+            "runtime: failed to redact run input_json for %s",
+            getattr(run, "id", "?"),
+        )
 
 
 class ActionRuntimeService:
@@ -308,7 +340,12 @@ class ActionRuntimeService:
             if claim.rowcount != 1:
                 self.session.rollback()
                 return 0
-            self.session.execute(
+            # M3 (R1): требовать rowcount==1 и от AgentRun-апдейта. Иначе
+            # (run уже терминализирован живым владельцем: completed) мы бы
+            # закоммитили Job=failed поверх run=completed — рассинхрон.
+            # C4 (R1): reaped-run исполнять уже не будут → чистим сырой
+            # input_json (PII) прямо в условном апдейте.
+            run_claim = self.session.execute(
                 update(AgentRun)
                 .where(AgentRun.id == run_id)
                 .where(AgentRun.status == "running")
@@ -319,8 +356,12 @@ class ActionRuntimeService:
                         "Действие не завершилось: обработчик был перезапущен."
                     ),
                     finished_at=now,
+                    input_json="{}",
                 )
             )
+            if run_claim.rowcount != 1:
+                self.session.rollback()
+                return 0
             self.session.commit()
         except Exception:
             self.session.rollback()
@@ -438,6 +479,18 @@ class ActionRuntimeService:
             return "failed"
 
         outcome = (final_state or {}).get("outcome")
+        # C4 (R1): граф завершил run (completed/failed) и закоммитил. Сырой
+        # input_json больше не нужен для исполнения — санитайзим PII at-rest.
+        try:
+            terminal_run = self.session.get(AgentRun, run_id)
+            if terminal_run is not None:
+                _redact_run_input_json(terminal_run)
+                self.session.commit()
+        except Exception:  # noqa: BLE001 — редактирование не должно менять исход
+            self.session.rollback()
+            logger.exception(
+                "runtime: post-run input_json redaction failed for run %s", run_id
+            )
         return "failed" if outcome == "failed" else "completed"
 
     # ------------------------------------------------------------- helpers
@@ -471,13 +524,19 @@ class ActionRuntimeService:
                 "unique constraint (FC-2 / db-uniques)",
                 action.tenant_id,
                 action.channel_type,
-                action.external_chat_id,
+                _hash_chat_id(action.external_chat_id),  # C4 (R1): PII → hash
                 [t.id for t in threads],
                 threads[0].id,
             )
         if threads:
             return threads[0]
 
+        # M4 (R1): создание thread'а — get-or-create с гонкой. Конкурентный
+        # enqueue того же (tenant, channel, chat) выиграл бы INSERT, а наш
+        # flush упал бы на uq_agent_threads_tenant_channel_chat (миграция
+        # 0085) → action терялся. Savepoint изолирует конфликт от внешней
+        # транзакции; на IntegrityError переспрашиваем победителя (образец
+        # planner/persistence.insert_or_resume).
         thread = AgentThread(
             id=f"thread_{uuid4().hex[:24]}",
             tenant_id=action.tenant_id,
@@ -487,8 +546,25 @@ class ActionRuntimeService:
             external_chat_id=action.external_chat_id,
             status="active",
         )
-        self.session.add(thread)
-        self.session.flush()
+        try:
+            with self.session.begin_nested():
+                self.session.add(thread)
+                self.session.flush()
+        except IntegrityError:
+            winner = (
+                self.session.query(AgentThread)
+                .filter(
+                    AgentThread.tenant_id == action.tenant_id,
+                    AgentThread.channel_type == action.channel_type,
+                    AgentThread.external_chat_id == action.external_chat_id,
+                )
+                .order_by(AgentThread.created_at.asc(), AgentThread.id.asc())
+                .first()
+            )
+            if winner is None:
+                # UNIQUE-конфликт не по нашей тройке — что-то иное, пробрасываем.
+                raise
+            return winner
         return thread
 
     async def _finalize_timeout(
@@ -638,6 +714,7 @@ class ActionRuntimeService:
         run.error_code = error_code
         run.error_message_sanitized = sanitized_message
         run.finished_at = now
+        _redact_run_input_json(run)  # C4 (R1): run терминален — санитайз PII
         self.session.commit()
 
     def _write_failure_row_only(
@@ -657,4 +734,5 @@ class ActionRuntimeService:
             run.error_code = error_code
             run.error_message_sanitized = sanitized_message
             run.finished_at = _utcnow()
+            _redact_run_input_json(run)  # C4 (R1): run терминален — санитайз PII
         self.session.commit()

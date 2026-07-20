@@ -136,8 +136,12 @@ def _make_action(*, action_type: str = "help.show", params: dict | None = None) 
 
 
 def test_enqueue_persists_and_executes_raw_input(monkeypatch, tmp_path: Path) -> None:
-    """Audit runtime-core #1: URL с query-string и «аллергия» должны
-    доехать до handler'а (и в input_json) БЕЗ privacy-плейсхолдеров."""
+    """Audit runtime-core #1: URL с query-string и «аллергия» должны доехать
+    до handler'а (исполнение — по ИСХОДНОМУ envelope) БЕЗ privacy-плейсхолдеров.
+
+    R1 C4: ПОСЛЕ завершения run'а input_json санитайзится at-rest (сырой
+    payload больше не нужен для исполнения) — здесь проверяем оба инварианта:
+    handler видел сырой текст, а осевший input_json — уже редактированный."""
     session = _setup_db(monkeypatch, tmp_path, "raw_input.db")
     try:
         captured: dict = {}
@@ -173,8 +177,17 @@ def test_enqueue_persists_and_executes_raw_input(monkeypatch, tmp_path: Path) ->
     assert captured["text"] == raw_text
     assert "[url]" not in captured["text"]
     assert "[allergy]" not in captured["text"]
-    # И персистится тоже исходник (sanitize — только для error-текстов).
-    assert persisted["params"]["text"] == raw_text
+    # R1 C4: осевший input_json ПОСЛЕ завершения run'а — редактированный:
+    # секреты/URL/мед-данные заменены плейсхолдерами, обычный текст сохранён.
+    persisted_text = persisted["params"]["text"]
+    assert persisted_text != raw_text
+    assert "[url]" in persisted_text
+    assert "[allergy]" in persisted_text
+    assert "[account_number]" in persisted_text
+    assert "https://site.ru" not in persisted_text
+    assert "аллергия" not in persisted_text
+    # Обычный (не-PII) текст диалога сохранён — history остаётся читаемым.
+    assert "прочитай" in persisted_text and "запомни" in persisted_text
 
 
 # ------------------------------------------------------------------
