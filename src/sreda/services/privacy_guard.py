@@ -233,8 +233,17 @@ def _replace_url(match: re.Match[str], entities: list[SensitiveEntity]) -> str:
 # не подстроки. Раньше substring-проверка «sig»/«key» маскировала
 # легитимные URL («design», «monkey», «keyboard») — over-redaction на
 # разговорном hot-path деградировал контент, уходящий в LLM.
+#
+# 2026-07-18 (R1 C5): compound-маркеры «apikey»/«secretkey» — слитные и
+# camelCase сегменты пути (``/apikey/<SECRET>``, ``/secretKey/<SECRET>``)
+# не режутся токенизатором на «api»+«key» и раньше обходили redaction.
+# Семантика прежняя — равенство токена, не подстрока: «monkey»/«keyboard»
+# целиком не равны маркерам и по-прежнему НЕ триггерятся.
 _SECRET_URL_MARKERS: Final = frozenset(
-    {"token", "key", "secret", "sig", "signature", "password", "pwd"}
+    {
+        "token", "key", "secret", "sig", "signature", "password", "pwd",
+        "apikey", "secretkey",
+    }
 )
 _URL_TOKEN_SPLIT_RE: Final = re.compile(r"[^a-z0-9]+")
 

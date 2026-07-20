@@ -494,8 +494,13 @@ def _geocode(location: str) -> tuple[float, float, str, str] | None:
     except (httpx.HTTPError, ValueError) as exc:
         # Аудит 2026-07-18 (svc-features #8 / cross-security П4): город юзера —
         # PII (фактическая геолокация), в лог открыто не пишем — только длина.
+        # 2026-07-18 (R1 C8): str(httpx.HTTPStatusError) содержит полный URL
+        # с ``name=…`` в query — логируем только класс ошибки + HTTP status.
         logger.warning(
-            "weather geocode failed (location len=%d): %s", len(location or ""), exc,
+            "weather geocode failed (location len=%d): %s (HTTP %s)",
+            len(location or ""),
+            type(exc).__name__,
+            getattr(getattr(exc, "response", None), "status_code", None),
         )
         _geo_neg_remember(key)
         return None
@@ -581,9 +586,14 @@ def _fetch_forecast(
     except (httpx.HTTPError, ValueError) as exc:
         # Аудит 2026-07-18 (svc-features #8 / cross-security П4): lat/lon с
         # точностью 3 знака — фактическая геолокация юзера (PII), в лог не пишем.
+        # 2026-07-18 (R1 C8): str(httpx.HTTPStatusError) содержит полный URL
+        # с ``latitude``/``longitude`` в query — логируем только класс ошибки
+        # + HTTP status.
         logger.warning(
-            "weather forecast failed granularity=%s: %s",
-            granularity, exc,
+            "weather forecast failed granularity=%s: %s (HTTP %s)",
+            granularity,
+            type(exc).__name__,
+            getattr(getattr(exc, "response", None), "status_code", None),
         )
         return None
 

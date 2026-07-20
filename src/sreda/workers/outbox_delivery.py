@@ -80,9 +80,10 @@ OUTBOX_SEND_TIMEOUT_SECONDS = 20
 # чистит только sent/failed/dropped), а метрика reliability_report (считает
 # только 'failed') врала «всё ок».
 #
-# Перманентный отказ (HTTP 4xx, кроме 429 rate-limit) → dead-letter СРАЗУ:
+# Перманентный отказ (HTTP 4xx, кроме 429 rate-limit и кроме 401/403 —
+# R1 M15: системные auth-ошибки канала, retryable) → dead-letter СРАЗУ:
 # status='failed' + drop_reason='delivery_permanent_<code>'. Транзиентные
-# (429 / 5xx / сеть) → ретрай с потолком OUTBOX_MAX_DELIVERY_ATTEMPTS
+# (401/403 / 429 / 5xx / сеть) → ретрай с потолком OUTBOX_MAX_DELIVERY_ATTEMPTS
 # попыток, затем dead-letter: status='failed' +
 # drop_reason='delivery_retry_exhausted' + admin alert. 'failed' виден
 # reliability_report → метрика честная; retention чистит failed через 60д.
@@ -353,11 +354,20 @@ class OutboxDeliveryWorker:
     def _is_permanent_delivery_error(status_code: int | None) -> bool:
         """HTTP 4xx (кроме 429 rate-limit) = перманентный отказ ЭТОЙ строки:
         повтор с тем же payload бессмыслен (клиенты TG/MAX 4xx сами не
-        ретраят — см. integrations/telegram/client.py:307-315)."""
+        ретраят — см. integrations/telegram/client.py:307-315).
+
+        2026-07-18 (R1 M15): 401/403 — НЕ перманент для строки, а
+        retryable/systemic: отозванный/протухший bot-token (401) и
+        «bot blocked/kicked» (403) — состояние КАНАЛА, а не payload'а;
+        токен/доступ может восстановиться (перевыпуск, разблок,
+        re-add в группу). Строка уходит в обычный retry-цикл с потолком
+        OUTBOX_MAX_DELIVERY_ATTEMPTS (≈40–80 мин окно восстановления)
+        вместо мгновенного dead-letter."""
         return (
             status_code is not None
             and 400 <= status_code < 500
             and status_code != 429
+            and status_code not in (401, 403)
         )
 
     @staticmethod
@@ -418,11 +428,15 @@ class OutboxDeliveryWorker:
         даст один алерт на канал за окно rate-limit, а не шторм."""
         try:
             from sreda.services.admin_alerts import send_admin_alert
+            # 2026-07-18 (R1 M16): str(exc) у delivery-ошибок может содержать
+            # URL/тело ответа с chat_id (канальный PII) — в алерт только
+            # класс ошибки + HTTP status, без тела исключения.
             send_admin_alert(
                 "P1",
                 f"outbox {channel}: retry ceiling reached — row dead-lettered",
                 f"row_id={row.id}\nfeature={row.feature_key}\n"
-                f"error={type(exc).__name__}: {exc}"[:500],
+                f"error={type(exc).__name__} "
+                f"http_status={getattr(exc, 'status_code', None)}",
                 dedupe_key=f"outbox-retry-exhausted:{channel}",
             )
         except Exception:  # noqa: BLE001 — alert не должен ронять доставку
