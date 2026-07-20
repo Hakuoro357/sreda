@@ -363,15 +363,19 @@ class HousewifeReminderService:
         from sqlalchemy.exc import IntegrityError
 
         from sreda.services.idempotent_ops import find_existing_pending_semantic
-        from sreda.services.operation_id import compute_normalized_title_hash
+        from sreda.services.operation_id import (
+            compute_normalized_title_hash_candidates,
+        )
 
         # `or None`: вырожденное название (только пунктуация) → нормализация даёт "" → хеш "".
         # Пустой hash IS NOT NULL → попал бы в партиал-индекс и ложно схлопнул разные такие записи;
         # трактуем "" как «дедуп невозможен» (None, вне индекса) — единообразно с легаси-NULL (субагент MINOR).
-        nhash = compute_normalized_title_hash(
+        # M9 (R1): кандидаты (primary + legacy-ключи) для lookup по IN(...); запись — под primary.
+        nhash_candidates = compute_normalized_title_hash_candidates(
             clean_title, entity_type="family_reminder", tenant_id=tenant_id,
             user_id=user_id or "",
-            extra=sep.join([trigger_at.isoformat(), recurrence_rule or ""])) or None
+            extra=sep.join([trigger_at.isoformat(), recurrence_rule or ""]))
+        nhash = nhash_candidates[0] if nhash_candidates else None
 
         dialect_name = self.session.bind.dialect.name  # type: ignore[union-attr]
         if dialect_name == "postgresql":
@@ -405,7 +409,7 @@ class HousewifeReminderService:
         # reuse без вставки. ON CONFLICT(op_id) покрывает within-turn повтор; backstop ниже — гонку.
         if nhash is not None:
             existing = find_existing_pending_semantic(
-                self.session, FamilyReminder, tenant_id=tenant_id, user_id=user_id, nhash=nhash)
+                self.session, FamilyReminder, tenant_id=tenant_id, user_id=user_id, nhash_candidates=nhash_candidates)
             if existing is not None:
                 return existing
         if commit:
@@ -416,7 +420,7 @@ class HousewifeReminderService:
                 self.session.rollback()
                 existing = (find_existing_pending_semantic(
                     self.session, FamilyReminder, tenant_id=tenant_id,
-                    user_id=user_id, nhash=nhash) if nhash is not None else None)
+                    user_id=user_id, nhash_candidates=nhash_candidates) if nhash is not None else None)
                 if existing is not None:
                     return existing
                 raise

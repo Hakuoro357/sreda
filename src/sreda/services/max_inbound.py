@@ -680,7 +680,7 @@ async def _maybe_transcribe_max_voice(
             ("daily", _daily_key, SREDA_FREE_LLM_DAILY),
             ("monthly", _monthly_key, SREDA_FREE_LLM_MONTHLY),
         ]
-        if not _ledger.try_consume(tenant_id, "llm_turns", 1, _llm_periods):
+        if not await _ledger.try_consume_async(tenant_id, "llm_turns", 1, _llm_periods):
             await _send_error(UPGRADE_COPY["llm_daily_or_monthly"])
             return None
         _voice_periods = [
@@ -715,7 +715,7 @@ async def _maybe_transcribe_max_voice(
                 _dl_meta["status"] = "too_long"
                 # Phase 2C M1 fix: refund LLM (reserved before download)
                 if _is_free and _ledger and _llm_periods:
-                    _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+                    await asyncio.to_thread(_ledger.refund,tenant_id, "llm_turns", 1, _llm_periods)
                 return None
             logger.warning("max voice download failed: %s", exc)
             await _send_error(
@@ -723,7 +723,7 @@ async def _maybe_transcribe_max_voice(
             )
             _dl_meta["status"] = "download_failed"
             if _is_free and _ledger and _llm_periods:
-                _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+                await asyncio.to_thread(_ledger.refund,tenant_id, "llm_turns", 1, _llm_periods)
             return None
         except Exception as exc:  # noqa: BLE001
             logger.warning("max voice download crashed: %s", exc)
@@ -732,7 +732,7 @@ async def _maybe_transcribe_max_voice(
             )
             _dl_meta["status"] = "download_crashed"
             if _is_free and _ledger and _llm_periods:
-                _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+                await asyncio.to_thread(_ledger.refund,tenant_id, "llm_turns", 1, _llm_periods)
             return None
         _dl_meta["bytes_in"] = len(audio_bytes)
         # Codex R2 MAJOR #3 partial fix: capture audio magic bytes для
@@ -770,7 +770,7 @@ async def _maybe_transcribe_max_voice(
             _dl_meta["status"] = "too_long"
             # Phase 2C: refund LLM if reserved (we charged at gate)
             if _is_free and _ledger and _llm_periods:
-                _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+                await asyncio.to_thread(_ledger.refund,tenant_id, "llm_turns", 1, _llm_periods)
             return None
 
     # --- Phase 2C: voice quota reserve via ffprobe duration ---
@@ -783,15 +783,15 @@ async def _maybe_transcribe_max_voice(
             _duration_seconds = await probe_audio_async(audio_bytes)
         except FfprobeError as exc:
             logger.warning("max voice ffprobe failed: %s — refunding LLM", exc)
-            _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+            await asyncio.to_thread(_ledger.refund,tenant_id, "llm_turns", 1, _llm_periods)
             await _send_error(
                 "Не получилось обработать голосовое — напиши текстом, пожалуйста."
             )
             return None
-        if not _ledger.try_consume(
+        if not await _ledger.try_consume_async(
             tenant_id, "voice_stt_seconds", _duration_seconds, _voice_periods,
         ):
-            _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+            await asyncio.to_thread(_ledger.refund,tenant_id, "llm_turns", 1, _llm_periods)
             await _send_error(UPGRADE_COPY["voice_daily_or_monthly"])
             return None
 
@@ -809,9 +809,9 @@ async def _maybe_transcribe_max_voice(
             # Phase 2C: refund both quotas если reserved
             if _is_free and _ledger:
                 if _llm_periods:
-                    _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+                    await asyncio.to_thread(_ledger.refund,tenant_id, "llm_turns", 1, _llm_periods)
                 if _voice_periods and _duration_seconds:
-                    _ledger.refund(
+                    await asyncio.to_thread(_ledger.refund,
                         tenant_id, "voice_stt_seconds",
                         _duration_seconds, _voice_periods,
                     )
@@ -945,9 +945,9 @@ async def _process_approved_max_turn(
     # → весь event loop потенциально зависает на синхронном вызове, а порядок
     # вложенности расходится с TG (риск перекрёстного дедлока на двух каналах
     # одного тенанта). Поэтому ExitStack заполняется ВНУТРИ ``tenant_lock``.
-    from contextlib import ExitStack
+    from contextlib import AsyncExitStack
 
-    _barrier = ExitStack()
+    _barrier = AsyncExitStack()  # M11 (R1): async advisory lock (см. ниже)
     try:
         _set_processing_status(
             bg_session, inbound_message_id, "processing_started",
@@ -994,9 +994,11 @@ async def _process_approved_max_turn(
             # ``finally`` через ``_barrier.close()``. tenant_lock (asyncio)
             # сериализует ходы тенанта В ЭТОМ процессе ПЕРВЫМ; advisory —
             # cross-process барьер против админ-delete — берётся ПОД ним.
-            from sreda.services.tenant_lifecycle import tenant_advisory_lock
-            _barrier.enter_context(
-                tenant_advisory_lock(bg_session, onboarding.tenant_id)
+            # M11 (R1): async advisory lock — не блокируем event loop на
+            # захвате PG advisory-лока (DB-roundtrip); зеркало TG.
+            from sreda.services.tenant_lifecycle import tenant_advisory_lock_async
+            await _barrier.enter_async_context(
+                tenant_advisory_lock_async(bg_session, onboarding.tenant_id)
             )
             # #187 дверь #6 (A3 re-check ПОД локом, зеркало TG): ingress-гейт
             # (handle_max_update) проверил активность ДО спавна хода; между гейтом и
@@ -1442,7 +1444,7 @@ async def _process_approved_max_turn(
         )
     finally:
         # #187 Phase 2b: отпустить advisory-lock ДО close() (симметрия с TG).
-        _barrier.close()
+        await _barrier.aclose()  # M11 (R1): async close AsyncExitStack
         bg_session.close()
         tenant_ctx.reset(_tenant_tok)  # #138 Ф2: снять tenant-контекст хода
 

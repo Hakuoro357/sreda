@@ -317,15 +317,28 @@ def _serve_existing_bundle_reads(
         # Аудит 2026-07-18 (svc-features #9): была ли ЯВНАЯ отмена юзером
         # (billing cancel → status="cancelled"). Отличает opt-out от
         # paid→expired (status="expired") и legacy no-sub.
-        has_cancelled_sub = (
+        #
+        # M21 (R1): опираемся на ПОСЛЕДНЕЕ состояние подписки, а не на факт
+        # ЛЮБОЙ исторической отмены. Раньше «есть хоть одна cancelled-строка»
+        # латчилось навсегда: тенант, который однажды отменил, потом ушёл в
+        # paid→expired, НАВСЕГДА терял fallback на free-tier (ассистент
+        # недоступен). Теперь cancelled-статус ТОЛЬКО если самая свежая
+        # housewife-подписка реально в состоянии cancelled.
+        _latest_sub = (
             ts.query(TenantSubscription)
             .filter(
                 TenantSubscription.tenant_id == tid,
                 TenantSubscription.feature_key == "housewife_assistant",
-                TenantSubscription.status == "cancelled",
+            )
+            .order_by(
+                TenantSubscription.updated_at.desc(),
+                TenantSubscription.created_at.desc(),
+                TenantSubscription.id.desc(),
             )
             .first()
-            is not None
+        )
+        has_cancelled_sub = (
+            _latest_sub is not None and _latest_sub.status == "cancelled"
         )
     # Репаир pending/no-sub — редкий legacy-случай (тенанты до approved_at-в-INSERT).
     # Аудит 2026-07-18 (svc-features #9): НЕ пересоздаём подписку молча после явной

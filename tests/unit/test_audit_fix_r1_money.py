@@ -116,3 +116,42 @@ def test_c7_mixed_period_renewal_uses_per_plan_window(session) -> None:
     # amount поплановый (не смешан).
     assert items[7].amount_rub == 70
     assert items[30].amount_rub == 100
+
+
+# ---------------------------------------------------------------------------
+# M12 — RRULE: отклонять BYSECOND, ограничивать многозначные BY-поля
+# ---------------------------------------------------------------------------
+
+
+def test_m12_rrule_rejects_bysecond() -> None:
+    from sreda.services.tasks import _validate_recurrence_rule
+
+    # BYSECOND (в т.ч. FREQ=HOURLY+BYSECOND — 86401 вхождение) → отказ.
+    with pytest.raises(ValueError, match="BYSECOND"):
+        _validate_recurrence_rule("FREQ=HOURLY;BYSECOND=0")
+    with pytest.raises(ValueError, match="BYSECOND"):
+        _validate_recurrence_rule("FREQ=DAILY;BYSECOND=0,30")
+
+
+def test_m12_rrule_caps_multivalue_by_fields() -> None:
+    from sreda.services.tasks import _validate_recurrence_rule
+
+    # >12 значений BYMINUTE → отказ.
+    many = ",".join(str(i) for i in range(0, 60, 2))  # 30 значений
+    with pytest.raises(ValueError, match="BYMINUTE"):
+        _validate_recurrence_rule(f"FREQ=HOURLY;BYMINUTE={many}")
+    many_h = ",".join(str(i) for i in range(0, 24))  # 24 значения
+    with pytest.raises(ValueError, match="BYHOUR"):
+        _validate_recurrence_rule(f"FREQ=DAILY;BYHOUR={many_h}")
+
+
+def test_m12_rrule_allows_reasonable() -> None:
+    from sreda.services.tasks import _validate_recurrence_rule
+
+    # Разумные правила проходят (каждые 5 минут = 12 значений — на границе OK).
+    _validate_recurrence_rule("FREQ=DAILY")
+    _validate_recurrence_rule("FREQ=DAILY;BYHOUR=8,12,18")
+    _validate_recurrence_rule("FREQ=WEEKLY;INTERVAL=2")
+    _validate_recurrence_rule(
+        "FREQ=HOURLY;BYMINUTE=0,5,10,15,20,25,30,35,40,45,50,55"  # 12 значений
+    )

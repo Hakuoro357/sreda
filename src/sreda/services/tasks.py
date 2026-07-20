@@ -65,6 +65,11 @@ def _combine_local(d: date, t: time) -> datetime:
 # в read hot-path). SECONDLY/MINUTELY не имеют смысла для семейного расписания.
 _RRULE_ALLOWED_FREQ = frozenset({"HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY"})
 _RRULE_MAX_INTERVAL = 366
+# M12 (R1): cap на число значений в многозначных BY-полях (BYMINUTE/BYHOUR).
+# BYMINUTE=0,1,2,…,59 × FREQ=HOURLY = 60 вхождений/час — read hot-path
+# материализует их в память на КАЖДЫЙ list_range. 12 значений с запасом
+# покрывают легитимные кейсы (каждые 5 минут = 12 значений).
+_RRULE_MAX_BY_VALUES = 12
 
 
 def _validate_recurrence_rule(rule: str) -> None:
@@ -90,6 +95,23 @@ def _validate_recurrence_rule(rule: str) -> None:
                 raise ValueError(
                     f"recurrence_rule: bad INTERVAL {value!r}"
                 ) from None
+        elif name == "BYSECOND":
+            # M12 (R1): BYSECOND материализует до 86401 вхождений/период (напр.
+            # FREQ=HOURLY+BYSECOND=0..59 или DAILY посекундно) → OOM в read
+            # hot-path list_range. Секундная гранулярность семейному расписанию
+            # не нужна — отказ (это же покрывает FREQ=HOURLY+BYSECOND).
+            raise ValueError(
+                "recurrence_rule: BYSECOND не поддерживается (слишком плотно)"
+            )
+        elif name in ("BYMINUTE", "BYHOUR"):
+            # M12 (R1): многозначные BY-поля множат вхождения на период —
+            # ограничиваем число значений.
+            n_values = len([v for v in value.split(",") if v.strip()])
+            if n_values > _RRULE_MAX_BY_VALUES:
+                raise ValueError(
+                    f"recurrence_rule: {name} — слишком много значений "
+                    f"({n_values} > {_RRULE_MAX_BY_VALUES})"
+                )
     if freq not in _RRULE_ALLOWED_FREQ:
         raise ValueError(
             "recurrence_rule: FREQ must be one of "
@@ -205,20 +227,25 @@ class TaskService:
             from sqlalchemy.exc import IntegrityError
 
             from sreda.services.idempotent_ops import find_existing_pending_semantic
-            from sreda.services.operation_id import compute_normalized_title_hash
+            from sreda.services.operation_id import (
+                compute_normalized_title_hash_candidates,
+            )
 
             nhash = None
+            nhash_candidates: list[str] = []
             if scheduled_date is not None:  # Codex MAJOR: дедупим только задачи С ДАТОЙ (решение
                 # Бориса «только задачи с датой»); время-без-даты — НЕ дедупим. Время участвует в
                 # ключе (extra) лишь когда дата есть.
-                # `or None`: вырожденное название (пунктуация) → хеш "" → IS NOT NULL → ложно
-                # схлопнул бы разные такие задачи в индексе; трактуем "" как «дедуп невозможен» (субагент MINOR).
-                nhash = compute_normalized_title_hash(
+                # M9 (R1): считаем кандидатов (primary + legacy-ключи) — lookup матчит по IN(...);
+                # запись — под primary (candidates[0]). Пустой список → дедуп невозможен (вырожденное
+                # название, хеш ""): трактуем как nhash=None (вне индекса).
+                nhash_candidates = compute_normalized_title_hash_candidates(
                     title_clean, entity_type="task", tenant_id=tenant_id, user_id=user_id or "",
                     extra=sep.join([
                         scheduled_date.isoformat() if scheduled_date else "",
                         time_start.isoformat() if time_start else "",
-                        recurrence_rule or ""])) or None
+                        recurrence_rule or ""]))
+                nhash = nhash_candidates[0] if nhash_candidates else None
             dialect_name = self.session.bind.dialect.name  # type: ignore[union-attr]
             if dialect_name == "postgresql":
                 from sqlalchemy.dialects.postgresql import insert as _insert
@@ -252,7 +279,7 @@ class TaskService:
             # reuse без вставки. ON CONFLICT(op_id) покрывает within-turn повтор; backstop ниже — гонку.
             if nhash is not None:
                 existing = find_existing_pending_semantic(
-                    self.session, Task, tenant_id=tenant_id, user_id=user_id, nhash=nhash)
+                    self.session, Task, tenant_id=tenant_id, user_id=user_id, nhash_candidates=nhash_candidates)
                 if existing is not None:
                     return existing
             try:
@@ -261,7 +288,7 @@ class TaskService:
                 self.session.rollback()
                 existing = (find_existing_pending_semantic(
                     self.session, Task, tenant_id=tenant_id,
-                    user_id=user_id, nhash=nhash) if nhash is not None else None)
+                    user_id=user_id, nhash_candidates=nhash_candidates) if nhash is not None else None)
                 if existing is not None:
                     return existing
                 raise

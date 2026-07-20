@@ -80,23 +80,32 @@ def peek_committed_replay(
 
 
 def find_existing_pending_semantic(
-    session: Any, model: Any, *, tenant_id: str, user_id: str | None, nhash: str,
+    session: Any, model: Any, *, tenant_id: str, user_id: str | None,
+    nhash_candidates: list[str],
 ) -> Any:
     """#163 Фаза 2b reuse: найти существующую *pending* строку с тем же semantic_key.
 
     Используется create-путями после конфликта partial-unique индекса (две одинаковые pending
     напоминания/задачи → вернуть существующую, «два повтора → 1 строка»). COALESCE-заглушка
     `__tenant_wide__` единообразна с индексом (общесемейные NULL user). Возвращает строку или None.
+
+    M9 (R1): матчим по СПИСКУ хеш-кандидатов (primary + legacy под старыми
+    ключами из compute_normalized_title_hash_candidates), а не по одному хешу.
+    После ротации SREDA_ENCRYPTION_KEY строки, записанные под старым ключом,
+    иначе перестали бы находиться → тихая деградация semantic-dedup (дубли).
+    Пустой список кандидатов (вырожденное название) → дедуп невозможен → None.
     """
     from sqlalchemy import func
 
+    if not nhash_candidates:
+        return None
     sentinel = "__tenant_wide__"
     return (
         session.query(model)
         .filter(
             model.tenant_id == tenant_id,
             func.coalesce(model.user_id, sentinel) == (user_id or sentinel),
-            model.normalized_title_hash == nhash,
+            model.normalized_title_hash.in_(nhash_candidates),
             model.status == "pending",
         )
         .order_by(model.created_at.asc())

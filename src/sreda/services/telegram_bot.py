@@ -295,7 +295,7 @@ async def _maybe_transcribe_voice(
             ("daily", _daily_key, SREDA_FREE_LLM_DAILY),
             ("monthly", _monthly_key, SREDA_FREE_LLM_MONTHLY),
         ]
-        if not _ledger.try_consume(tenant_id, "llm_turns", 1, _llm_periods):
+        if not await _ledger.try_consume_async(tenant_id, "llm_turns", 1, _llm_periods):
             await _send_error(UPGRADE_COPY["llm_daily_or_monthly"])
             return None
         # Voice quota check happens AFTER duration probed. Set up
@@ -319,7 +319,7 @@ async def _maybe_transcribe_voice(
             await _send_error("Не удалось получить голосовое сообщение. Отправь ещё раз.")
             _dl_meta["status"] = "no_file_id"
             if _is_free and _ledger and _llm_periods:
-                _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+                await asyncio.to_thread(_ledger.refund,tenant_id, "llm_turns", 1, _llm_periods)
             return None
 
         try:
@@ -335,7 +335,7 @@ async def _maybe_transcribe_voice(
             # Phase 2C M1 fix: refund LLM if reserved (download failure
             # ≠ user fault). Юзер не получил value — quota не charge'аем.
             if _is_free and _ledger and _llm_periods:
-                _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+                await asyncio.to_thread(_ledger.refund,tenant_id, "llm_turns", 1, _llm_periods)
             return None
 
         _dl_meta["bytes_in"] = len(audio_bytes)
@@ -352,15 +352,15 @@ async def _maybe_transcribe_voice(
             _duration_seconds = await probe_audio_async(audio_bytes)
         except FfprobeError as exc:
             logger.warning("ffprobe failed: %s — refunding LLM, sending text fallback", exc)
-            _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+            await asyncio.to_thread(_ledger.refund,tenant_id, "llm_turns", 1, _llm_periods)
             await _send_error(
                 "Не получилось обработать голосовое — напиши текстом, пожалуйста."
             )
             return None
-        if not _ledger.try_consume(
+        if not await _ledger.try_consume_async(
             tenant_id, "voice_stt_seconds", _duration_seconds, _voice_periods,
         ):
-            _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+            await asyncio.to_thread(_ledger.refund,tenant_id, "llm_turns", 1, _llm_periods)
             await _send_error(UPGRADE_COPY["voice_daily_or_monthly"])
             return None
 
@@ -377,9 +377,9 @@ async def _maybe_transcribe_voice(
             # Phase 2C: refund both quotas если reserved
             if _is_free and _ledger:
                 if _llm_periods:
-                    _ledger.refund(tenant_id, "llm_turns", 1, _llm_periods)
+                    await asyncio.to_thread(_ledger.refund,tenant_id, "llm_turns", 1, _llm_periods)
                 if _voice_periods and _duration_seconds:
-                    _ledger.refund(
+                    await asyncio.to_thread(_ledger.refund,
                         tenant_id, "voice_stt_seconds",
                         _duration_seconds, _voice_periods,
                     )

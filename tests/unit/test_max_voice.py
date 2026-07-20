@@ -627,8 +627,9 @@ def _patch_paid_gate(monkeypatch) -> None:
 def _patch_ledger_spy(monkeypatch) -> MagicMock:
     """UsageLedgerService с spy на ``try_consume`` (sync). Возвращает ledger-mock."""
     ledger = MagicMock()
-    ledger.try_consume = MagicMock(return_value=True)
-    ledger.refund = MagicMock()
+    ledger.try_consume_async = AsyncMock(return_value=True)  # M10 (R1): await
+    ledger.try_consume = MagicMock(return_value=True)  # backcompat
+    ledger.refund = MagicMock()  # зовётся через asyncio.to_thread
     monkeypatch.setattr(
         "sreda.services.usage_ledger.UsageLedgerService", lambda engine: ledger
     )
@@ -670,7 +671,7 @@ async def test_max_v6_exhausted_carrier_does_not_reserve_llm_turn(monkeypatch):
     )
 
     assert result is None
-    ledger.try_consume.assert_not_called()
+    ledger.try_consume_async.assert_not_called()
     max_client.download_audio.assert_not_awaited()
     fake_recognizer.recognize.assert_not_awaited()
     _budget.record_api_usage.assert_not_called()
@@ -720,8 +721,8 @@ async def test_max_v6_non_exhausted_free_carrier_does_reserve_llm_turn(monkeypat
     )
 
     assert result is payload
-    assert ledger.try_consume.call_count >= 1
-    first_call = ledger.try_consume.call_args_list[0]
+    assert ledger.try_consume_async.call_count >= 1
+    first_call = ledger.try_consume_async.call_args_list[0]
     assert first_call.args[0] == "t1"        # tenant_id (из _onboarding)
     assert first_call.args[1] == "llm_turns"
     assert first_call.args[2] == 1

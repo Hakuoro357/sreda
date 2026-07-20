@@ -494,8 +494,10 @@ def _patch_ledger_spy():
     Возвращает (context_manager, ledger_mock) — ассерты по
     ``ledger.try_consume``."""
     ledger = MagicMock()
-    ledger.try_consume = MagicMock(return_value=True)
-    ledger.refund = MagicMock()
+    # M10 (R1): код зовёт try_consume_async (await) — spy как AsyncMock.
+    ledger.try_consume_async = AsyncMock(return_value=True)
+    ledger.try_consume = MagicMock(return_value=True)  # backcompat
+    ledger.refund = MagicMock()  # зовётся через asyncio.to_thread (sync ок)
     cm = patch(
         "sreda.services.usage_ledger.UsageLedgerService", return_value=ledger
     )
@@ -530,7 +532,7 @@ async def test_v6_exhausted_carrier_does_not_reserve_llm_turn():
 
     assert result is None
     # Главный позитивный ассерт: free-tier reserve НЕ зван (гейт ДО резерва).
-    ledger.try_consume.assert_not_called()
+    ledger.try_consume_async.assert_not_called()
     # И ход блокирован полностью.
     recognizer.recognize.assert_not_awaited()
     budget.record_api_usage.assert_not_called()
@@ -573,8 +575,8 @@ async def test_v6_non_exhausted_free_carrier_does_reserve_llm_turn():
     assert result is payload
     # Free-tier llm_turn reserve ДОСТИГНУТ (гейт не отсёк): первый вызов —
     # 'llm_turns' с amount=1.
-    assert ledger.try_consume.call_count >= 1
-    first_call = ledger.try_consume.call_args_list[0]
+    assert ledger.try_consume_async.call_count >= 1
+    first_call = ledger.try_consume_async.call_args_list[0]
     assert first_call.args[0] == "t_v6b"   # tenant_id
     assert first_call.args[1] == "llm_turns"
     assert first_call.args[2] == 1
