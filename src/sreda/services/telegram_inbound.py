@@ -668,7 +668,14 @@ async def _process_approved_turn_locked(
                         thread_id=f"react:{onboarding.tenant_id}:{onboarding.chat_id}",
                         channel="telegram", provider_key=_prov)
             else:
-                await handle_telegram_interaction(
+                # M13 (R1): non-ReAct путь ЖИВ (голос/callback/новый юзер/
+                # тенант вне react_loop_enabled_tenants). Раньше метил inbound
+                # 'processed' безусловно — исход process_job глотался, и failed-
+                # ход прятался от unprocessed_inbound monitor'а. Теперь исход
+                # прокидывается; 'failed' → _turn_ok=False (не метим processed,
+                # образец ReAct-пути). None (спец-хендлеры: callback-ack, захват
+                # имени, persona, пустой текст) = штатное завершение → processed.
+                _nr_outcome = await handle_telegram_interaction(
                     bg_session,
                     bot_key=bot_key,
                     payload=payload,
@@ -677,6 +684,7 @@ async def _process_approved_turn_locked(
                     inbound_message_id=inbound_message_id,
                     ack_progress_controller=ack_progress_controller,
                 )
+                _turn_ok = _nr_outcome != "failed"
         except TelegramDeliveryError as exc:
             logger.warning(
                 "Telegram delivery failed during turn processing: %s", exc,

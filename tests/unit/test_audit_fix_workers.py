@@ -143,12 +143,17 @@ def _alert_spy(monkeypatch) -> list:
 
 @pytest.mark.asyncio
 async def test_poison_update_dead_lettered_after_max_attempts(
-    poller_db, monkeypatch
+    poller_db, monkeypatch, tmp_path
 ):
     """Update, детерминированно роняющий handler MAX_UPDATE_ATTEMPTS раз,
     dead-letter'ится: offset продвигается мимо него, хвост батча обрабатывается,
-    уходит admin alert (P0, dedupe по bot_key+update_id)."""
+    уходит admin alert (P0, dedupe по bot_key+update_id).
+
+    C6/M14 (R1): счётчик durable (poller_offsets.poison_*), сырой «мёртвый»
+    апдейт журналируется ДО сдвига offset."""
     monkeypatch.setattr(tlp, "BACKOFF_SECS", 0.01)  # ускоряем retry-цикл
+    _journal = tmp_path / "poison.jsonl"
+    monkeypatch.setattr(tlp, "_POISON_JOURNAL_PATH", str(_journal))
     alerts = _alert_spy(monkeypatch)
     poller = _make_poller()
 
@@ -177,8 +182,17 @@ async def test_poison_update_dead_lettered_after_max_attempts(
         row = s.query(PollerOffset).filter_by(channel="telegram:sreda").first()
         assert row is not None
         assert row.last_update_id == 8  # offset продвинут МИМО poison
+        # C6/M14: durable poison-счётчик сброшен после dead-letter.
+        assert row.poison_count == 0
+        assert row.poison_update_id is None
     assert poller.offset == 9
-    assert poller._update_failures == {}  # счётчик очищен после dead-letter
+
+    # C6: сырой «мёртвый» апдейт durably зажурналирован ДО сдвига offset.
+    lines = _journal.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["update_id"] == 7
+    assert rec["update"]["message"]["text"] == "boom"  # восстановимо
 
     assert len(alerts) == 1
     args, kwargs = alerts[0]
@@ -216,8 +230,49 @@ async def test_update_failure_recovers_when_handler_heals(
         row = s.query(PollerOffset).filter_by(channel="telegram:sreda").first()
         assert row is not None
         assert row.last_update_id == 11
+        # C6/M14: успех сбрасывает durable poison-счётчик.
+        assert row.poison_count == 0
+        assert row.poison_update_id is None
     assert alerts == []
-    assert poller._update_failures == {}
+
+
+@pytest.mark.asyncio
+async def test_poison_counter_durable_across_restart(
+    poller_db, monkeypatch, tmp_path
+):
+    """M14 (R1): poison-счётчик переживает РЕСТАРТ процесса. Новый инстанс
+    поллера видит накопленные попытки в БД, а не начинает с нуля — иначе
+    детерминированно ядовитый апдейт при рестарте на каждом сбое НИКОГДА не
+    достигал бы потолка и вечно блокировал очередь (in-memory dict терялся)."""
+    monkeypatch.setattr(tlp, "BACKOFF_SECS", 0.01)
+    monkeypatch.setattr(tlp, "_POISON_JOURNAL_PATH", str(tmp_path / "p.jsonl"))
+    poison = {"update_id": 7, "message": {"chat": {"id": 1}, "text": "boom"}}
+
+    async def crash(payload, *, bot_key="sreda"):
+        raise RuntimeError("crash")
+
+    SessionLocal = get_session_factory()
+
+    # «Рестарт 1»: инстанс #1, один сбой (attempt 1 < MAX) — offset не двинут.
+    p1 = _make_poller()
+    p1._fetch_updates = _FetchScript([[poison]])  # type: ignore[assignment]
+    with patch.object(tlp, "handle_telegram_update", crash):
+        await _run_then_cancel(p1)
+    with SessionLocal() as s:
+        row = s.query(PollerOffset).filter_by(channel="telegram:sreda").first()
+        assert row.poison_count == 1 and row.poison_update_id == 7
+        assert row.last_update_id == 6  # якорь на update_id-1 (re-deliver poison)
+
+    # «Рестарт 2»: НОВЫЙ инстанс (in-memory счётчик был бы 0). Второй сбой →
+    # count=2 (durable, накопился ЧЕРЕЗ рестарт), а не сброшен в 1.
+    p2 = _make_poller()
+    p2._fetch_updates = _FetchScript([[poison]])  # type: ignore[assignment]
+    with patch.object(tlp, "handle_telegram_update", crash):
+        await _run_then_cancel(p2)
+    with SessionLocal() as s:
+        row = s.query(PollerOffset).filter_by(channel="telegram:sreda").first()
+        assert row.poison_count == 2  # ← durable через рестарт (RED без фикса)
+        assert row.last_update_id == 6  # всё ещё не продвинут (< MAX)
 
 
 # ---------------------------------------------------------------------------

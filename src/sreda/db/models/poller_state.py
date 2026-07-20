@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, String, Text
+from sqlalchemy import BigInteger, DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sreda.db.base import Base
@@ -35,6 +35,18 @@ class PollerOffset(Base):
     last_update_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
+    )
+    # C6/M14 (R1): durable poison-счётчик для голова-очереди апдейта. In-memory
+    # счётчик терялся при рестарте → «ядовитый» (детерминированно роняющий
+    # хендлер) апдейт мог либо вечно блокировать inbound (никогда не достигал
+    # потолка), либо терять транзиентно-сбойные сообщения. Держим ЗДЕСЬ (без
+    # отдельной таблицы): update_id текущего сбоящего апдейта + число подряд
+    # идущих неудач. Success/dead-letter → сброс в NULL/0.
+    poison_update_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True,
+    )
+    poison_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", default=0,
     )
 
 

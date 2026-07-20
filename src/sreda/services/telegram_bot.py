@@ -32,13 +32,18 @@ async def handle_telegram_interaction(
     onboarding: TelegramOnboardingResult,
     inbound_message_id: str | None = None,
     ack_progress_controller=None,
-) -> None:
+) -> str | None:
+    """M13 (R1): возвращает исход process_job ('completed'/'failed'/…) для
+    dispatch-путей, либо None для «спец»-хендлеров (callback-ack, захват имени,
+    persona, пустой текст) — все они = штатное завершение. telegram_inbound
+    метит inbound 'processed' только если исход != 'failed'."""
     if onboarding.chat_id is None:
-        return
+        return None
 
     callback_query = payload.get("callback_query")
     if isinstance(callback_query, dict):
-        await _handle_callback(
+        # M13 (R1): прокидываем исход process_job наверх (см. return-контракт).
+        return await _handle_callback(
             session,
             telegram_client=telegram_client,
             callback_query=callback_query,
@@ -47,7 +52,6 @@ async def handle_telegram_interaction(
             payload=payload,
             inbound_message_id=inbound_message_id,
         )
-        return
 
     # 2026-04-27 simplified: ветка `is_new_user` удалена. До approval-gate
     # юзер не доходит до этой функции (webhook routes pending tenants
@@ -157,7 +161,10 @@ async def handle_telegram_interaction(
             )
         return
 
-    await _handle_command(
+    # M13 (R1): исход process_job (completed/failed) прокидывается наверх, чтобы
+    # telegram_inbound метил inbound 'processed' ТОЛЬКО при не-failed (образец —
+    # ReAct-путь через _Reply.had_internal_error).
+    return await _handle_command(
         session,
         telegram_client=telegram_client,
         bot_key=bot_key,
@@ -427,7 +434,7 @@ async def _handle_callback(
     bot_key: str,
     payload: dict,
     inbound_message_id: str | None,
-) -> None:
+) -> str | None:  # M13 (R1): исход process_job
     callback_id = callback_query.get("id")
     data = str(callback_query.get("data") or "")
 
@@ -848,7 +855,8 @@ async def _handle_callback(
     # Достаём label по токену, подставляем как message.text и дальше —
     # обычный chat-turn, будто юзер сам это написал.
     if data.startswith("btn_reply:"):
-        await _handle_btn_reply_callback(
+        # M13 (R1): прокинуть исход btn-reply chat-turn наверх.
+        return await _handle_btn_reply_callback(
             session=session,
             telegram_client=telegram_client,
             callback_query=callback_query,
@@ -858,7 +866,6 @@ async def _handle_callback(
             inbound_message_id=inbound_message_id,
             token=data[len("btn_reply:"):],
         )
-        return
 
     if callback_id:
         try:
@@ -877,7 +884,8 @@ async def _handle_callback(
 
     runtime = ActionRuntimeService(session, telegram_client=telegram_client)
     queued = runtime.enqueue_action(runtime_action)
-    await runtime.process_job(queued.job_id)
+    # M13 (R1): вернуть исход (completed/failed/…) наверх, не глотать.
+    return await runtime.process_job(queued.job_id)
 
 
 async def _handle_reminder_callback(
@@ -1013,7 +1021,7 @@ async def _handle_btn_reply_callback(
     payload: dict,
     inbound_message_id: str | None,
     token: str,
-) -> None:
+) -> str | None:  # M13 (R1): исход process_job
     """Inline-кнопка от LLM-ответа (Часть 0 плана v2).
 
     Resolve токена в label, подставляем label как text-message и
@@ -1083,7 +1091,8 @@ async def _handle_btn_reply_callback(
         return
     runtime = ActionRuntimeService(session, telegram_client=telegram_client)
     queued = runtime.enqueue_action(runtime_action)
-    await runtime.process_job(queued.job_id)
+    # M13 (R1): вернуть исход (completed/failed/…) наверх, не глотать.
+    return await runtime.process_job(queued.job_id)
 
 
 async def _handle_command(
@@ -1095,7 +1104,7 @@ async def _handle_command(
     onboarding: TelegramOnboardingResult,
     inbound_message_id: str | None,
     ack_progress_controller=None,
-) -> None:
+) -> str | None:  # M13 (R1): исход process_job
     runtime_action = dispatch_telegram_action(
         payload=payload,
         bot_key=bot_key,
@@ -1103,7 +1112,7 @@ async def _handle_command(
         inbound_message_id=inbound_message_id,
     )
     if runtime_action is None:
-        return
+        return None
 
     runtime = ActionRuntimeService(
         session,
@@ -1111,7 +1120,8 @@ async def _handle_command(
         ack_progress_controller=ack_progress_controller,
     )
     queued = runtime.enqueue_action(runtime_action)
-    await runtime.process_job(queued.job_id)
+    # M13 (R1): вернуть исход (completed/failed/…) наверх, не глотать.
+    return await runtime.process_job(queued.job_id)
 
 
 def _extract_message_text(payload: dict) -> str | None:

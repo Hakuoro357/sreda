@@ -39,11 +39,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import signal
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 from sqlalchemy import create_engine, text
@@ -84,6 +86,13 @@ LAST_ERROR_MAX_CHARS = 1000
 # deterministically-crashing update blocked the bot's entire inbound
 # (head-of-line) for up to ~24h (Telegram-side update TTL).
 MAX_UPDATE_ATTEMPTS = 3
+# C6 (R1): куда durably писать «мёртвый» (dead-letter'нутый) апдейт ПЕРЕД
+# сдвигом offset — иначе он теряется безвозвратно (offset ушёл, в БД его нет).
+# Append-only JSONL, восстановимо вручную. Отдельного шифрованного хранилища
+# НЕ вводим (пропорционально). Путь конфигурируем; дефолт рядом с логами.
+_POISON_JOURNAL_PATH = os.environ.get(
+    "SREDA_POISON_JOURNAL", "/var/log/sreda/poison_updates.jsonl"
+)
 
 
 def _advisory_lock_id(bot_key: str) -> int:
@@ -161,10 +170,10 @@ class TelegramLongPoller:
         self._lock_engine: Engine | None = None
         self._lock_conn: Connection | None = None
         self.offset: int = 0
-        # Poison-update guard: consecutive handler failures per update_id.
-        # Entries are popped on success / dead-letter, so only updates
-        # currently failing occupy the map.
-        self._update_failures: dict[int, int] = {}
+        # C6/M14 (R1): poison-счётчик теперь DURABLE (poller_offsets.poison_*),
+        # не in-memory — переживает рестарт. Только ГОЛОВА очереди ретраится
+        # (батч рвётся на первом сбое), поэтому одного (update_id, count) на
+        # канал достаточно.
         # Per-bot derived values.
         self._lock_key: int = _advisory_lock_id(bot_key)
         self._channel: str = _poller_channel(bot_key)
@@ -280,17 +289,98 @@ class TelegramLongPoller:
         after ``handle_telegram_update`` has returned (durable ingest
         is committed) — so a crash between the two commits is safe:
         the next ``getUpdates`` re-delivers the same update and
-        ``persist_inbound_event`` short-circuits on duplicate."""
+        ``persist_inbound_event`` short-circuits on duplicate.
+
+        C6/M14 (R1): также СБРАСЫВАЕТ poison-счётчик — успешная обработка (или
+        dead-letter, тоже зовущий _save_offset) сдвинула голову очереди, старый
+        poison больше не актуален."""
         with self.SessionLocal() as session:
-            session.merge(
-                PollerOffset(
+            row = (
+                session.query(PollerOffset)
+                .filter_by(channel=self._channel)
+                .first()
+            )
+            if row is None:
+                row = PollerOffset(
                     channel=self._channel,
                     last_update_id=update_id,
                     updated_at=_utcnow(),
+                    poison_update_id=None,
+                    poison_count=0,
                 )
-            )
+                session.add(row)
+            else:
+                row.last_update_id = update_id
+                row.updated_at = _utcnow()
+                row.poison_update_id = None
+                row.poison_count = 0
             session.commit()
         self.offset = update_id + 1
+
+    def _record_poison_attempt(self, update_id: int) -> int:
+        """C6/M14 (R1): DURABLE инкремент числа ПОДРЯД идущих сбоев ЭТОГО
+        (головного) апдейта на poller_offsets. НЕ двигает offset. Возвращает
+        накопленное число попыток. Переживает рестарт (в отличие от прежнего
+        in-memory dict) → детерминированно ядовитый апдейт достигнет потолка,
+        даже если процесс рестартует на каждом сбое."""
+        with self.SessionLocal() as session:
+            row = (
+                session.query(PollerOffset)
+                .filter_by(channel=self._channel)
+                .first()
+            )
+            if row is None:
+                # Первый же апдейт ядовит (offset-строки ещё нет). Якорим
+                # last_update_id на (update_id-1) → getUpdates при ретрае
+                # re-delivered ровно этот апдейт (offset = update_id).
+                row = PollerOffset(
+                    channel=self._channel,
+                    last_update_id=update_id - 1,
+                    updated_at=_utcnow(),
+                    poison_update_id=update_id,
+                    poison_count=1,
+                )
+                session.add(row)
+                session.commit()
+                return 1
+            if row.poison_update_id == update_id:
+                row.poison_count += 1
+            else:
+                row.poison_update_id = update_id
+                row.poison_count = 1
+            row.updated_at = _utcnow()
+            count = row.poison_count
+            session.commit()
+            return count
+
+    def _journal_dead_update(
+        self, update_id: int, upd: dict, exc: Exception
+    ) -> bool:
+        """C6 (R1): ПЕРЕД сдвигом offset durably пишем сырой «мёртвый» апдейт
+        в append-only JSONL (восстановимо вручную) — иначе он теряется
+        безвозвратно (offset уйдёт, в БД его нет). True при успешной записи;
+        False → caller НЕ двигает offset (сообщение не теряем, ждём следующего
+        тика/починки диска)."""
+        rec = {
+            "ts": _utcnow().isoformat(),
+            "channel": self._channel,
+            "bot_key": self.bot_key,
+            "update_id": update_id,
+            "error_type": type(exc).__name__,
+            "update": upd,
+        }
+        try:
+            path = Path(_POISON_JOURNAL_PATH)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            return True
+        except Exception:  # noqa: BLE001 — журнал не должен ронять поллер
+            logger.error(
+                "poison journal write failed (%s) — offset NOT advanced, "
+                "will retry", _POISON_JOURNAL_PATH, exc_info=True,
+            )
+            return False
 
     def _save_heartbeat(self, *, ok: bool, error: str | None = None) -> None:
         """Update the heartbeat row.
@@ -393,7 +483,8 @@ class TelegramLongPoller:
                         # Poison update dead-lettered — carry on with the
                         # rest of the batch.
                         continue
-                    self._update_failures.pop(update_id, None)
+                    # Успех: _save_offset двигает offset И сбрасывает poison
+                    # (C6/M14) — отдельный in-memory pop больше не нужен.
                     self._save_offset(update_id)
             except asyncio.CancelledError:
                 raise
@@ -452,26 +543,30 @@ class TelegramLongPoller:
         after a successful handle, so a deterministically-crashing update
         re-ran every iteration and stalled the bot's whole inbound
         (head-of-line) while ``_save_heartbeat(ok=True)`` — recorded right
-        after the fetch — kept every health probe green. Dead-letter loses
-        exactly one update but unblocks everyone behind it, and the
-        critical log + alert make the loss visible (the audit's core
-        complaint was the SILENT failure mode).
+        after the fetch — kept every health probe green. Dead-letter unblocks
+        everyone behind it, and the critical log + alert make the loss visible
+        (the audit's core complaint was the SILENT failure mode).
+
+        C6/M14 (R1): счётчик DURABLE (poller_offsets), переживает рестарт; а
+        ПЕРЕД dead-letter'ом сырой апдейт durably журналируется (не теряем).
         """
-        attempts = self._update_failures.get(update_id, 0) + 1
-        self._update_failures[update_id] = attempts
+        attempts = self._record_poison_attempt(update_id)  # M14: DURABLE
         if attempts < MAX_UPDATE_ATTEMPTS:
             logger.exception(
                 "telegram update %s failed (attempt %d/%d) — will retry",
                 update_id, attempts, MAX_UPDATE_ATTEMPTS,
             )
+            return True  # retry: offset НЕ двигаем
+        # C6: durably журналируем «мёртвый» апдейт ДО сдвига offset. Не смогли
+        # записать → offset НЕ двигаем (сообщение не теряем, ретрай).
+        if not self._journal_dead_update(update_id, upd, exc):
             return True
-        self._update_failures.pop(update_id, None)
         logger.critical(
             "telegram update %s crashed handler %d times — DEAD-LETTER: "
-            "advancing offset past it (bot_key=%s, error=%s: %s)",
-            update_id, attempts, self.bot_key, type(exc).__name__, exc,
+            "journaled + advancing offset (bot_key=%s, error=%s)",
+            update_id, attempts, self.bot_key, type(exc).__name__,
         )
-        self._save_offset(update_id)
+        self._save_offset(update_id)  # advance past + сброс poison
         await self._alert_poison_update(update_id, upd, exc)
         return False
 
