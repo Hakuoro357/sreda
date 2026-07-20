@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import itertools
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -146,6 +147,12 @@ def _okv2_added(content: str) -> tuple[int, int]:
     return int(payload.get("added_count", 0)), int(payload.get("duplicate_count", 0))
 
 
+# R3 (ревью sol+terra R2): нулевой/no-op контракт — `ok:*:0` (added/cleared/updated 0),
+# ok:noop, *unchanged*, *not_found* → эффекта НЕТ, не считать applied (иначе ложное «готово»
+# после no-op остаётся зелёным). Кросс-проверка правды — снимок состояния (`mutated`).
+_ZERO_EFFECT_RE = re.compile(r"(?::0\b)|(?:\bnoop\b)|unchanged|not_found", re.IGNORECASE)
+
+
 def _classify_receipt(name: str, kind: str | None, content: str) -> str:
     """Статус квитанции per-receipt (R2, ревью sol+terra: НЕ по set имён — не путать
     успех одного вызова с упавшим одноимённым). applied / already_applied / failed /
@@ -163,6 +170,8 @@ def _classify_receipt(name: str, kind: str | None, content: str) -> str:
         if dup > 0:
             return "already_applied"     # всё уже было (цель удовлетворена, не новая строка)
         return "noop"                    # ни добавлено, ни дубли → эффекта нет
+    if _ZERO_EFFECT_RE.search(content):  # ok:updated:0 / ok:cleared:0 / not_found → no-op
+        return "noop"
     # target-инструменты (archive/schedule…): success-префикс ok:archived / ok:scheduled …
     if content.startswith("ok:") and not content.startswith("ok:noop"):
         return "applied"

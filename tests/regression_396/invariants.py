@@ -137,14 +137,18 @@ def inv_no_false_success(dialog: DialogOutcome) -> list[Violation]:
 
 
 def inv_failed_not_done(dialog: DialogOutcome) -> list[Violation]:
-    """Инв.2: инструмент вернул ошибку И нет компенсирующего успеха ⇒ реплика НЕ
-    говорит «готово». Модель не должна рапортовать успех поверх упавшего инструмента."""
+    """Инв.2: инструмент упал ⇒ реплика НЕ рапортует безусловный успех «готово».
+
+    R3 (ревью sol+terra R2): убрана оговорка «нет компенсирующего успеха» — на СМЕШАННОМ
+    ходе (один вызов ok, другой failed) обобщённое «Готово, всё добавила» пряталo провал
+    (has_applied_write=True глушил инвариант). Теперь падение ЛЮБОГО инструмента при
+    success-claim = красный (частичный отчёт фикстура объявляет явно require/forbid-фразами)."""
     out: list[Violation] = []
     for i, t in enumerate(dialog.turns):
-        if t.has_failed_tool and not t.has_applied_write and _claims_success(t):
+        if t.has_failed_tool and _claims_success(t):
             out.append(Violation(
                 "failed_not_done", "CRITICAL", i,
-                f"инструмент упал (receipts={[(r.name, r.result_kind) for r in t.receipts]}), "
+                f"инструмент упал (receipts={[(r.name, r.status) for r in t.receipts]}), "
                 f"а реплика рапортует успех: {t.reply!r}"))
     return out
 

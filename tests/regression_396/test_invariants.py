@@ -87,6 +87,30 @@ def test_inv2_silent_when_honest_failure():
     assert inv_failed_not_done(d) == []
 
 
+def test_inv2_catches_mixed_success_and_failure():
+    """R3 (ревью sol+terra R2): один вызов ok, другой failed, а реплика «Готово, всё добавила» —
+    один успех НЕ должен глушить провал. Красный."""
+    d = _dialog(_turn("Готово, всё добавила.", tool_calls=["add_checklist_items", "add_task"],
+                      receipts=[_ok_receipt("add_checklist_items"), _err_receipt("add_task")],
+                      after={**_Z, "checklist_items": 1}))
+    assert inv_failed_not_done(d), "смешанный успех+провал под success-claim не пойман"
+
+
+def test_inv1_noop_receipt_is_false_success():
+    """R3: no-op квитанция (status=noop, напр. ok:updated:0) не считается applied →
+    «Обновила» без реального изменения = ложный успех."""
+    noop = ToolReceipt(name="update_task", result_kind="ok", content="ok:updated:0", status="noop")
+    d = _dialog(_turn("Обновила задачу.", tool_calls=["update_task"], receipts=[noop]))
+    assert inv_no_false_success(d), "ложный успех после no-op не пойман"
+
+
+def test_inv1_catches_plural_claim_forms():
+    """R3 (ревью terra R2): множественное число «добавили/создали/внесли/обновили» без эффекта."""
+    for reply in ("Добавили молоко.", "Создали список.", "Внесли запись.", "Обновили данные."):
+        d = _dialog(_turn(reply, tool_calls=["add_checklist_items"]))
+        assert inv_no_false_success(d), f"пропущена plural-форма: {reply!r}"
+
+
 # ─────────────────────────── инв.4a mutated_not_cancelled (#362) ───────────────────────────
 
 def test_inv4a_catches_false_cancel_on_write():

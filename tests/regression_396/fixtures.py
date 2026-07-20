@@ -88,9 +88,11 @@ F393_ARCHIVE_RESUME = Fixture(
 F390_SHOW_LISTS = Fixture(
     id="390_show_lists_tech_leak",
     bug="#390",
-    summary="«покажи списки» → get_checklist(overview) отдаёт сырой англ. формат "
-            "«N pending, M done, K total» + id — модель пересказывает как есть. Инв.5: "
-            "публичный ответ ∩ тех-поля = ∅. Красный по СЫРОМУ ВЫВОДУ инструмента (реальный код).",
+    summary="RECEIPT-CONTRACT (не E2E публичной утечки — reply скриптован чистым; ревью sol+terra "
+            "R2): «покажи списки» → get_checklist(overview) отдаёт СЫРОЙ англ. «N pending, M done, "
+            "K total» + id. Красный по ВЫВОДУ инструмента (реальный код) — источник #390; зеленеет, "
+            "когда формат чинят на русский. Публичная режущая способность inv_public_no_tech "
+            "доказана отдельно в test_invariants (синтетика + протокол-префиксы).",
     seed=lambda s, u: _seed_lists(s, u, {
         "Кино к просмотру": ["Дюна", "Оппенгеймер"], "Поход": ["палатка", "спички", "котелок"]}),
     turns=[
@@ -145,20 +147,24 @@ F362_DIRECT_WRITE = Fixture(
 F_IDEMPOTENCY = Fixture(
     id="synthetic_idempotency",
     bug="inv3",
-    summary="ОДИН idempotency_key (тот же inbound_message_id → тот же turn_key/operation_id) на "
-            "двух ходах ⇒ ≤1 мутация. R2 (ревью sol+terra): пинним inbound_id, иначе тест мерил "
-            "лишь дедуп по имени, а не replay-идемпотентность ключа. Инв.3.",
+    summary="ТОЧНЫЙ replay одного ключа: тот же inbound_message_id (→ turn_key) И тот же "
+            "tool_call_id (→ operation_id = f(turn_key, tool_call_id, name)) на двух ходах ⇒ "
+            "ОБСЕРВИРУЕМО ≤1 мутация. Инв.3 — судим по СОСТОЯНИЮ (уровень, заданный #396). "
+            "R3 (ревью sol+terra): пинним и inbound_id, и tool_call_id. Ограничение (задокумент.): "
+            "дедуп по имени «молоко» — со-объяснение того же ≤1 исхода; изолировать operation-id-"
+            "идемпотентность нечем (dedup-free инструменты типа add_task-без-даты rerun-unsafe by "
+            "design). Режущая способность самого инв.3 — в test_invariants (unit).",
     turns=[
         ScriptedTurn(
             "добавь молоко в покупки",
-            [ai_tool("add_shopping_items", {"items": [{"title": "молоко"}]}),
+            [ai_tool("add_shopping_items", {"items": [{"title": "молоко"}]}, cid="idem-call"),
              ai_text("Готово, добавила молоко.")],
             inbound_id="idem-key-1"),
         ScriptedTurn(
             "добавь молоко в покупки",
-            [ai_tool("add_shopping_items", {"items": [{"title": "молоко"}]}),
+            [ai_tool("add_shopping_items", {"items": [{"title": "молоко"}]}, cid="idem-call"),
              ai_text("Молоко уже в списке.")],
-            inbound_id="idem-key-1"),   # ← ТОТ ЖЕ ключ: реальный replay
+            inbound_id="idem-key-1"),   # ← ТОТ ЖЕ inbound + tool_call_id: точный replay
     ],
     idempotent_group=([0, 1], "shopping"),
     expect_mutations={"shopping": 1},
@@ -182,7 +188,11 @@ F_AMBIGUOUS_CANCEL = Fixture(
              ai_text("Уточни, какой именно список удалить?")]),
     ],
     ambiguous_cancel_turns=[0],
+    max_confirms=1,   # деструктив на неоднозначной цели УПИРАЕТСЯ в confirm (не молча архивирует)
     expect_final=lambda s, u: (
+        # ход №0 НЕ выполнил архивацию (упёрся в confirm, назвав конкретную цель) →
+        # оба списка активны. Резюмировать «да» фикстура НЕ шлёт: проверяем «0 мутаций до
+        # подтверждения», что и есть безопасность неоднозначной отмены.
         [] if all(_list_status(s, u, t) == "active" for t in ("дела на дачу", "дела на сегодня"))
         else ["неоднозначная отмена заархивировала список: "
               + repr({t: _list_status(s, u, t) for t in ("дела на дачу", "дела на сегодня")})]),
