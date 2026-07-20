@@ -2370,30 +2370,38 @@ def _sgr_structured_step(*, bound: list, allowed_read: Any, allowed_write: Any,
         used_provider, used_model = provider_key, model_name
         _t0 = _time.perf_counter()
         try:
-            raw = invoke_with_per_call_timeout(
-                llm.bind(response_format=_rf), sgr_msgs,
-                timeout_seconds=timeout_s, provider=provider_key)
-            out["primary_latency_ms"] = int((_time.perf_counter() - _t0) * 1000)  # #401
-        except Exception as _pe:  # noqa: BLE001 — сетевой сбой/таймаут primary → structured-Оса (§5)
-            out["primary_latency_ms"] = int((_time.perf_counter() - _t0) * 1000)  # #401: попытка primary до сбоя
-            fb_shape = _sgr.WIRE_SHAPE_BY_PROVIDER.get(fallback_provider_key or "")
-            if fallback_llm is None or not fb_shape:
-                raise
-            logger.warning("react_sgr: primary structured сбой → structured-фолбэк %s",
-                           fallback_provider_key, exc_info=True)
-            # CR R1 sol MINOR: телеметрия попытки primary (PII-free: только тип ошибки) —
-            # llm_calls не должен скрывать сбой Mercury и повторную попытку.
-            out["fallback_fired"], out["primary_error"] = True, type(_pe).__name__
-            _rf_fb = {"type": "json_schema",
-                      "json_schema": {"name": "sgr_step", "strict": True,
-                                      "schema": _sgr.build_wire_schema(sgr_tools, fb_shape)}}
-            _tfb = _time.perf_counter()  # #401: вызов structured-резерва — отдельным таймингом
-            raw = invoke_with_per_call_timeout(
-                fallback_llm.bind(response_format=_rf_fb), sgr_msgs,
-                timeout_seconds=timeout_s, provider=fallback_provider_key)
-            out["fallback_latency_ms"] = int((_time.perf_counter() - _tfb) * 1000)  # #401
-            used_provider, used_model = fallback_provider_key, fallback_model_name
-        out["latency_ms"] = int((_time.perf_counter() - _t0) * 1000)
+            try:
+                raw = invoke_with_per_call_timeout(
+                    llm.bind(response_format=_rf), sgr_msgs,
+                    timeout_seconds=timeout_s, provider=provider_key)
+                out["primary_latency_ms"] = int((_time.perf_counter() - _t0) * 1000)  # #401
+            except Exception as _pe:  # noqa: BLE001 — сетевой сбой/таймаут primary → structured-Оса (§5)
+                out["primary_latency_ms"] = int((_time.perf_counter() - _t0) * 1000)  # #401: попытка primary до сбоя
+                fb_shape = _sgr.WIRE_SHAPE_BY_PROVIDER.get(fallback_provider_key or "")
+                if fallback_llm is None or not fb_shape:
+                    raise
+                logger.warning("react_sgr: primary structured сбой → structured-фолбэк %s",
+                               fallback_provider_key, exc_info=True)
+                # CR R1 sol MINOR: телеметрия попытки primary (PII-free: только тип ошибки) —
+                # llm_calls не должен скрывать сбой Mercury и повторную попытку.
+                out["fallback_fired"], out["primary_error"] = True, type(_pe).__name__
+                _rf_fb = {"type": "json_schema",
+                          "json_schema": {"name": "sgr_step", "strict": True,
+                                          "schema": _sgr.build_wire_schema(sgr_tools, fb_shape)}}
+                _tfb = _time.perf_counter()  # #401: вызов structured-резерва — отдельным таймингом
+                try:
+                    raw = invoke_with_per_call_timeout(
+                        fallback_llm.bind(response_format=_rf_fb), sgr_msgs,
+                        timeout_seconds=timeout_s, provider=fallback_provider_key)
+                finally:
+                    # #401 (R2 sol+terra MINOR): под-тайминг фолбэка — даже если фолбэк САМ упал
+                    # (двойной SGR-сбой → легаси): иначе trace показывал fallback_fired без длительности.
+                    out["fallback_latency_ms"] = int((_time.perf_counter() - _tfb) * 1000)
+                used_provider, used_model = fallback_provider_key, fallback_model_name
+        finally:
+            # #401 (R2 sol+terra MINOR): итог SGR-попытки ВСЕГДА (в т.ч. двойной сбой → outer except →
+            # легаси): иначе latency_ms=0 и легаси-аккумуляция теряла SGR-ожидание.
+            out["latency_ms"] = int((_time.perf_counter() - _t0) * 1000)
         # per-attempt учёт завершённой structured-попытки (guarded — учёт не валит ход)
         try:
             _p, _c = _extract_usage(raw)
@@ -3607,7 +3615,14 @@ def _build_graph(llm: Any, all_tools: list, *,
                                       budget=_compact_budget(), summary=history_summary)
             if time_tail_line:  # #298: дата+время эфемерным хвостом (prompt-view, заморожено на ход)
                 _msgs = _append_time_tail(_msgs, time_tail_line)
-            _primary = deepseek_llm if deepseek_llm is not None else llm  # мисконфиг → Фредди+web-only
+            # #401 (R2 terra MAJOR): у chat/fact НЕТ Оса-тира — Оса (fallback_llm) это фолбэк ТОЛЬКО
+            # task/SGR-ветки (#197 дизайн). Значит Mercury тут — ПОСЛЕДНИЙ рубеж И как primary (когда
+            # deepseek не построился), И как фолбэк после deepseek → берём Mercury с ДЕФОЛТНЫМ retry
+            # (chat_fallback_llm), а НЕ fail-fast `llm`: fail-fast `llm` жив ТОЛЬКО в task/SGR, где за
+            # ним реально стоит Оса. Иначе fail-fast Mercury тут упал бы без достижимого резерва (5xx →
+            # safe-reply без ретраев). None → `llm` (back-compat: тесты инжектят один клиент).
+            _chat_fb_client = chat_fallback_llm if chat_fallback_llm is not None else llm
+            _primary = deepseek_llm if deepseek_llm is not None else _chat_fb_client  # мисконфиг → Фредди+web-only
             _used_provider = deepseek_provider_key if deepseek_llm is not None else provider_key
             _used_model = _deepseek_model_name if deepseek_llm is not None else _model_name
             _t0 = _time.perf_counter()
@@ -3622,12 +3637,8 @@ def _build_graph(llm: Any, all_tools: list, *,
                                type(_e).__name__, exc_info=True)
                 _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
                 _tfb = _time.perf_counter()  # #401: вызов резерва — отдельным таймингом
-                # #401 (R1 sol MAJOR): chat/fact-фолбэк — ПОСЛЕДНИЙ рубеж (Осы за ним нет) → берём
-                # Mercury с ДЕФОЛТНЫМ retry (chat_fallback_llm), а НЕ fail-fast `llm`: транзиентный
-                # блип Фредди тут стоит ретраить (15с-cap бортует латентность). None → `llm` (back-compat).
-                _chat_fb = chat_fallback_llm if chat_fallback_llm is not None else llm
                 resp = invoke_with_per_call_timeout(  # тот же web-only bound, НЕ task; #256: тоже короткий
-                    _chat_fb.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s,
+                    _chat_fb_client.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s,
                     provider=provider_key)  # #343: fallback Фредди → СВОЙ breaker-bucket, не primary
                 _fallback_latency_ms = int((_time.perf_counter() - _tfb) * 1000)  # #401
                 _used_provider, _used_model, _fallback_fired = provider_key, _model_name, True

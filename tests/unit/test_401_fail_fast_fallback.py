@@ -269,3 +269,15 @@ def test_chat_fact_fallback_defaults_to_llm_when_unset(monkeypatch):
                                chat_fb=None, thread="cf-default")
     assert res["messages"][-1].content == "from-llm", \
         f"без chat_fallback_llm фолбэк = llm (back-compat): {res['messages'][-1].content}"
+
+
+def test_chat_fact_primary_uses_default_retry_when_no_deepseek(monkeypatch):
+    """R2 terra MAJOR: deepseek не построился → chat/fact PRIMARY = chat_fallback_llm (default-retry),
+    НЕ fail-fast `llm` (fail-fast без Оса-тира тут = 5xx → safe-reply без ретраев)."""
+    from tests.unit.test_react_preflight_197 import _Chat
+    chat_fb = _Chat("chatfb", classify="chat", responses=[AIMessage(content="from-chat-primary")])
+    freddie = _Chat("freddie", classify="chat", responses=[AIMessage(content="from-llm")])  # fail-fast llm
+    res = _run_chat_fact_graph(monkeypatch, deepseek=None, freddie=freddie,
+                               chat_fb=chat_fb, thread="cf-nods")
+    assert res["messages"][-1].content == "from-chat-primary", \
+        f"chat/fact primary без deepseek должен идти через chat_fallback_llm, не llm: {res['messages'][-1].content}"
