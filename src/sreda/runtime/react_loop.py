@@ -5494,11 +5494,16 @@ async def handle_turn(
                     collect_successful_writes,
                     fallback_reply,
                     reply_grounds_result,
+                    reply_has_tech_leak,
                 )
                 _writes393 = collect_successful_writes(result.get("messages") or [])
-                if _writes393 and not reply_grounds_result(text, _writes393):
+                if _writes393:
                     _fb393 = fallback_reply(_writes393)
-                    if _fb393:
+                    # подмена ЧИСТОЙ страховкой, если: (а) реплика НЕ называет результат ИЛИ (б) называет,
+                    # но несёт машинную утечку (okv2/id=/ref=/«—»/hex-id — Codex terra R3: grounded-ответ с
+                    # техследом проходил детектор, _postformat не всё чистит). Только когда страховка есть.
+                    if _fb393 and (not reply_grounds_result(text, _writes393)
+                                   or reply_has_tech_leak(text)):
                         text = _fb393
             except Exception:  # noqa: BLE001 — заземление best-effort, ход пользователя не роняем
                 logger.warning("react_loop: post-tool report (#393) failed", exc_info=True)

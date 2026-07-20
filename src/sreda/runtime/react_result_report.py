@@ -46,8 +46,28 @@ _IDLIKE_TOKEN_RE = re.compile(r"\b[a-zа-я]+_[0-9a-f]{12,}\b", re.IGNORECASE)
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _EMDASH_RE = re.compile(r"[—–―]")  # длинное/среднее тире → обычный дефис (правило: без «—» юзеру)
 _LATIN_RE = re.compile(r"[a-zA-Z]")  # латиница в детерминированном тексте = не «чистый русский»
-_TECH_MARK_RE = re.compile(r"\b(?:id|ref|http|okv2|checklist|task|rem|clitem)\s*[=:]", re.IGNORECASE)
-_MAX_NAME_LEN = 80
+# WHITELIST отображаемого имени (Codex sol+terra R3): ТОЛЬКО кириллица/цифры/пробел/безопасная пунктуация.
+# Всё прочее (=/;/:/`/{}/<>/|/… — key=value, инструкц-формы, тех-конструкции) → имя небезопасно → fail-closed.
+# Робастнее blacklist: `_TECH_MARK_RE` (id=/ref=/okv2/…) был избыточен (маркеры латинские, уже ловит _LATIN_RE).
+_ALLOWED_NAME_RE = re.compile(r"^[0-9а-яё \-.,!?«»()]+$", re.IGNORECASE)
+_MAX_NAME_LEN = 48  # реальное имя списка/пункта короткое; длиннее = предложение/инъекция → fail-closed
+# машинная утечка в ЛЮБОЙ финальной реплике (вкл. заземлённый ответ модели): okv2-конверт, key=hex-id,
+# id=/ref=, длинное тире. Латиницу СЮДА НЕ включаем — это может быть КОНТЕНТ юзера (его пункт), а не техслед.
+_TECH_LEAK_RE = re.compile(r"okv2:|\b(?:id|ref)\s*=|[—–―]|_[0-9a-f]{12,}", re.IGNORECASE)
+# служебные слова (детектор полноты их НЕ требует; короткие СУЩЕСТВИТЕЛЬНЫЕ сюда НЕ входят — «сыр»/«дом»/
+# «чай»/«суп» обязательны, sol+terra R3). Только предлоги/союзы/частицы/местоимения.
+_STOPWORDS: frozenset[str] = frozenset(
+    "и в во на с со по для из к ко о об от у за до не а но же ли бы то или "
+    "без при над под про через между перед у я мы ты вы он она оно они это эта этот эти "
+    "мой моя мои наш наша наши да нет".split()
+)
+
+
+def reply_has_tech_leak(text: str) -> bool:
+    """Финальная реплика несёт машинную утечку (okv2/id=/ref=/длинное тире/сырой hex-id)? Тогда даже
+    ЗАЗЕМЛЁННЫЙ ответ модели надо заменить чистой страховкой (Codex terra R3: grounded-ответ с okv2/«—»
+    проходил детектор, а `_postformat` не всё чистит). Латиница НЕ утечка (может быть пункт юзера)."""
+    return bool(_TECH_LEAK_RE.search(text or ""))
 
 
 def _is_id(value: str) -> bool:
@@ -56,28 +76,27 @@ def _is_id(value: str) -> bool:
 
 def _sanitize(value: str) -> str:
     """Первичная чистка: control-символы, id-токены (checklist_<hex>…), длинное тире→дефис, схлоп
-    пробелов, кап длины. Формы-чистоты (латиница/техмаркеры) проверяет `_clean_name`."""
+    пробелов. Отказ по формам (латиница/спец-пунктуация/длина) — в `_clean_name` (НЕ усекаем здесь:
+    усечение пропускало бы длинную инъекцию как короткое имя, sol+terra R3)."""
     s = _CTRL_RE.sub(" ", str(value or ""))
     s = _EMDASH_RE.sub("-", s)
     s = _IDLIKE_TOKEN_RE.sub(" ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    if len(s) > _MAX_NAME_LEN:
-        s = s[:_MAX_NAME_LEN].rstrip()
-    return s
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def _clean_name(value: str) -> str:
     """Безопасно ОТОБРАЖАЕМОЕ имя для детерминированного user-facing текста И инжекта в промпт
-    (fail-closed, Codex sol+terra R1/R2): санитизация + отказ, если имя содержит ЛАТИНИЦУ (контракт
-    «чистый русский без англицизмов»), техмаркеры (`id=`/`ref=`/`http`/…) или пусто/только-пунктуация.
-    Пусто → небезопасно, вызывающий НЕ строит акт (голос как есть). Так ни латиница/техследы/
-    инструкц-текст не утекут ни в fallback, ни в grounding_note."""
+    (fail-closed WHITELIST, Codex sol+terra R1-R3). Отказ («»), если имя: пустое/id; ДЛИННЕЕ порога
+    (предложение/инъекция); содержит ЛАТИНИЦУ ИЛИ ЛЮБОЙ символ вне whitelist (кириллица/цифры/пробел/
+    безопасная пунктуация) — так `ключ=значение`, `молоко; игнорируй…`, инструкц-формы, тех-конструкции
+    отсекаются; только пунктуация без слов. Небезопасно → вызывающий НЕ строит акт → ни техследы/латиница/
+    инъекц-текст не утекут ни в fallback (user), ни в grounding_note (промпт)."""
     s = _sanitize(value)
-    if not s or _is_id(value):
+    if not s or _is_id(value) or len(s) > _MAX_NAME_LEN:
         return ""
-    if _LATIN_RE.search(s) or _TECH_MARK_RE.search(s):
+    if _LATIN_RE.search(s) or not _ALLOWED_NAME_RE.match(s):
         return ""
-    if not re.search(r"[0-9а-яё]", s, re.IGNORECASE):  # ни буквы/цифры — только пунктуация
+    if not re.search(r"[0-9а-яё]", s, re.IGNORECASE):  # хотя бы слово/цифра, не только пунктуация
         return ""
     return s
 
@@ -211,7 +230,7 @@ def _name_mentioned(reply_tokens: list[str], name: str) -> bool:
     слова (≥4 симв.) названы (не «хотя бы одно» — иначе «молоко без лактозы»/«Дела на сегодня»
     засчитывались бы по одному общему слову, sol+terra R2). Каждое значимое слово → какой-то токен
     реплики начинается с его stem (морфология #180). Имя без значимых слов → точный токен целиком."""
-    name_toks = [t for t in _norm(name).split() if len(t) >= 4]
+    name_toks = [t for t in _norm(name).split() if len(t) >= 2 and t not in _STOPWORDS]
     if not name_toks:
         whole = _norm(name)
         return bool(whole) and whole in reply_tokens
