@@ -86,11 +86,11 @@ def test_shopping_destructive_and_edits_still_candidates():
         assert out[0].name == name
 
 
-def test_other_add_tools_still_candidates():
-    """Аддитивные семьи вне autoexec-реестра остаются кандидатами при allowed_write=∅.
-    #389 добавил add_shopping_items, #392 — add_checklist_items (обе доказаны данными
-    + owner-«да»); add_task данными НЕ доказан → кандидат под confirm (регрессия границы)."""
-    for name in ("add_task",):
+def test_non_additive_writes_still_candidates():
+    """Write-инструменты ВНЕ autoexec-реестра (правки/статусы) остаются кандидатами при
+    allowed_write=∅. #392-расширение сделало autoexec ТОЛЬКО аддитивные (add_/save_);
+    update_/mark_ — не аддитивны → confirm-кандидат (регрессия границы)."""
+    for name in ("update_task", "mark_checklist_item_done", "update_shopping_item"):
         t = _tool(name)
         out = _apply_unified_policy([t], ["web"], [])
         assert len(out) == 1 and out[0] is not t, name
@@ -149,7 +149,8 @@ def test_autoexec_registry_guard_mechanism():
         _validate_unified_autoexec_registry(frozenset({"list_shopping"}))  # read-класс
     with pytest.raises(RuntimeError, match="аддитивн"):
         _validate_unified_autoexec_registry(frozenset({"remove_shopping_items"}))  # деструктив
-    # R2 sol MINOR: add_* другого инструмента гвард ловит owner-allowlist'ом —
-    # расширение реестра требует явного решения владельца, не только префикса.
+    # R2 sol MINOR: аддитив-префикс другого инструмента гвард ловит owner-allowlist'ом —
+    # расширение реестра требует явного решения владельца, не только префикса. (#392: add_task
+    # теперь в allowlist; для этой ветки берём create_checklist — аддитив-префикс, но не approved.)
     with pytest.raises(RuntimeError, match="owner-allowlist"):
-        _validate_unified_autoexec_registry(frozenset({"add_task"}))
+        _validate_unified_autoexec_registry(frozenset({"create_checklist"}))

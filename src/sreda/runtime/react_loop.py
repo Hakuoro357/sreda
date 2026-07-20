@@ -1781,48 +1781,68 @@ def _generic_confirm_wrap(inner: Any) -> Any:
     )
 
 
-# #389/#392: аддитивные write-инструменты, доказанные как чистое трение под
-# candidate-confirm — продолжение диктовки порциями («1 литр молока», «Еще добавь в
-# соль», «Ещё добавь уголь») не несёт императив+домен-слово в ОДНОМ сообщении →
-# allowed_write=∅ → «Подтверждаешь?» на каждом пункте. Точечное осознанное исключение из
-# пилляра «нет молчаливой записи» (позиция владельца: добавление — аддитивно, видимо,
-# обратимо), ПОШТУЧНО с owner-«да» и прод-данными:
-#   • add_shopping_items — #389 (react_turn_trace 18.07, оба кейса resolved yes = промах
-#     сигнала по калибровочному контракту #285 Фазы A);
-#   • add_checklist_items — #392 (тот же паттерн в семье чек-листов; владелец отметил
-#     живьём 20.07: «Ещё добавь уголь» в список → лишний confirm).
-# Фикс НЕ расширяет autoexec на деструктив (remove_*/clear_*/delete_*/archive_* остаются в
-# общем двухъярусном контуре B2) и на семьи БЕЗ прод-данных+owner-«да» (add_task и пр.) —
-# сюда не добавлять. R2 (субагент MAJOR): autoexec гейтится отсутствием КОНКУРИРУЮЩЕГО
-# write-домена роутера — «добавь в список дел купить молоко» даёт aw={checklists}, прямой
-# shopping-write тут противоречил бы роутеру → кандидат+confirm (confirm примиряет
-# расхождение «роутер vs выбор модели», как до #389); симметрично для add_checklist_items
-# при aw={shopping}.
-_UNIFIED_AUTOEXEC_WRITE_TOOLS = frozenset({"add_shopping_items", "add_checklist_items"})
-# Вторая «рука» гварда (R2 sol MINOR): owner-approved allowlist. Расширение реестра выше
-# требует ОДНОВРЕМЕННОЙ правки этого списка — т.е. отдельного осознанного решения владельца
-# с прод-данными; «add_task тоже add_* — пройдёт» больше не проходит (валидатор упадёт).
-_UNIFIED_AUTOEXEC_OWNER_ALLOWLIST = frozenset({"add_shopping_items", "add_checklist_items"})
+# #389/#392: аддитивные write-инструменты — чистое трение под candidate-confirm. Продолжение
+# диктовки порциями («1 литр молока», «Еще добавь в соль», «Ещё добавь уголь», дневник «ещё
+# запиши…») не несёт императив+домен-слово в ОДНОМ сообщении → allowed_write=∅ →
+# «Подтверждаешь?» на КАЖДОМ пункте. Осознанное исключение из пилляра «нет молчаливой записи»
+# (позиция владельца: добавление аддитивно/видимо/обратимо) — ТОЛЬКО аддитивные (add_/save_),
+# owner-approved (#392-расширение 2026-07-20 «все безопасные семьи»):
+#   • add_shopping_items — #389 (react_turn_trace 18.07, оба кейса resolved yes);
+#   • add_checklist_items — #392 (владелец отметил живьём 20.07: «Ещё добавь уголь»);
+#   • add_family_members / save_recipe / save_recipes_batch — #392-расширение (чистые листовые:
+#     семантически аддитивно/видимо/обратимо; частоту промахов меряет страховка ниже).
+# ФОРКНУТО (в отдельный follow-up, НЕ в #392 — решение оркестратора 2026-07-20):
+#   • add_task — поведенчески безопасен (аддитив/обратим), НО канонический пример candidate-паузы
+#     в ~8 тестах #285/#316/#320/#321 (durable/redirect/stale/abandon/decline); autoexec потребовал
+#     бы репойнта/инвалидации большого пласта confirm-сьюта (churn непропорционален) → форк.
+#   • save_core_fact/save_episode (память) — диктовку памяти уже решает #319 sticky-by-use (дверь
+#     серии) с безопасным «дверь закрылась → confirm» на первой записи; блокет-autoexec СНЁС бы
+#     дверь #319 (не путать с #363 — та про заземление ОТВЕТА, другая ось). Заменять ли #319 на
+#     autoexec — отдельная развилка владельцу.
+# НИКОГДА не autoexec: деструктив (delete_/remove_/clear_/cancel_/archive_), правки (update_*),
+# смены статуса (mark_/complete_), перенос (move_task_to_checklist — деструктив шаг 1),
+# cross-domain read-write (generate_shopping_from_menu) — все в общем двухъярусном контуре B2.
+# СТРАХОВКА (см. _maybe_alert_write_on_read): раз confirm-сети нет, промах модели (autoexec-запись
+# на ходе-ЧТЕНИИ) громко логируется + admin-alert — чтобы видеть/мерить.
+# Гейт конкурирующего домена (R2 субагент MAJOR): autoexec ТОЛЬКО без КОНКУРИРУЮЩЕГО write-домена
+# роутера (aw ⊆ доменов инструмента) — «добавь в список дел купить молоко» даёт aw={checklists},
+# прямой shopping-write противоречил бы роутеру → кандидат+confirm (примиряет «роутер vs модель»).
+_UNIFIED_AUTOEXEC_WRITE_TOOLS = frozenset({
+    "add_shopping_items", "add_checklist_items", "add_family_members",
+    "save_recipe", "save_recipes_batch",
+})
+# Вторая «рука» гварда (R2 sol MINOR): owner-approved allowlist. Расширение реестра выше требует
+# ОДНОВРЕМЕННОЙ правки этого списка — отдельного осознанного owner-решения; аддитив-префикс сам по
+# себе НЕ пропускает (напр. create_* / add_task / save_core_fact — форк/развилка, не в allowlist → упадёт).
+_UNIFIED_AUTOEXEC_OWNER_ALLOWLIST = frozenset({
+    "add_shopping_items", "add_checklist_items", "add_family_members",
+    "save_recipe", "save_recipes_batch",
+})
+# Аддитивные префиксы (создают/добавляют, не удаляют/меняют). Деструктив/правки/статусы сюда НЕ
+# попадают → import-time гвард их отвергает. create_ — аддитив по форме, но owner-allowlist держит
+# отдельным ключом (create_* пока развилка владельцу, не в реестре).
+_ADDITIVE_PREFIXES = ("add_", "save_", "create_")
 
 
 def _validate_unified_autoexec_registry(registry: frozenset | None = None) -> None:
     """#389 R2 (субагент MINOR-1): гвард реестра МЕХАНИЗМОМ, не комментом (прецедент #180).
-    Каждый член: существует в манифесте, op-class == write, имя аддитивно (add_*) И входит
-    в owner-approved allowlist — неосторожная будущая правка/опечатка падает на импорте,
+    Каждый член: существует в манифесте, op-class == write, имя аддитивно (add_/save_/create_) И
+    входит в owner-approved allowlist — неосторожная будущая правка/опечатка падает на импорте,
     а не молчит на проде. По образцу _validate_tool_op_metadata (families.py)."""
     from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST, TOOL_OP_CLASS
     reg = _UNIFIED_AUTOEXEC_WRITE_TOOLS if registry is None else registry
     for n in reg:
         if n not in TOOL_FAMILY_MANIFEST:
-            raise RuntimeError(f"autoexec-реестр #389: {n!r} отсутствует в манифесте")
+            raise RuntimeError(f"autoexec-реестр: {n!r} отсутствует в манифесте")
         if TOOL_OP_CLASS.get(n) != "write":
-            raise RuntimeError(f"autoexec-реестр #389: {n!r} не write-класса")
-        if not n.startswith("add_"):
-            raise RuntimeError(f"autoexec-реестр #389: {n!r} не аддитивный (ожидается add_*)")
+            raise RuntimeError(f"autoexec-реестр: {n!r} не write-класса")
+        if not n.startswith(_ADDITIVE_PREFIXES):
+            raise RuntimeError(
+                f"autoexec-реестр: {n!r} не аддитивный (ожидается add_/save_/create_*)")
         if n not in _UNIFIED_AUTOEXEC_OWNER_ALLOWLIST:
             raise RuntimeError(
-                f"autoexec-реестр #389: {n!r} вне owner-allowlist — расширение требует "
-                f"явного решения владельца с прод-данными")
+                f"autoexec-реестр: {n!r} вне owner-allowlist — расширение требует "
+                f"явного решения владельца")
 
 
 _validate_unified_autoexec_registry()
@@ -2045,6 +2065,78 @@ def _maybe_alert_degraded_turn(
         # reply_text[:160] (ПД юзера напрямую); при сбое INSERT дедупа они утекали в
         # traceback. PII-safe стек вместо полного exc.
         logger.warning("react_loop: degraded-turn alert failed type=%s at=%s",
+                       _safe_tn(_aexc), _safe_tb(_aexc))
+
+
+def _executed_autoexec_writes(messages) -> frozenset[str]:
+    """#392: имена autoexec-write-инструментов (``_UNIFIED_AUTOEXEC_WRITE_TOOLS``), УСПЕШНО
+    исполненных в ТЕКУЩЕМ ходе (окно после последнего HumanMessage; artifact result_kind == 'ok').
+    Пусто, если таких нет. Переиспользует окно-скан #393 (``collect_successful_writes``), но по
+    autoexec-реестру — БЕЗ ложного успеха: отказ confirm/ошибка/no-op (result_kind ≠ ok) не считаются."""
+    msgs = list(messages or [])
+    start = 0
+    for i in range(len(msgs) - 1, -1, -1):
+        if isinstance(msgs[i], HumanMessage):
+            start = i + 1
+            break
+    window = msgs[start:]
+    results = {getattr(m, "tool_call_id", None): m for m in window if isinstance(m, ToolMessage)}
+    out: set[str] = set()
+    for m in window:
+        for tc in (getattr(m, "tool_calls", None) or []):
+            name = _TOOL_NAME_ALIASES.get(tc.get("name"), tc.get("name"))
+            if name not in _UNIFIED_AUTOEXEC_WRITE_TOOLS:
+                continue
+            tm = results.get(tc.get("id"))
+            if tm is None:
+                continue
+            art = getattr(tm, "artifact", None) or {}
+            if isinstance(art, dict) and art.get("result_kind") == "ok":
+                out.add(name)
+    return frozenset(out)
+
+
+def _maybe_alert_write_on_read(
+    *, tenant_id: str, user_id: str | None, channel: str, turn_key: str,
+    user_text: str, messages,
+) -> None:
+    """#392 страховка наблюдаемости autoexec: autoexec убрал confirm-сеть для аддитивных write.
+    Если такой инструмент ИСПОЛНИЛСЯ на ходе, чей запрос — ЧТЕНИЕ (read-cue есть, явной
+    write-команды нет = рассогласование «читать→сделал запись»), это ПРОМАХ модели. Тогда:
+    громкий warning-лог + admin-alert (P2, DB-dedup+burst+severity-rate → не флудит; #395 дуал
+    TG+MAX — reuse ``send_admin_alert``, НЕ новая подсистема). Цель: (а) промах виден оператору
+    сразу, (б) измеряем частоту для решения «оставлять ли autoexec».
+
+    Сигнал «чтение» детерминирован (текст юзера): ``read_cue_domains`` непусто И НЕ
+    ``write_command_signal``. Континуация диктовки «Ещё добавь X» несёт императив → НЕ флаг;
+    декларатив «меня зовут Аня» без read-cue → НЕ флаг; «покажи список дел» + молчаливый add →
+    флаг. Best-effort/PII-safe: сбой алерта НЕ влияет на ход; текст обрезан, стек PII-safe."""
+    try:
+        from sreda.runtime.react_signals import read_cue_domains, write_command_signal
+        _t = user_text or ""
+        if write_command_signal(_t):
+            return  # явная команда-мутация → это НЕ чтение (легитимная запись)
+        if not read_cue_domains(_t):
+            return  # нет read-cue → не «чистое чтение» (диктовка/декларатив/смолток) — не рассогласование
+        executed = _executed_autoexec_writes(messages)
+        if not executed:
+            return  # autoexec-запись в этом ходе не исполнялась → сигналить нечего
+        tools = ", ".join(sorted(executed))
+        logger.warning(
+            "react_loop: autoexec write-on-read mismatch tenant=%s tools=%s turn=%s",
+            tenant_id, tools, turn_key)
+        from sreda.services.admin_alerts import send_admin_alert
+        send_admin_alert(
+            severity="P2",  # «знать + разобрать», не срочно (autoexec аддитивен/обратим)
+            title="Среда: autoexec-запись на ходе-чтении",
+            body=(f"инструменты: {tools} · канал: {channel}\n"
+                  f"тенант: {tenant_id} · turn_key: {turn_key}\n"
+                  f"запрос-чтение: {_t[:160]}"),
+            dedupe_key=f"autoexec_write_on_read:{tenant_id}",
+        )
+    except Exception as _aexc:  # noqa: BLE001 — страховка-алерт НЕ валит ход
+        # PII-safe: тело алерта несёт user_text[:160] → без exc_info (traceback утёк бы ПД).
+        logger.warning("react_loop: write-on-read alert failed type=%s at=%s",
                        _safe_tn(_aexc), _safe_tb(_aexc))
 
 
@@ -5599,6 +5691,11 @@ async def handle_turn(
                 _maybe_alert_degraded_turn(
                     tenant_id=tenant_id, user_id=user_id, channel=channel, turn_key=_tk_trace,
                     user_text=user_text, reply_text=str(reply), outcome=_outcome, passes=_passes_fin)
+                # #392 страховка: autoexec-запись на ходе-ЧТЕНИИ (read-cue без write-команды) →
+                # промах модели (confirm-сети больше нет) → громкий лог + admin-alert (измеряем частоту).
+                _maybe_alert_write_on_read(
+                    tenant_id=tenant_id, user_id=user_id, channel=channel, turn_key=_tk_trace,
+                    user_text=user_text, messages=_msgs_all)
             except Exception as _texc:  # noqa: BLE001 — трейс не валит ход
                 # #366: exc_info=True печатал str(exc) с SQL+ПД (g-039); PII-safe стек.
                 logger.warning("react_loop: trace finish failed type=%s at=%s",
