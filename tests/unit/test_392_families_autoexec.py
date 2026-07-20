@@ -1,23 +1,18 @@
-"""#392 расширение: autoexec для ВСЕХ безопасных аддитивных/обратимых write-семей.
+"""#392 autoexec-набор: граница реестра + двухключевой import-time гвард.
 
-Владелец одобрил расширение (2026-07-20) тем же ПРОВЕРЕННЫМ паттерном #389 (реестр +
-owner-allowlist + гейт конкурирующего домена + import-time валидатор) на аддитивные/видимые/
-обратимые write. Диктовка порциями («ещё запиши…», дневник ~19 confirm/yes у соседа) больше
-не упирается в лишний confirm. Деструктив (delete/clear/remove/archive), правки (update_*),
-смены статуса (mark/complete) — НИКОГДА не autoexec.
+Владелец одобрил расширение (2026-07-20) тем же паттерном #389, НО R2+R3 Codex-ревью показало, что
+каждая листовая семья задета взаимодействием → расширение сузилось до ПРОВЕРЕННОГО ЯДРА.
 
-Итоговый autoexec-набор: add_shopping_items (#389), add_checklist_items (#392),
-save_recipe, save_recipes_batch (recipes имеет read-cue → страховка ловит промах).
+Финальный autoexec-набор: **add_shopping_items (#389), add_checklist_items (#392)** — оба аддитивны,
+#393-заземлены (ответ называет результат), обратимы, страховка ловит промах (checklists/shopping имеют
+read-cue). Деструктив/правки/статусы/create_ — НИКОГДА не autoexec.
 
 ФОРКНУТО (отдельный follow-up):
-  • add_family_members (R2 sol MAJOR) — household БЕЗ read-cue (read_cue_domains=∅ на «кто у меня
-    в семье»): семейный read не биндит list_family_members, а autoexec пишет ПРЯМО, и страховка
-    СЛЕПА (нет read-cue → нет alert) → немеряемая молчаливая PII-запись. Вернуть после household read-cue.
-  • add_task — канонический пример candidate-паузы в ~8 тестах #285/#316/#320/#321; autoexec =
-    непропорциональный churn confirm-сьюта (поведенчески безопасен, но форк).
-  • save_core_fact/save_episode (память) — конфликт с #319 sticky-by-use (дверь серии): блокет-
-    autoexec снёс бы «дверь закрылась → confirm» первой записи. НЕ путать с #363 (заземление
-    ответа — другая ось). Развилка: заменять ли #319 на autoexec.
+  • save_recipe/save_recipes_batch — R3 terra MAJOR: НЕ подключены к #393-заземлению → autoexec-запись
+    могла бы кончиться филлером; данными не доказаны. Вернуть после wiring в #393.
+  • add_family_members — R2 sol MAJOR: household БЕЗ read-cue → autoexec-промах немеряем страховкой.
+  • add_task — канонический candidate-пример в ~8 тестах #285/#316/#320/#321 → autoexec = churn.
+  • save_core_fact/save_episode (память) — конфликт с дверью #319 sticky-by-use (НЕ с #363).
 """
 
 from __future__ import annotations
@@ -31,7 +26,7 @@ from sreda.runtime.react_loop import (
     _apply_unified_policy,
     _validate_unified_autoexec_registry,
 )
-from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST, tool_write_domains
+from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
 
 
 def _tool(name):
@@ -40,51 +35,28 @@ def _tool(name):
     return StructuredTool.from_function(func=_f, name=name, description=name)
 
 
-# инструмент → его домен (для конкурирующего кейса берём ЧУЖОЙ)
-_NEW_AUTOEXEC = [
-    "save_recipe", "save_recipes_batch",
-]
+_CORE_AUTOEXEC = frozenset({"add_shopping_items", "add_checklist_items"})
 
-# форкнуто в отдельный follow-up — НЕ в autoexec:
-#   add_family_members (household без read-cue → страховка слепа, R2 sol MAJOR),
-#   add_task (churn confirm-сьюта #285/#321), память (конфликт #319 sticky)
-_FORKED = ["add_family_members", "add_task", "save_core_fact", "save_episode"]
+# форкнуто в отдельный follow-up — НЕ в autoexec (каждая семья задета ревью, см. модуль-докстринг):
+_FORKED = ["save_recipe", "save_recipes_batch", "add_family_members", "add_task",
+           "save_core_fact", "save_episode"]
 
 
-@pytest.mark.parametrize("name", _NEW_AUTOEXEC)
-def test_new_family_in_registry_and_allowlist(name):
-    assert name in _UNIFIED_AUTOEXEC_WRITE_TOOLS, name
-    assert name in _UNIFIED_AUTOEXEC_OWNER_ALLOWLIST, name
+def test_autoexec_set_is_exactly_core():
+    """Реестр и owner-allowlist = РОВНО проверенное ядро {add_shopping_items, add_checklist_items}.
+    Любое расширение должно осознанно менять ЭТОТ пин (защита от тихого дрейфа набора)."""
+    assert _UNIFIED_AUTOEXEC_WRITE_TOOLS == _CORE_AUTOEXEC
+    assert _UNIFIED_AUTOEXEC_OWNER_ALLOWLIST == _CORE_AUTOEXEC
 
 
-@pytest.mark.parametrize("name", _NEW_AUTOEXEC)
-def test_new_family_direct_at_empty_write(name):
+@pytest.mark.parametrize("name", sorted(_CORE_AUTOEXEC))
+def test_core_direct_at_empty_write(name):
     """aw=∅ (диктовка порциями без домен-слова) → прямой бинд, без confirm."""
     t = _tool(name)
-    out = _apply_unified_policy([t], ["web"], [])
-    assert out == [t], name
+    assert _apply_unified_policy([t], ["web"], []) == [t], name
 
 
-@pytest.mark.parametrize("name", _NEW_AUTOEXEC)
-def test_new_family_direct_on_own_domain(name):
-    """aw={собственный домен} → прямой (штатный ярус а)."""
-    dom = sorted(tool_write_domains(name))[0]
-    t = _tool(name)
-    out = _apply_unified_policy([t], [dom, "web"], [dom])
-    assert out == [t], name
-
-
-@pytest.mark.parametrize("name", _NEW_AUTOEXEC)
-def test_new_family_confirm_on_competing_domain(name):
-    """aw={ЧУЖОЙ домен} → кандидат под confirm (гейт конкурирующего домена жив)."""
-    own = sorted(tool_write_domains(name))[0]
-    competing = "shopping" if own != "shopping" else "checklists"
-    t = _tool(name)
-    out = _apply_unified_policy([t], [competing, "web"], [competing])
-    assert len(out) == 1 and out[0] is not t, name
-
-
-# ─────────── деструктив/правки/статусы каждой семьи — НИКОГДА не autoexec ───────────
+# ─────────── деструктив/правки/статусы — НИКОГДА не autoexec ───────────
 
 _NEVER_AUTOEXEC = [
     # деструктив
@@ -110,9 +82,8 @@ def test_never_autoexec_not_in_registry(name):
 
 @pytest.mark.parametrize("name", _FORKED)
 def test_forked_not_in_autoexec(name):
-    """add_task (churn confirm-сьюта) и память save_core_fact/save_episode (конфликт #319 sticky)
-    ФОРКНУТЫ в отдельный follow-up → НЕ в реестре (их существующие тесты остаются зелёными:
-    add_task=candidate в #285/#321, память под дверью #319)."""
+    """Форкнутые семьи НЕ в реестре → их существующие тесты остаются зелёными (add_task=candidate в
+    #285/#321; память под дверью #319; recipes/household — candidate под confirm)."""
     assert name not in _UNIFIED_AUTOEXEC_WRITE_TOOLS, name
     assert name not in _UNIFIED_AUTOEXEC_OWNER_ALLOWLIST, name
 
@@ -126,28 +97,27 @@ def test_destructive_stays_candidate_at_empty_write(name):
     assert len(out) == 1 and out[0] is not t, name
 
 
-# ─────────── двухключевой гвард на расширенном наборе ───────────
+# ─────────── двухключевой гвард ───────────
 
-def test_registry_guard_accepts_all_new_members():
-    """Текущий (расширенный) реестр валиден: каждый член — манифест + write + аддитив-префикс
-    (add_/save_/create_) + owner-allowlist."""
+def test_registry_guard_accepts_core():
+    """Текущий (ядро) реестр валиден: каждый член — манифест + write + аддитив-префикс (add_) + allowlist."""
     _validate_unified_autoexec_registry()
-    for name in _NEW_AUTOEXEC:
+    for name in _CORE_AUTOEXEC:
         _validate_unified_autoexec_registry(frozenset({name}))
 
 
-def test_registry_guard_rejects_destructive():
-    """Деструктив (не аддитив-префикс) падает на import-time гварде."""
-    with pytest.raises(RuntimeError, match="аддитивн"):
-        _validate_unified_autoexec_registry(frozenset({"delete_task"}))
-    with pytest.raises(RuntimeError, match="аддитивн"):
-        _validate_unified_autoexec_registry(frozenset({"update_recipe"}))
+def test_registry_guard_rejects_non_additive_prefix():
+    """Не-аддитив-префикс (деструктив/правка/create_/save_) падает на import-time гварде (R3 sol:
+    префикс сужен до add_ — save_/create_ тоже отвергаются здесь, а не только на allowlist)."""
+    for name in ("delete_task", "update_recipe", "create_checklist",
+                 "create_memory_category", "save_recipe", "save_core_fact"):
+        with pytest.raises(RuntimeError, match="аддитивн"):
+            _validate_unified_autoexec_registry(frozenset({name}))
 
 
 def test_registry_guard_rejects_additive_prefix_not_in_allowlist():
-    """create_* — аддитив-префикс, НО не owner-approved (развилка владельцу) → гвард ловит
-    owner-allowlist'ом: расширение требует явного решения владельца, не только префикса."""
-    with pytest.raises(RuntimeError, match="owner-allowlist"):
-        _validate_unified_autoexec_registry(frozenset({"create_checklist"}))
-    with pytest.raises(RuntimeError, match="owner-allowlist"):
-        _validate_unified_autoexec_registry(frozenset({"create_memory_category"}))
+    """add_*-инструмент вне owner-allowlist (add_task/add_family_members — форк) → гвард ловит
+    owner-allowlist'ом: расширение требует явного owner-решения, не только add_-префикса."""
+    for name in ("add_task", "add_family_members"):
+        with pytest.raises(RuntimeError, match="owner-allowlist"):
+            _validate_unified_autoexec_registry(frozenset({name}))

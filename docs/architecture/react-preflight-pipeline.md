@@ -114,21 +114,23 @@ flowchart TD
   state-каналы `router_allowed_*` (переиспользует #221-машинерию `_apply_domain_policy`);
 - **write двухъярусный (B2):** сигнал+продуктивный домен → инструмент напрямую; БЕЗ сигнала → все write-инструменты
   биндятся КАНДИДАТАМИ под универсальный confirm на dispatch (`_apply_unified_policy` → `_generic_confirm_wrap`;
-  превью без чтения БД; инвариант «нет молчаливой записи»). Исключение #389/#392 (autoexec): аддитивные
-  `add_shopping_items` (#389), `add_checklist_items` (#392) + `save_recipe`/`save_recipes_batch`
-  (#392-расширение 2026-07-20) — реестр `_UNIFIED_AUTOEXEC_WRITE_TOOLS` + owner-allowlist, import-time
-  гвард (манифест + write + аддитив-префикс add_/save_/create_) — биндятся прямым, если роутер НЕ дал
+  превью без чтения БД; инвариант «нет молчаливой записи»). Исключение #389/#392 (autoexec) — ТОЛЬКО
+  проверенное ядро `add_shopping_items` (#389) + `add_checklist_items` (#392): реестр
+  `_UNIFIED_AUTOEXEC_WRITE_TOOLS` + owner-allowlist, import-time гвард (манифест + write + аддитив-префикс
+  `add_` — R3 sol: save_/create_ отвергаются префиксом) — биндятся прямым, если роутер НЕ дал
   КОНКУРИРУЮЩЕГО write-домена (aw ⊆ доменов инструмента; «добавь в список дел купить молоко» →
-  aw={checklists} → для add_shopping_items кандидат+confirm, примиряющий расхождение «роутер vs модель»).
-  Мотив — чистое трение confirm'а на диктовке порциями. ФОРКНУТО (отдельный follow-up, НЕ в #392):
-  `add_family_members` (R2 sol MAJOR: household БЕЗ read-cue → autoexec-промах немеряем страховкой),
-  `add_task` (глубоко вплетён в confirm-сьют #285/#321 — churn), память `save_core_fact`/`save_episode`
-  (конфликт с дверью #319 sticky-by-use, НЕ с заземлением #363). Деструктив/правки/статусы — НИКОГДА не
-  autoexec (candidate-confirm при aw=∅ — пред-существующее поведение). СТРАХОВКА (`_maybe_alert_write_on_read`,
-  вызов в finalization `handle_turn` ВНЕ trace-блока — R2 terra): раз confirm-сети нет, autoexec-запись
-  на ходе-ЧТЕНИИ (`new_read_request_signal`: маркер-запрос + own-data кюс, НЕ write-команда — R2 sol,
-  чтобы диктовка «ещё рецепт: X» не давала ложный alert) → warning-лог + admin-alert (#395 dedup) —
-  промах виден и измеряем; success записи считается по конвенции #115 (okv2/«ok:»), не по result_kind;
+  aw={checklists} → для add_shopping_items кандидат+confirm). Оба #393-заземлены (ответ называет
+  результат) и наблюдаемы страховкой (checklists/shopping имеют read-cue). NB (R3 terra): add_checklist_items
+  несёт implicit-create (создаёт список, если имени нет) — принято: это единый add-флоу диктовки,
+  аддитив/обратим/заземлён, НЕ standalone create_*. ФОРКНУТО (R2/R3 Codex, отдельный follow-up, НЕ в #392):
+  `save_recipe`/`save_recipes_batch` (НЕ подключены к #393 → риск филлера), `add_family_members` (household
+  БЕЗ read-cue → промах немеряем), `add_task` (churn confirm-сьюта #285/#321), память `save_core_fact`/
+  `save_episode` (конфликт с дверью #319 sticky, НЕ с #363). Деструктив/правки/статусы — НИКОГДА не autoexec.
+  СТРАХОВКА (`_maybe_alert_write_on_read`, вызов в finalization `handle_turn` ВНЕ trace-блока — R2 terra):
+  раз confirm-сети нет, autoexec-запись на ходе-ЧТЕНИИ (`new_read_request_signal`: маркер-запрос + own-data
+  кюс, НЕ write-команда — R2 sol) → warning-лог + admin-alert (#395 dedup) — промах виден и измеряем;
+  «исполненной записью» считаем по ФАКТУ эффекта (okv2 `created` непусто — R3 sol: error/all-dup/no-op не
+  флагаются);
 - **промпт единый (B4):** task-персона + user-role хвост честности из ФАКТИЧЕСКОГО bound
   (`_unified_availability_directive`, #279-семантика: «под рукой в этом ходе», отмена → «сообщи и остановись»,
   заметку не пересказывать; тон — «ответь ПО СУЩЕСТВУ, опираясь на результаты»). NB: хвост узла `chat` —

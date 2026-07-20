@@ -149,8 +149,10 @@ def test_autoexec_registry_guard_mechanism():
         _validate_unified_autoexec_registry(frozenset({"list_shopping"}))  # read-класс
     with pytest.raises(RuntimeError, match="аддитивн"):
         _validate_unified_autoexec_registry(frozenset({"remove_shopping_items"}))  # деструктив
-    # R2 sol MINOR: аддитив-префикс другого инструмента гвард ловит owner-allowlist'ом —
-    # расширение реестра требует явного решения владельца, не только префикса. (#392: add_task
-    # теперь в allowlist; для этой ветки берём create_checklist — аддитив-префикс, но не approved.)
-    with pytest.raises(RuntimeError, match="owner-allowlist"):
+    # R3 sol MINOR: префикс сужен до add_ → create_/save_ тоже НЕ аддитивны здесь (падают префиксом).
+    with pytest.raises(RuntimeError, match="аддитивн"):
         _validate_unified_autoexec_registry(frozenset({"create_checklist"}))
+    # owner-allowlist-ветка: add_*-инструмент ВНЕ allowlist (add_task — форк) → расширение требует
+    # явного owner-решения, не только add_-префикса.
+    with pytest.raises(RuntimeError, match="owner-allowlist"):
+        _validate_unified_autoexec_registry(frozenset({"add_task"}))

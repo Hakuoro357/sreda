@@ -74,15 +74,18 @@ def reply_has_tech_leak(text: str) -> bool:
     return bool(_TECH_LEAK_RE.search(text or ""))
 
 
-_ARCHIVE_ROOT_RE = re.compile(r"архив", re.IGNORECASE)
+# R3 sol MINOR: и КИРИЛЛИЧЕСКИЙ «архив», и ЛАТИНСКИЙ «archiv» (Archived/archive/archiving) — обе формы
+# внутреннего термина недопустимы в USER-FACING финале (латиницу `_TECH_LEAK_RE` намеренно не ловит).
+_ARCHIVE_ROOT_RE = re.compile(r"архив|archiv", re.IGNORECASE)
 
 
 def reply_has_archive_leak(reply: str, acts) -> bool:
-    """#394 (R2 sol MINOR): на archive_checklist финальная реплика НЕ должна нести корень «архив» —
-    юзер сказал «удали», отвечаем на его языке. Детектор заземления (`reply_grounds_result`) проверяет
-    лишь ИМЯ цели, поэтому живое «Заархивировала список Дача» прошло бы как заземлённое и архив утёк бы.
-    Механизм-гейт (не промпт, прецедент #180): есть успешный archive-акт И реплика содержит «архив» →
-    подменяем детерминированной страховкой (spec[0]=«удалила список»)."""
+    """#394 (R2/R3 sol MINOR): на archive_checklist финальная реплика НЕ должна нести корень «архив»
+    (ни кириллицей, ни латиницей «archiv») — юзер сказал «удали», отвечаем на его языке. Детектор
+    заземления (`reply_grounds_result`) проверяет лишь ИМЯ цели, поэтому живое «Заархивировала список
+    Дача» / «Archived список Дача» прошло бы как заземлённое и термин утёк бы. Механизм-гейт (не промпт,
+    прецедент #180): есть успешный archive-акт И реплика содержит архив-корень → подменяем
+    детерминированной страховкой (spec[0]=«удалила список»)."""
     if not any(getattr(a, "tool", None) == "archive_checklist" for a in (acts or ())):
         return False
     return bool(_ARCHIVE_ROOT_RE.search(reply or ""))

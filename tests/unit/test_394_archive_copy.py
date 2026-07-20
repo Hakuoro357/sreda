@@ -93,6 +93,8 @@ def test_archive_leak_backstop_394():
     финализация подменит детерминированной страховкой («удалила список»). Механизм-гейт, не промпт."""
     acts = [_archive_act("Дача")]
     assert reply_has_archive_leak("Заархивировала список «Дача».", acts) is True
+    # R3 sol MINOR: латинский «archiv» (Archived/archive) — тоже внутренний термин, тоже ловим
+    assert reply_has_archive_leak("Archived список «Дача».", acts) is True
     assert reply_has_archive_leak("Удалила список «Дача».", acts) is False
     # без archive-акта — не наше дело (add-акт с «архивным» ИМЕНЕМ списка не триггерит)
     add = [WriteAct("add_checklist_items", "add", "Архив", ("молоко",), 1)]

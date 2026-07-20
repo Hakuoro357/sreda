@@ -34,14 +34,24 @@ def _tm(content: str, cid: str = "c1", *, kind: str = "ok") -> ToolMessage:
     return ToolMessage(content=content, tool_call_id=cid, artifact={"result_kind": kind})
 
 
-def _turn(name: str, *, kind: str = "ok", human: str = "покажи список дел") -> list:
-    return [HumanMessage(content=human), _ai(name), _tm(f"ok:{name}", kind=kind)]
+def _okv2(created: list[str]) -> str:
+    """okv2-конверт успешной add-записи (#115) с фактически добавленными именами."""
+    import json
+    return "okv2:added:" + json.dumps(
+        {"added_count": len(created), "duplicate_count": 0,
+         "checklist_id": "checklist_" + "a" * 24, "created": created}, ensure_ascii=False)
+
+
+def _turn(name: str, *, kind: str = "ok", human: str = "покажи список дел",
+          content: str | None = None) -> list:
+    c = content if content is not None else _okv2(["молоко"])
+    return [HumanMessage(content=human), _ai(name), _tm(c, kind=kind)]
 
 
 # ─────────── детектор исполненных autoexec-write ───────────
 
 def test_detect_executed_autoexec_write():
-    """add_checklist_items (autoexec) успешно исполнен → в наборе."""
+    """add_checklist_items (autoexec) успешно исполнен (okv2 created непусто) → в наборе."""
     assert _executed_autoexec_writes(_turn("add_checklist_items")) == frozenset({"add_checklist_items"})
 
 
@@ -57,10 +67,16 @@ def test_detect_ignores_failed_write():
 
 def test_detect_ignores_error_content_with_ok_kind():
     """R2 sol MINOR: run_tools ставит result_kind='ok' ЛЮБОМУ не-raise возврату, включая «error:…»-
-    контент. Считаем исполненной записью ТОЛЬКО по success-конвенции #115 (okv2/«ok:»), не по одному
-    result_kind — иначе ошибка/отказ дали бы ложный алерт."""
+    контент. Считаем записью ТОЛЬКО по ФАКТУ эффекта (okv2 created непусто), не по result_kind."""
     msgs = [HumanMessage(content="покажи список дел"), _ai("add_checklist_items"),
             _tm("error: internal", kind="ok")]
+    assert _executed_autoexec_writes(msgs) == frozenset()
+
+
+def test_detect_ignores_noop_all_duplicate():
+    """R3 sol MINOR: no-op (все дубли → okv2 created=[]) — записи фактически НЕ было → не считаем
+    (без ложных write-on-read алертов на дедуп-no-op)."""
+    msgs = _turn("add_checklist_items", content=_okv2([]))  # created пусто
     assert _executed_autoexec_writes(msgs) == frozenset()
 
 
@@ -119,18 +135,18 @@ def test_no_alert_on_continuation_dictation(monkeypatch):
     assert sink.calls == []
 
 
-def test_no_alert_on_recipe_dictation(monkeypatch):
-    """R2 sol MINOR: «Ещё один рецепт: борщ» — recipes-кюс ЕСТЬ, но НЕ маркер-запрос →
-    new_read_request_signal=False → легитимный autoexec save_recipe НЕ флагается (без ложных алертов).
-    Реальный autoexec-инструмент (не вакуумный add_task) + декларативная диктовка."""
-    sink = _fire(monkeypatch, human="Ещё один рецепт: борщ со свёклой", tool="save_recipe")
+def test_no_alert_on_dictation_without_marker(monkeypatch):
+    """R2 sol MINOR: «в список покупок молоко» — shopping-кюс ЕСТЬ, но НЕ маркер-запрос →
+    new_read_request_signal=False → легитимная autoexec-диктовка НЕ флагается (без ложных алертов).
+    Голый кюс/слот-ответ (без «покажи/какие») не считается read-запросом."""
+    sink = _fire(monkeypatch, human="в список покупок молоко", tool="add_shopping_items")
     assert sink.calls == []
 
 
-def test_alert_fires_on_recipe_read_query(monkeypatch):
-    """Ход-ЧТЕНИЕ рецептов «какие у меня рецепты» (маркер+кюс) + молчаливый autoexec save_recipe → алерт."""
-    sink = _fire(monkeypatch, human="какие у меня рецепты", tool="save_recipe")
-    assert len(sink.calls) == 1 and "save_recipe" in sink.calls[0]["body"]
+def test_alert_fires_on_shopping_read_query(monkeypatch):
+    """Ход-ЧТЕНИЕ «какие у меня покупки» (маркер+кюс) + молчаливый autoexec add_shopping_items → алерт."""
+    sink = _fire(monkeypatch, human="какие у меня покупки", tool="add_shopping_items")
+    assert len(sink.calls) == 1 and "add_shopping_items" in sink.calls[0]["body"]
 
 
 def test_no_alert_when_no_autoexec_write(monkeypatch):

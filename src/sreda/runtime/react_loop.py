@@ -1788,19 +1788,19 @@ def _generic_confirm_wrap(inner: Any) -> Any:
 # (позиция владельца: добавление аддитивно/видимо/обратимо) — ТОЛЬКО аддитивные (add_/save_),
 # owner-approved (#392-расширение 2026-07-20 «все безопасные семьи»):
 #   • add_shopping_items — #389 (react_turn_trace 18.07, оба кейса resolved yes);
-#   • add_checklist_items — #392 (владелец отметил живьём 20.07: «Ещё добавь уголь»);
-#   • save_recipe / save_recipes_batch — #392-расширение (аддитивно/видимо/обратимо; recipes имеет
-#     read-cue → страховка ниже РЕАЛЬНО ловит промах на ходе-чтении).
-# ФОРКНУТО (в отдельный follow-up, НЕ в #392 — решение оркестратора 2026-07-20 + R2 Codex):
-#   • add_family_members — R2 sol MAJOR: у домена household НЕТ read-cue (read_cue_domains=∅ на
-#     «кто у меня в семье»), поэтому (а) семейный read-запрос не биндит list_family_members, а
-#     autoexec add_family_members пишет ПРЯМО, и (б) страховка СЛЕПА (нет read-cue → нет alert) →
-#     немеряемая молчаливая PII-запись. Вернуть в autoexec ТОЛЬКО после query-scoped household read-cue.
-#   • add_task — канонический пример candidate-паузы в ~8 тестах #285/#316/#320/#321; autoexec =
-#     непропорциональный churn confirm-сьюта (поведенчески безопасен, но форк).
-#   • save_core_fact/save_episode (память) — диктовку памяти уже решает #319 sticky-by-use (дверь
-#     серии) с безопасным «дверь закрылась → confirm» на первой записи; блокет-autoexec СНЁС бы
-#     дверь #319 (не путать с #363 — та про заземление ОТВЕТА, другая ось). Развилка владельцу.
+#   • add_checklist_items — #392 (владелец отметил живьём 20.07: «Ещё добавь уголь»).
+# ОБА: аддитивны, #393-заземлены (collect_successful_writes → ответ называет результат), страховка
+# ниже РЕАЛЬНО ловит промах (checklists/shopping имеют read-cue), обратимы. NB (R3 terra): у
+# add_checklist_items есть implicit-create (создаёт список, если имени нет) — осознанно принято
+# оркестратором: это ЕДИНЫЙ add-флоу диктовки (owner «запиши в дела по машине: …»), аддитив/обратим
+# (archive), заземлён и наблюдаем страховкой; НЕ standalone create_* (те исключены).
+# ФОРКНУТО (отдельный follow-up, НЕ в #392) — каждая семья задета ревью:
+#   • save_recipe/save_recipes_batch — R3 terra MAJOR: НЕ подключены к #393-заземлению
+#     (collect_successful_writes их не покрывает) → autoexec-запись могла бы кончиться филлером «приняла
+#     к сведению»; данными не доказаны. Вернуть после wiring в #393 + прод-данных.
+#   • add_family_members — R2 sol MAJOR: household БЕЗ read-cue → autoexec-промах немеряем страховкой.
+#   • add_task — канонический пример candidate-паузы в ~8 тестах #285/#316/#320/#321 → autoexec = churn.
+#   • save_core_fact/save_episode (память) — конфликт с дверью #319 sticky-by-use (НЕ с #363).
 # НИКОГДА не autoexec: деструктив (delete_/remove_/clear_/cancel_/archive_), правки (update_*),
 # смены статуса (mark_/complete_), перенос (move_task_to_checklist — деструктив шаг 1),
 # cross-domain read-write (generate_shopping_from_menu) — все в общем двухъярусном контуре B2.
@@ -1810,24 +1810,24 @@ def _generic_confirm_wrap(inner: Any) -> Any:
 # роутера (aw ⊆ доменов инструмента) — «добавь в список дел купить молоко» даёт aw={checklists},
 # прямой shopping-write противоречил бы роутеру → кандидат+confirm (примиряет «роутер vs модель»).
 _UNIFIED_AUTOEXEC_WRITE_TOOLS = frozenset({
-    "add_shopping_items", "add_checklist_items", "save_recipe", "save_recipes_batch",
+    "add_shopping_items", "add_checklist_items",
 })
 # Вторая «рука» гварда (R2 sol MINOR): owner-approved allowlist. Расширение реестра выше требует
 # ОДНОВРЕМЕННОЙ правки этого списка — отдельного осознанного owner-решения; аддитив-префикс сам по
-# себе НЕ пропускает (напр. create_* / add_task / add_family_members / save_core_fact — форк/развилка,
-# не в allowlist → упадёт).
+# себе НЕ пропускает (напр. add_task / add_family_members — форк, не в allowlist → упадёт).
 _UNIFIED_AUTOEXEC_OWNER_ALLOWLIST = frozenset({
-    "add_shopping_items", "add_checklist_items", "save_recipe", "save_recipes_batch",
+    "add_shopping_items", "add_checklist_items",
 })
-# Аддитивные префиксы (создают/добавляют, не удаляют/меняют). Деструктив/правки/статусы сюда НЕ
-# попадают → import-time гвард их отвергает. create_ — аддитив по форме, но owner-allowlist держит
-# отдельным ключом (create_* пока развилка владельцу, не в реестре).
-_ADDITIVE_PREFIXES = ("add_", "save_", "create_")
+# Аддитивные префиксы (R3 sol MINOR — сужено до add_: save_/create_ семантически не «диктовка
+# порциями в существующее», а сохранение/создание контейнера; standalone save_*/create_* — форк/
+# развилка, падают на ЭТОМ гварде-префиксе, а не только на owner-allowlist). Деструктив/правки/статусы
+# тоже отвергаются префиксом.
+_ADDITIVE_PREFIXES = ("add_",)
 
 
 def _validate_unified_autoexec_registry(registry: frozenset | None = None) -> None:
     """#389 R2 (субагент MINOR-1): гвард реестра МЕХАНИЗМОМ, не комментом (прецедент #180).
-    Каждый член: существует в манифесте, op-class == write, имя аддитивно (add_/save_/create_) И
+    Каждый член: существует в манифесте, op-class == write, имя аддитивно (``_ADDITIVE_PREFIXES``) И
     входит в owner-approved allowlist — неосторожная будущая правка/опечатка падает на импорте,
     а не молчит на проде. По образцу _validate_tool_op_metadata (families.py)."""
     from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST, TOOL_OP_CLASS
@@ -1839,7 +1839,7 @@ def _validate_unified_autoexec_registry(registry: frozenset | None = None) -> No
             raise RuntimeError(f"autoexec-реестр: {n!r} не write-класса")
         if not n.startswith(_ADDITIVE_PREFIXES):
             raise RuntimeError(
-                f"autoexec-реестр: {n!r} не аддитивный (ожидается add_/save_/create_*)")
+                f"autoexec-реестр: {n!r} не аддитивный (ожидается {'/'.join(_ADDITIVE_PREFIXES)}*)")
         if n not in _UNIFIED_AUTOEXEC_OWNER_ALLOWLIST:
             raise RuntimeError(
                 f"autoexec-реестр: {n!r} вне owner-allowlist — расширение требует "
@@ -2073,11 +2073,12 @@ def _executed_autoexec_writes(messages) -> frozenset[str]:
     """#392: имена autoexec-write-инструментов (``_UNIFIED_AUTOEXEC_WRITE_TOOLS``), УСПЕШНО
     исполненных в ТЕКУЩЕМ ходе (окно после последнего HumanMessage). Пусто, если таких нет.
     Переиспользует окно-скан #393 (``collect_successful_writes``), но по autoexec-реестру.
-    R2 sol MINOR: ``run_tools`` ставит artifact.result_kind=='ok' ЛЮБОМУ не-raise возврату,
-    включая «error:…»-контент (react_loop, ветка успешного возврата). Поэтому успех считаем по
-    КОНВЕНЦИИ #115 (okv2-конверт ИЛИ «ok:»-префикс), НЕ по одному result_kind — «error:…» и прочий
-    не-успех отбрасываем (без ложных алертов)."""
-    from sreda.services.tool_schemas.tool_ok_codec import is_okv2
+    R2/R3 sol MINOR: ``run_tools`` ставит artifact.result_kind=='ok' ЛЮБОМУ не-raise возврату,
+    включая «error:…»-контент И no-op (all-dup/created_count=0). Реестр = только okv2-add-инструменты
+    (add_shopping_items/add_checklist_items), поэтому «исполненной записью» считаем по ФАКТУ ЭФФЕКТА —
+    okv2 ``created`` НЕПУСТО (``_okv2_created``, dedup-aware #115): «error:…», all-dup и empty дают
+    пустой created → НЕ считаются (без ложных write-on-read алертов)."""
+    from sreda.runtime.react_result_report import _okv2_created
     msgs = list(messages or [])
     start = 0
     for i in range(len(msgs) - 1, -1, -1):
@@ -2098,8 +2099,8 @@ def _executed_autoexec_writes(messages) -> frozenset[str]:
             art = getattr(tm, "artifact", None) or {}
             if not (isinstance(art, dict) and art.get("result_kind") == "ok"):
                 continue
-            content = str(getattr(tm, "content", "") or "").strip()
-            if is_okv2(content) or content.startswith("ok:"):  # success-конвенция #115, не «error:…»
+            content = str(getattr(tm, "content", "") or "")
+            if _okv2_created(content):  # ФАКТ эффекта: okv2 created непусто (не error/all-dup/empty)
                 out.add(name)
     return frozenset(out)
 
