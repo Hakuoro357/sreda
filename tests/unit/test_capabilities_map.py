@@ -132,7 +132,7 @@ def test_doc_on_disk_is_fresh():
 # drift «код ушёл, карта не перегенерирована» теперь ловится в CI на
 # каждый PR. Обновление: `python scripts/dev/gen_capabilities.py`, затем
 # подставить сюда новый хэш из упавшего ассерта (одна строка).
-_DOC_SHA256 = "91a61fe8a61d5e2f172b7976f929b3168c2e3fda7348ed9aa38a5acd5a4bdfd3"
+_DOC_SHA256 = "285a03a9c4fec00e5aa7762b96ef3d5f0cb10d8ead90d5b38e3da34d769a3e19"
 
 
 def test_doc_hash_pinned_for_ci():

@@ -396,7 +396,9 @@ def test_max_acquires_advisory_after_tenant_lock() -> None:
 
     src = inspect.getsource(max_inbound._process_approved_max_turn)
     lock_idx = src.find("async with tenant_lock")
-    adv_idx = src.find("tenant_advisory_lock(")
+    # R1 M11: MAX advisory теперь async (tenant_advisory_lock_async) — ищем по
+    # общей подстроке; инвариант «asyncio tenant_lock РАНЬШЕ advisory» сохранён.
+    adv_idx = src.find("tenant_advisory_lock")
     assert lock_idx != -1, "MAX turn must acquire the asyncio tenant_lock"
     assert adv_idx != -1, "MAX turn must enter tenant_advisory_lock"
     assert lock_idx < adv_idx, (
