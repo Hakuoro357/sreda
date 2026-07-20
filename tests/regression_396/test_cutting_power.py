@@ -13,8 +13,10 @@ import pytest
 
 from tests.unit.conftest import seed_telegram_user
 
-from .fixtures import F390_SHOW_LISTS, F393_ADD
+from . import harness
+from .fixtures import F390_SHOW_LISTS, F393_ADD, F_AMBIG_CANCEL_ARCHIVE_RESUMED
 from .harness import Fixture, ScriptedTurn, ai_text, ai_tool, check_fixture, run_fixture
+from .invariants import inv_ambiguous_cancel_zero_mutations
 
 
 @pytest.mark.asyncio
@@ -73,3 +75,39 @@ async def test_362_defect_repro_is_caught_by_inv4a(db_session):
     problems = check_fixture(dialog, defect, db_session, u)
     assert dialog.turns[0].db_diff.get("tasks") == 1, "запись должна была состояться"
     assert any("mutated_not_cancelled" in p for p in problems), problems
+
+
+@pytest.mark.asyncio
+async def test_projection_catches_inplace_archive_at_unchanged_count(db_session):
+    """Load-bearing тест ЛОГИЧЕСКОЙ проекции: ambiguous-cancel резюмит «да» → архивирует список.
+    count НЕ меняется (archive не удаляет строку), но status active→archived → mutated=True ТОЛЬКО
+    через проекцию → inv_ambiguous_cancel краснеет. Единственное НЕмаскированное место, где проекция
+    режет (иначе она декоративна — Opus анти-вакуум)."""
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    dialog = await run_fixture(F_AMBIG_CANCEL_ARCHIVE_RESUMED, db_session, u)
+    t1 = dialog.turns[1]                       # резюмированный ход
+    assert t1.db_diff == {}, f"ждали НЕИЗМЕННЫЙ count (archive не удаляет строку), факт {t1.db_diff}"
+    assert t1.mutated is True, "проекция обязана поймать status flip active→archived"
+    v = inv_ambiguous_cancel_zero_mutations(dialog, turns=[1])
+    assert v and v[0].invariant == "ambiguous_cancel", v
+
+
+@pytest.mark.asyncio
+async def test_projection_cutting_power_regress_to_count_only_loses_violation(db_session, monkeypatch):
+    """Доказательство режущей силы проекции (анти-#74): регрессируем proj() до count-only
+    (status/title→None, id сохраняем) → нарушение inv_ambiguous_cancel ИСЧЕЗАЕТ. Т.е. проекция
+    НЕ декоративна: выкинь status/title — и load-bearing фикстура выше перестаёт краснеть."""
+    orig = harness.state_snapshot
+
+    def _count_only(session, tenant_id, user_id):
+        return {k: {i: (None, None) for i in v} for k, v in orig(session, tenant_id, user_id).items()}
+
+    monkeypatch.setattr(harness, "state_snapshot", _count_only)
+    u = seed_telegram_user(db_session)
+    db_session.commit()
+    dialog = await run_fixture(F_AMBIG_CANCEL_ARCHIVE_RESUMED, db_session, u)
+    t1 = dialog.turns[1]
+    assert t1.mutated is False, "count-only: status flip невидим → mutated=False (проекция выключена)"
+    v = inv_ambiguous_cancel_zero_mutations(dialog, turns=[1])
+    assert v == [], "count-only убил нарушение → проекция БЫЛА load-bearing (режущая сила доказана)"

@@ -190,6 +190,24 @@ def test_inv4_silent_when_no_mutation():
     assert inv_ambiguous_cancel_zero_mutations(d, turns=[0]) == []
 
 
+def test_mutated_detects_status_only_change_but_count_only_masks_it():
+    """Комплемент к projection cutting-power: mutated ловит смену ТОЛЬКО status (archive) при
+    неизменном count; регресс проекции до (None,None) — не ловит. Анти-#74 на уровне model."""
+    counts = {"checklists": 1}
+    changed = TurnOutcome(
+        user_text="да", is_auto=True, reply="Готово.", awaiting_confirm=False,
+        db_before=counts, db_after=counts, tool_calls=[], receipts=[],
+        state_before={"checklists": {"c1": ("active", "Дача")}},
+        state_after={"checklists": {"c1": ("archived", "Дача")}})
+    assert changed.mutated is True
+    count_only = TurnOutcome(
+        user_text="да", is_auto=True, reply="Готово.", awaiting_confirm=False,
+        db_before=counts, db_after=counts, tool_calls=[], receipts=[],
+        state_before={"checklists": {"c1": (None, None)}},
+        state_after={"checklists": {"c1": (None, None)}})
+    assert count_only.mutated is False
+
+
 # ─────────── R2 (ревью sol+terra): корпус форм успеха/отмены/техвыдачи ───────────
 
 def test_inv1_catches_passive_claim_forms():

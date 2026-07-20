@@ -199,6 +199,30 @@ F_AMBIGUOUS_CANCEL = Fixture(
 )
 
 
+# ─────────── in-place мутация: доказательство режущей силы ЛОГИЧЕСКОЙ проекции ───────────
+# Анти-вакуум (Opus-проход оркестратора): проекция {id:(status,title)} была декоративна —
+# `mutated` везде маскировался `... or has_applied_write`, а единственное НЕмаскированное место
+# (inv_ambiguous_cancel) кормилось фикстурой, стопающейся на confirm (mutated=False). Здесь
+# ambiguous-cancel РЕЗЮМИТ «да» и АРХИВИРУЕТ список: status active→archived при НЕИЗМЕННОМ
+# count (archive не удаляет строку). inv_ambiguous_cancel_zero_mutations срабатывает ТОЛЬКО
+# через проекцию (mutated по status), НЕ через count → регресс proj→count-only теряет нарушение.
+# Не в авто-списках: сценарий НАМЕРЕННО даёт нарушение (гоняется в test_cutting_power).
+F_AMBIG_CANCEL_ARCHIVE_RESUMED = Fixture(
+    id="ambig_cancel_archive_resumed",
+    bug="inv4/projection",
+    summary="ambiguous cancel «удали список дела» (needle на 2 списка) → confirm → «да» → архивирует "
+            "выбранный; in-place status flip при неизменном count. inv_ambiguous_cancel ловит через "
+            "ЛОГИЧЕСКУЮ проекцию (не count). Load-bearing тест проекции (анти-#74).",
+    seed=lambda s, u: _seed_lists(s, u, {"дела на дачу": ["a"], "дела на сегодня": ["b"]}),
+    turns=[
+        ScriptedTurn("удали список дела",
+                     [ai_tool("archive_checklist", {"list_id_or_title": "дела"})]),
+        ScriptedTurn("да", [ai_text("Готово, убрала список.")], is_auto=True),
+    ],
+    ambiguous_cancel_turns=[1],
+)
+
+
 # Каталог: (фикстура, ожидается_зелёной). ОТКРЫТЫЕ баги → False (xfail(strict), XPASS при починке).
 GREEN_FIXTURES = [
     F393_ADD,
