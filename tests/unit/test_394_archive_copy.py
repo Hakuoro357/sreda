@@ -95,7 +95,20 @@ def test_archive_leak_backstop_394():
     assert reply_has_archive_leak("Заархивировала список «Дача».", acts) is True
     # R3 sol MINOR: латинский «archiv» (Archived/archive) — тоже внутренний термин, тоже ловим
     assert reply_has_archive_leak("Archived список «Дача».", acts) is True
+    # R4 sol MINOR: нет позитива «удал/убр» → тоже подмена (позитивная копия #394 не гарантирована иначе)
+    assert reply_has_archive_leak("Список «Дача» больше не виден.", acts) is True   # нет удал/убр
+    assert reply_has_archive_leak("Deleted список «Дача».", acts) is True           # латиница, нет удал
+    # позитив на языке юзера БЕЗ архив-корня → НЕ подменяем (живой голос сохранён)
     assert reply_has_archive_leak("Удалила список «Дача».", acts) is False
+    assert reply_has_archive_leak("Убрала список «Дача».", acts) is False
     # без archive-акта — не наше дело (add-акт с «архивным» ИМЕНЕМ списка не триггерит)
     add = [WriteAct("add_checklist_items", "add", "Архив", ("молоко",), 1)]
     assert reply_has_archive_leak("Добавила молоко в список «Архив».", add) is False
+
+
+def test_generic_confirm_archive_is_delete_copy_394():
+    """R4 sol MINOR: generic-candidate confirm archive_checklist — «удалить список» (язык юзера),
+    НЕ нейтральное «сделать это изменение?» и НЕ внутреннее «архив»."""
+    from sreda.runtime.confirm_preview import generic_action_question
+    q = generic_action_question("archive_checklist", {"list_id_or_title": "Дача"})
+    assert "удал" in q.lower() and "архив" not in q.lower(), q

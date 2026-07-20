@@ -77,18 +77,22 @@ def reply_has_tech_leak(text: str) -> bool:
 # R3 sol MINOR: и КИРИЛЛИЧЕСКИЙ «архив», и ЛАТИНСКИЙ «archiv» (Archived/archive/archiving) — обе формы
 # внутреннего термина недопустимы в USER-FACING финале (латиницу `_TECH_LEAK_RE` намеренно не ловит).
 _ARCHIVE_ROOT_RE = re.compile(r"архив|archiv", re.IGNORECASE)
+# R4 sol MINOR: #394 требует ПОЗИТИВНУЮ копию удаления. Реплика без «удал/убр» («Список больше не
+# виден», латинское «Deleted список Дача») формально не несёт «архив», но и не отвечает на языке юзера.
+_DELETE_ROOT_RE = re.compile(r"удал|убр", re.IGNORECASE)
 
 
 def reply_has_archive_leak(reply: str, acts) -> bool:
-    """#394 (R2/R3 sol MINOR): на archive_checklist финальная реплика НЕ должна нести корень «архив»
-    (ни кириллицей, ни латиницей «archiv») — юзер сказал «удали», отвечаем на его языке. Детектор
-    заземления (`reply_grounds_result`) проверяет лишь ИМЯ цели, поэтому живое «Заархивировала список
-    Дача» / «Archived список Дача» прошло бы как заземлённое и термин утёк бы. Механизм-гейт (не промпт,
-    прецедент #180): есть успешный archive-акт И реплика содержит архив-корень → подменяем
-    детерминированной страховкой (spec[0]=«удалила список»)."""
+    """#394 (R2/R3/R4 sol MINOR): финал на archive_checklist ДОЛЖЕН быть на языке юзера — позитивное
+    «удал/убр» И БЕЗ внутреннего термина «архив»/«archiv». Детектор заземления (`reply_grounds_result`)
+    проверяет лишь ИМЯ цели, поэтому «Заархивировала список Дача» (архив), «Archived …» (латиница) или
+    «Список больше не виден» (нет позитива) прошли бы как заземлённые. Механизм-гейт (не промпт,
+    прецедент #180): есть успешный archive-акт И реплика (а) несёт архив-корень ИЛИ (б) НЕ несёт
+    «удал/убр» → подменяем детерминированной страховкой (spec[0]=«удалила список»). True = нужна подмена."""
     if not any(getattr(a, "tool", None) == "archive_checklist" for a in (acts or ())):
         return False
-    return bool(_ARCHIVE_ROOT_RE.search(reply or ""))
+    r = reply or ""
+    return bool(_ARCHIVE_ROOT_RE.search(r)) or not _DELETE_ROOT_RE.search(r)
 
 
 def _is_id(value: str) -> bool:

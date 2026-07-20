@@ -195,6 +195,8 @@ _ACTIONS_RU = {
     "complete_task": "отметить задачу выполненной",
     "add_checklist_items": "добавить в список",
     "add_shopping_items": "добавить в покупки",
+    "archive_checklist": "удалить список",  # #394 (R4 sol): generic-candidate тоже на языке юзера,
+    # не нейтральное «сделать это изменение?» и НЕ внутреннее «архив»
     "update_reminder": "изменить напоминание",
     "update_shopping_item": "изменить покупку",
     "create_checklist": "создать список",
