@@ -640,6 +640,11 @@ def _confirm_wrap(inner: Any, phrase: str) -> Any:
     return StructuredTool.from_function(
         func=_wrapped, name=inner.name, description=inner.description,
         args_schema=inner.args_schema,
+        # #405: маркер ФАКТИЧЕСКОЙ bespoke-обёртки. Ярус (б) единого пути по нему пропускает
+        # деструктив как есть (не оборачивает вторым generic-confirm → без двойного подтверждения
+        # «очисти список покупок»). Гейт на маркер, не на имя: незамаркированный деструктив всё
+        # равно получит confirm (нет тихой мутации).
+        metadata={**(getattr(inner, "metadata", None) or {}), "sreda_bespoke_confirm": True},
     )
 
 
@@ -1906,8 +1911,14 @@ def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any,
                 out.append(t)
             elif tool_write_domains(name) <= aw and tool_read_domains(name) <= ar:
                 out.append(t)  # ярус (а): домены разрешены → прямой write без confirm
+            elif (getattr(t, "metadata", None) or {}).get("sreda_bespoke_confirm"):
+                # #405: деструктив уже несёт bespoke-confirm (_confirm_wrap, специфичный «уберу «X»») —
+                # НЕ оборачивать вторым generic-confirm (иначе ДВА подтверждения на один вызов, прод-баг
+                # «очисти список покупок»). Гейт на МАРКЕР фактической обёртки (не на имя): деструктив
+                # без маркера уйдёт в ветку ниже и всё равно получит confirm → тихой мутации нет.
+                out.append(t)  # ярус (б) для bespoke-подтверждённого: как есть → РОВНО один confirm
             else:
-                out.append(_generic_confirm_wrap(t))  # ярус (б): кандидат под confirm
+                out.append(_generic_confirm_wrap(t))  # ярус (б): кандидат под generic confirm
         elif tool_read_domains(name) <= ar:
             # #376 слой-2: внутридоменное сужение ЧТЕНИЯ — детерминированный детектор
             # (items+имя резолвится) вырезает конкурента (list_checklists) из read-набора,
