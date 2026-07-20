@@ -143,6 +143,23 @@ def test_fallback_save_strips_iso_date_363():
     _assert_clean(fb)
 
 
+@pytest.mark.parametrize("prefix", [
+    "2026-07-11T14:30:00.500: ",   # доли секунд
+    "2026-07-11T14:30:00Z: ",       # таймзона Z
+    "2026-07-11T14:30:00+03:00: ",  # смещение TZ
+    "2026-07-11 14:30:00.123 — ",   # пробел-разделитель + доли + тире
+])
+def test_fallback_save_strips_iso_with_fraction_tz_363(prefix):
+    """Опус-нога #363: ведущий ISO с долями секунд / таймзоной НЕ должен утечь (БИБЛИЯ g-075).
+    Regex leading-only расширен на (?:\\.\\d+)? и (?:[zZ]|±HH:MM). Еду называем, ISO-хвоста нет."""
+    fb = fallback_reply(collect_successful_writes(_core_msgs(prefix + "ужин — котлета")))
+    low = fb.lower()
+    assert "котлет" in low and "ужин" in low
+    assert "2026" not in fb and ".500" not in fb and ".123" not in fb
+    assert "+03" not in fb and "14:30" not in fb and "z:" not in low
+    _assert_clean(fb)
+
+
 def test_fallback_save_latin_degrades_not_leaks_363():
     """Латиница в имени факта (напр. «L-Thyroxin») → имя неотображаемо → грациозная деградация к
     факту («записала»), БЕЗ утечки латиницы (owner R4-c)."""
