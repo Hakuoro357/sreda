@@ -45,6 +45,8 @@ _ID_RE = re.compile(r"^[a-zа-я]+_[0-9a-f]{12,}$", re.IGNORECASE)
 _IDLIKE_TOKEN_RE = re.compile(r"\b[a-zа-я]+_[0-9a-f]{12,}\b", re.IGNORECASE)
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _EMDASH_RE = re.compile(r"[—–―]")  # длинное/среднее тире → обычный дефис (правило: без «—» юзеру)
+_LATIN_RE = re.compile(r"[a-zA-Z]")  # латиница в детерминированном тексте = не «чистый русский»
+_TECH_MARK_RE = re.compile(r"\b(?:id|ref|http|okv2|checklist|task|rem|clitem)\s*[=:]", re.IGNORECASE)
 _MAX_NAME_LEN = 80
 
 
@@ -53,15 +55,30 @@ def _is_id(value: str) -> bool:
 
 
 def _sanitize(value: str) -> str:
-    """Чистое отображаемое имя цели/пункта для user-facing текста И для инжекта в промпт (часть 1).
-    Вычищает control-символы, id-подобные токены (checklist_<hex>…), меняет длинное тире на дефис,
-    схлопывает пробелы, каппит длину. Пусто → неотображаемо (вызвавший делает fail-closed)."""
+    """Первичная чистка: control-символы, id-токены (checklist_<hex>…), длинное тире→дефис, схлоп
+    пробелов, кап длины. Формы-чистоты (латиница/техмаркеры) проверяет `_clean_name`."""
     s = _CTRL_RE.sub(" ", str(value or ""))
     s = _EMDASH_RE.sub("-", s)
     s = _IDLIKE_TOKEN_RE.sub(" ", s)
     s = re.sub(r"\s+", " ", s).strip()
     if len(s) > _MAX_NAME_LEN:
         s = s[:_MAX_NAME_LEN].rstrip()
+    return s
+
+
+def _clean_name(value: str) -> str:
+    """Безопасно ОТОБРАЖАЕМОЕ имя для детерминированного user-facing текста И инжекта в промпт
+    (fail-closed, Codex sol+terra R1/R2): санитизация + отказ, если имя содержит ЛАТИНИЦУ (контракт
+    «чистый русский без англицизмов»), техмаркеры (`id=`/`ref=`/`http`/…) или пусто/только-пунктуация.
+    Пусто → небезопасно, вызывающий НЕ строит акт (голос как есть). Так ни латиница/техследы/
+    инструкц-текст не утекут ни в fallback, ни в grounding_note."""
+    s = _sanitize(value)
+    if not s or _is_id(value):
+        return ""
+    if _LATIN_RE.search(s) or _TECH_MARK_RE.search(s):
+        return ""
+    if not re.search(r"[0-9а-яё]", s, re.IGNORECASE):  # ни буквы/цифры — только пунктуация
+        return ""
     return s
 
 
@@ -115,9 +132,7 @@ def _target_name(field: str | None, args: dict) -> str:
     if not field:
         return ""
     val = args.get(field)
-    if isinstance(val, str) and val.strip() and not _is_id(val):
-        return _sanitize(val)
-    return ""
+    return _clean_name(val) if isinstance(val, str) else ""
 
 
 def collect_successful_writes(messages) -> tuple[WriteAct, ...]:
@@ -151,10 +166,17 @@ def collect_successful_writes(messages) -> tuple[WriteAct, ...]:
             content = str(getattr(tm, "content", "") or "")
             args = tc.get("args") or {}
             if name in _ADD_TOOLS:
-                items = tuple(s for s in (_sanitize(x) for x in _okv2_created(content)) if s)
-                if not items:  # all-dup / нераспарсено → нет эффекта, не заземляем
+                created = _okv2_created(content)
+                if not created:  # all-dup / нераспарсено → нет эффекта, не заземляем
                     continue
-                acts.append(WriteAct(name, "add", _target_name(_ADD_TOOLS[name], args), items))
+                items = tuple(_clean_name(x) for x in created)
+                if not all(items):  # ЛЮБОЙ пункт неотображаем (латиница/техследы) → fail-closed ВЕСЬ акт
+                    continue
+                field = _ADD_TOOLS[name]
+                target = _target_name(field, args)
+                if field and not target:  # checklist-add: имя списка ОБЯЗАНО быть отображаемым
+                    continue  # (пустой target допустим только для add_shopping_items, field=None)
+                acts.append(WriteAct(name, "add", target, items))
             elif name in _TARGET_SPECS:
                 _verb, prefix, field = _TARGET_SPECS[name]
                 if not content.startswith(prefix):  # нет эффекта (не тот исход)
@@ -184,14 +206,16 @@ def _stem(word: str) -> str:
 
 
 def _name_mentioned(reply_tokens: list[str], name: str) -> bool:
-    """Имя названо в реплике? Матч ПО ТОКЕНАМ (границы слов), не подстрокой — иначе stem «дел»
-    списка «Дела» ложно матчит «Сделала» (Codex terra R1). Значимое слово имени (≥4 симв.) →
-    какой-то токен реплики начинается с его stem; короткое имя → точный токен."""
+    """Имя ПОЛНОСТЬЮ названо в реплике? Матч ПО ТОКЕНАМ (границы слов), не подстрокой — иначе stem
+    «дел» списка «Дела» ложно матчит «Сделала» (Codex terra R1). Многословное имя → ВСЕ его значимые
+    слова (≥4 симв.) названы (не «хотя бы одно» — иначе «молоко без лактозы»/«Дела на сегодня»
+    засчитывались бы по одному общему слову, sol+terra R2). Каждое значимое слово → какой-то токен
+    реплики начинается с его stem (морфология #180). Имя без значимых слов → точный токен целиком."""
     name_toks = [t for t in _norm(name).split() if len(t) >= 4]
     if not name_toks:
         whole = _norm(name)
         return bool(whole) and whole in reply_tokens
-    return any(any(rt.startswith(_stem(nt)) for rt in reply_tokens) for nt in name_toks)
+    return all(any(rt.startswith(_stem(nt)) for rt in reply_tokens) for nt in name_toks)
 
 
 def reply_grounds_result(reply: str, acts) -> bool:
@@ -208,6 +232,10 @@ def reply_grounds_result(reply: str, acts) -> bool:
         return False
     for act in acts:
         if act.kind == "add":
+            # add-акт заземлён ⟺ названы И имя списка (если есть; checklist-add его гарантирует
+            # fail-closed), И КАЖДЫЙ добавленный пункт (sol+terra R2: приёмка «имя списка + пункты»).
+            if act.target and not _name_mentioned(reply_tokens, act.target):
+                return False
             if not (act.items and all(_name_mentioned(reply_tokens, it) for it in act.items)):
                 return False
         elif not (act.target and _name_mentioned(reply_tokens, act.target)):

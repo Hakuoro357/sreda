@@ -123,7 +123,8 @@ def test_detector_add_filler_not_grounded_393():
 
 def test_detector_add_named_items_grounded_393():
     acts = collect_successful_writes(_add_msgs())
-    assert reply_grounds_result("Добавила грабли, лопату и перчатки.", acts) is True
+    # add-акт требует И имя списка, И все пункты (sol+terra R2, приёмка «имя списка + пункты»)
+    assert reply_grounds_result("Добавила в Дачу грабли, лопату и перчатки.", acts) is True
 
 
 def test_detector_add_morphology_tolerant_393():
@@ -249,7 +250,8 @@ def test_detector_add_partial_items_not_grounded_393():
     acts = collect_successful_writes(_add_msgs())
     assert reply_grounds_result("Добавила грабли.", acts) is False
     assert reply_grounds_result("Добавила грабли и лопату.", acts) is False
-    assert reply_grounds_result("Добавила грабли, лопату и перчатки.", acts) is True
+    # полный отчёт = имя списка + ВСЕ пункты (R2)
+    assert reply_grounds_result("Добавила в Дачу грабли, лопату и перчатки.", acts) is True
 
 
 def test_detector_all_acts_required_393():
@@ -264,7 +266,59 @@ def test_detector_all_acts_required_393():
     acts = collect_successful_writes(msgs)
     assert len(acts) == 2
     assert reply_grounds_result("Добавила грабли.", acts) is False          # Поход не назван
-    assert reply_grounds_result("Добавила грабли, убрала Поход.", acts) is True
+    assert reply_grounds_result("Добавила грабли в Дачу, убрала Поход.", acts) is True
+
+
+# ─────────────────────────── R2 (Codex sol+terra): полнота детектора + fail-closed чистоты ───────────────────────────
+
+def test_detector_add_requires_target_393():
+    """R2: add-акт заземлён ТОЛЬКО если названо имя списка. Названы все пункты, но НЕ «Дача» → подмена."""
+    acts = collect_successful_writes(_add_msgs())
+    assert reply_grounds_result("Добавила грабли, лопату и перчатки.", acts) is False
+
+
+def test_detector_multiword_all_tokens_393():
+    """R2: многословный пункт заземлён, только когда названы ВСЕ его значимые слова (не одно общее):
+    «молоко без лактозы» по одному «молоко» → нет."""
+    created = ('okv2:added:{"added_count":1,"duplicate_count":0,"checklist_id":"checklist_'
+               + "a" * 24 + '","created":["молоко без лактозы"]}')
+    msgs = [HumanMessage(content="добавь в покупки молоко без лактозы"),
+            _ai_call("add_shopping_items", {"items": ["молоко без лактозы"]}),
+            _tm(created, name="add_shopping_items")]
+    acts = collect_successful_writes(msgs)
+    assert len(acts) == 1
+    assert reply_grounds_result("Молоко записала.", acts) is False
+    assert reply_grounds_result("Записала молоко без лактозы.", acts) is True
+
+
+def test_collect_add_latin_item_fail_closed_393():
+    """R2: латиница в пункте (не «чистый русский») → неотображаемо → fail-closed ВЕСЬ акт."""
+    created = ('okv2:added:{"added_count":1,"duplicate_count":0,"checklist_id":"checklist_'
+               + "a" * 24 + '","created":["milk"]}')
+    msgs = [HumanMessage(content="добавь"),
+            _ai_call("add_checklist_items", {"list_id_or_title": "Дача", "items": ["milk"]}),
+            _tm(created)]
+    assert collect_successful_writes(msgs) == ()
+
+
+def test_collect_add_latin_target_fail_closed_393():
+    """R2: латиница в имени списка → fail-closed (target checklist-add обязан быть чистым русским).
+    Чисто-латинское «Weekly Plan» И СМЕШАННОЕ «Дача Todo» (кириллица+латиница) — оба отклоняются
+    (смешанное изолирует именно latin-гард: гард «есть кириллица» его пропустил бы)."""
+    for bad in ("Weekly Plan", "Дача Todo"):
+        msgs = [HumanMessage(content="добавь"),
+                _ai_call("add_checklist_items", {"list_id_or_title": bad, "items": ["молоко"]}),
+                _tm(_OKV2_ADD)]
+        assert collect_successful_writes(msgs) == (), bad
+
+
+def test_collect_add_id_target_fail_closed_393():
+    """R2: checklist-add с id-именем списка → fail-closed (нельзя назвать «в какой список»)."""
+    msgs = [HumanMessage(content="добавь"),
+            _ai_call("add_checklist_items",
+                     {"list_id_or_title": "checklist_" + "a" * 24, "items": ["молоко"]}),
+            _tm(_OKV2_ADD)]
+    assert collect_successful_writes(msgs) == ()
 
 
 # ─────────────────────────── e2e через handle_turn (легаси-путь) ───────────────────────────
