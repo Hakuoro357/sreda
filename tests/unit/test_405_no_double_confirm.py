@@ -135,15 +135,17 @@ def test_real_inline_destructives_single_interrupt_tier_b_405(db_session, monkey
     u = seed_telegram_user(db_session)
     db_session.commit()
     now = datetime(2030, 1, 1, tzinfo=timezone.utc)
-    tid_c, tid_d, tid_n = (f"task_{uuid4().hex[:18]}" for _ in range(3))
-    for tid, title in ((tid_c, "отменяемая"), (tid_d, "удаляемая"), (tid_n, "сохраняемая")):
+    tid_c, tid_d, tid_n, tid_dn = (f"task_{uuid4().hex[:18]}" for _ in range(4))
+    for tid, title in ((tid_c, "отменяемая"), (tid_d, "удаляемая"),
+                       (tid_n, "сохраняемая"), (tid_dn, "неудаляемая")):
         db_session.add(Task(id=tid, tenant_id=u.tenant_id, user_id=u.user_id, title=title,
                             scheduled_date=date(2030, 6, 20), status="pending",
                             created_at=now, updated_at=now))
-    rid = f"rem_{uuid4().hex[:18]}"
+    rid, rid_n = (f"rem_{uuid4().hex[:18]}" for _ in range(2))
     when = datetime(2030, 1, 1, 9, 0, tzinfo=timezone.utc)
-    db_session.add(FamilyReminder(id=rid, tenant_id=u.tenant_id, user_id=u.user_id, title="разминка",
-                                  trigger_at=when, next_trigger_at=when, status="pending"))
+    for _rid, _t in ((rid, "разминка"), (rid_n, "растяжка")):
+        db_session.add(FamilyReminder(id=_rid, tenant_id=u.tenant_id, user_id=u.user_id, title=_t,
+                                      trigger_at=when, next_trigger_at=when, status="pending"))
     db_session.commit()
     tools = {t.name: t for t in build_slice_tools(db_session, u.tenant_id, u.user_id)}
 
@@ -177,10 +179,19 @@ def test_real_inline_destructives_single_interrupt_tier_b_405(db_session, monkey
 
     _invoke("cancel_reminder", {"reminder_ref": rid})
     assert counter["n"] == 1, f"cancel_reminder: ожидался один interrupt, было {counter['n']}"
+    db_session.expire_all()
+    assert db_session.get(FamilyReminder, rid).status == "cancelled", \
+        "cancel_reminder после «да» должен пометить cancelled (мутация ПОСЛЕ confirm)"
 
-    # «нет» → один interrupt, НОЛЬ мутаций
+    # «нет» → один interrupt, НОЛЬ мутаций (по каждому из трёх inline-деструктивов)
     counter["reply"] = "нет"
     _invoke("cancel_task", {"task_ref": tid_n})
-    assert counter["n"] == 1, f"decline: ожидался один interrupt, было {counter['n']}"
+    assert counter["n"] == 1, f"decline cancel_task: ожидался один interrupt, было {counter['n']}"
+    _invoke("delete_task", {"task_ref": tid_dn})
+    assert counter["n"] == 1, f"decline delete_task: ожидался один interrupt, было {counter['n']}"
+    _invoke("cancel_reminder", {"reminder_ref": rid_n})
+    assert counter["n"] == 1, f"decline cancel_reminder: ожидался один interrupt, было {counter['n']}"
     db_session.expire_all()
-    assert db_session.get(Task, tid_n).status == "pending", "«нет» → задача НЕ должна отмениться"
+    assert db_session.get(Task, tid_n).status == "pending", "«нет» → cancel_task не отменяет"
+    assert db_session.get(Task, tid_dn) is not None, "«нет» → delete_task не удаляет"
+    assert db_session.get(FamilyReminder, rid_n).status == "pending", "«нет» → cancel_reminder не отменяет"
