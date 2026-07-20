@@ -2598,11 +2598,13 @@ def _is_new_request_on_pause(text: str) -> bool:
 
 def _should_redirect_on_pause(user_text: str, is_confirm_pause: bool) -> bool:
     """#316 R5 (субагент R4 MINOR — спец-дрейф #74): ЕДИНАЯ функция решения «новый запрос на живой паузе
-    → свежий ход». Извлечена из handle_turn, чтобы юнит-тест бил РЕАЛЬНЫЙ путь (а не реимплементацию —
-    иначе дроп конъюнкта не поймался бы тестом). confirm-пауза: положительный сигнал И НЕ голое эхо-
-    подтверждение «удали»/«ок удали» (иначе → A0 «нет», #267 fail-closed удаления); classify-конъюнкт
-    оставлен защитно (при is_new он всегда "redirect"). ask_human: просто сигнал нового запроса — у
-    открытого вопроса нет да/нет-действия, которое можно «переэхнуть», поэтому эхо-гейта нет."""
+    → свежий ход». Извлечена из handle_turn, чтобы юнит-тест бил РЕАЛЬНЫЙ путь (а не реимплементацию).
+    confirm-пауза (#362 R2, sol+terra MINOR — синхронизировано с кодом): у неё валидны ТОЛЬКО «да»/«нет»,
+    поэтому редиректим ЛЮБОЙ содержательный ответ, КРОМЕ (1) affirm/negate (`classify_confirm_reply !=
+    "redirect"` → resume: штатное «да» / честная детерминированная «Отменила» #321) и (2) эхо/filler
+    (`confirm_reply_is_noise` → resume → fail-closed «нет», #316/#267). `_is_new_request_on_pause` для
+    confirm-ветки НЕ используется. ask_human: просто сигнал нового запроса (`_is_new_request_on_pause`) —
+    у открытого вопроса нет да/нет-действия, которое можно «переэхнуть», поэтому эхо-гейта нет."""
     from sreda.runtime.react_signals import confirm_reply_is_noise
     is_new = _is_new_request_on_pause(user_text)
     if is_confirm_pause:
