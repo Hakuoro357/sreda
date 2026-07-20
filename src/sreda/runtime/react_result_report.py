@@ -252,10 +252,19 @@ def reply_grounds_result(reply: str, acts) -> bool:
     if not reply_tokens:
         return False
     for act in acts:
-        names = list(act.items)
-        if act.target:
-            names.append(act.target)
-        if names and not all(_name_mentioned(reply_tokens, n) for n in names):
+        if act.kind == "add":
+            # НЕ заземлён, если: (а) добавлены НЕ все отображаемо — часть/все пункты неотображаемы
+            # (len(items)<count; латиница/id — детектор их не верифицирует → страховка деградирует к
+            # количеству, Codex sol R5); (б) не все отображаемые пункты названы; (в) для checklist-add
+            # имя списка неотображаемо ИЛИ не названо (shopping — неявная цель, имя не требуем).
+            if len(act.items) < act.count:
+                return False
+            if not all(_name_mentioned(reply_tokens, it) for it in act.items):
+                return False
+            if act.tool != "add_shopping_items" and not (
+                    act.target and _name_mentioned(reply_tokens, act.target)):
+                return False
+        elif not (act.target and _name_mentioned(reply_tokens, act.target)):
             return False
     return True
 
@@ -304,17 +313,18 @@ def _phrase(act: WriteAct) -> str:
     """Тёплая формулировка ОДНОГО акта для ВЫВОДА (страховка). Грациозно деградирует к серверным
     фактам (кол-во+тип), если имя неотображаемо (owner R4-c: не молчим). Имена уже дисплей-чисты."""
     if act.kind == "add":
+        # перечисляем пункты ТОЛЬКО когда отображаемы ВСЕ добавленные (иначе теряли бы count — sol R5).
+        complete = bool(act.items) and len(act.items) == act.count
         items = ", ".join(act.items)
         if act.tool == "add_shopping_items":
-            return (f"добавила в список покупок: {items}" if items
+            return (f"добавила в список покупок: {items}" if complete
                     else f"добавила {_units(act.count)} в список покупок")
-        if act.target and items:
-            return f"добавила в список «{act.target}»: {items}"
-        if act.target:  # пункты неотображаемы → по количеству
-            return f"добавила {_units(act.count)} в список «{act.target}»"
-        if items:  # имя списка неотображаемо → назовём пункты
+        if act.target:
+            return (f"добавила в список «{act.target}»: {items}" if complete
+                    else f"добавила {_units(act.count)} в список «{act.target}»")
+        if complete:  # имя списка неотображаемо, но все пункты — назовём пункты
             return f"добавила пункты: {items}"
-        return f"добавила {_units(act.count)} в {_ADD_WHERE.get(act.tool, 'список')}"
+        return f"добавила {_units(act.count)} в {_ADD_WHERE.get(act.tool, 'чек-лист')}"
     spec = _TARGET_SPECS.get(act.tool)
     if not spec:
         return ""

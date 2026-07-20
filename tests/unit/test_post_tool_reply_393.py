@@ -168,6 +168,26 @@ def test_collect_undisplayable_names_degrade_not_drop_393():
     assert fb and "checklist_" not in fb.lower() and "убрала список" in fb
 
 
+def test_detector_and_fallback_undisplayable_items_use_count_393():
+    """R5 (sol CRITICAL): часть/все добавленные пункты неотображаемы (len(items)<count) → НЕ заземлён
+    (P0-филлер не остаётся для латиница/id-пунктов), страховка деградирует к КОЛИЧЕСТВУ (не теряет count)."""
+    full = collect_successful_writes([
+        HumanMessage(content="добавь"),
+        _ai_call("add_shopping_items", {"items": ["iPhone"]}),
+        _tm(_okv2_add(["iPhone"]), name="add_shopping_items")])
+    assert len(full) == 1 and full[0].count == 1 and full[0].items == ()
+    assert reply_grounds_result("Добавила, готово.", full) is False
+    assert reply_grounds_result("Купила iPhone.", full) is False
+    assert fallback_reply(full) == "Готово, добавила 1 пункт в список покупок."
+    part = collect_successful_writes([
+        HumanMessage(content="добавь"),
+        _ai_call("add_shopping_items", {"items": ["молоко", "iPhone"]}),
+        _tm(_okv2_add(["молоко", "iPhone"]), name="add_shopping_items")])
+    assert len(part) == 1 and part[0].count == 2 and part[0].items == ("молоко",)
+    assert reply_grounds_result("Добавила молоко.", part) is False
+    assert fallback_reply(part) == "Готово, добавила 2 пункта в список покупок."
+
+
 def test_collect_long_legit_name_graceful_truncate_393():
     """owner R4-c: длинное ЛЕГИТ имя (>порога) → graceful трункейт для показа, акт НЕ дропается."""
     long_name = "Дела на дачу этим летом обязательно успеть сделать до конца августа непременно всё"
@@ -426,6 +446,24 @@ async def test_e2e_okv2_never_reaches_user_393(db_session):
     u = seed_telegram_user(db_session); db_session.commit()
     reply = await _turn(db_session, u, _add_stub("Добавила (okv2:added:3)."))
     assert "okv2" not in str(reply).lower(), reply
+
+
+@pytest.mark.asyncio
+async def test_e2e_undisplayable_item_filler_substituted_to_count_393(db_session):
+    """R5 (sol): латиница-пункт + филлер → подмена деградирует к КОЛИЧЕСТВУ (P0-филлер не остаётся)."""
+    u = seed_telegram_user(db_session); db_session.commit()
+    stub = _StubLLM([
+        AIMessage(content="", tool_calls=[{
+            "name": "add_shopping_items", "args": {"items": [{"title": "iPhone"}]}, "id": "c1"}]),
+        AIMessage(content="Хорошо, приняла к сведению."),
+    ])
+    reply = await handle_turn(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        thread_id=f"react:t:{uuid4().hex}", llm=stub, user_text="добавь в покупки iPhone",
+        inbound_message_id="m1", channel="max")
+    s = str(reply).lower()
+    assert "приняла к сведению" not in s, reply
+    assert "1 пункт" in s and "покупок" in s, reply
 
 
 @pytest.mark.asyncio
