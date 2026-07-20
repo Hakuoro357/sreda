@@ -515,24 +515,31 @@ def _react_fallback_available(primary_provider: str = "", settings: Any = None) 
     return primary_provider not in _GROQ_MODEL_BY_PROVIDER
 
 
-def react_primary_llm(provider: str = "", settings: Any = None) -> Any:
+def react_primary_llm(provider: str = "", settings: Any = None,
+                      *, has_fallback: bool | None = None) -> Any:
     """#401: основной ReAct-LLM (Фредди/Mercury) с fail-fast на серверную ошибку.
 
     Инцидент 20.07: openai-клиент primary по умолчанию ретраит 5xx (`max_retries=2`, эксп.
     бэкофф) ВНУТРИ одного `invoke` → на медленно-500-ящем Mercury накопилось ~40с ПОД wall-clock
-    60с перед фолбэком на Осу (которая сама отвечает 3-5с). Когда запас (Оса) ДОСТУПЕН
-    (`_react_fallback_available`), строим primary с `max_retries=0`: серверная ошибка/сетевой сбой
-    primary НЕ ретраит сам себя, а СРАЗУ поднимает исключение → ручной try/except в chat-узле
-    уводит ход в фолбэк немедленно.
+    60с перед фолбэком на Осу (которая сама отвечает 3-5с). Когда запас РЕАЛЬНО доступен, строим
+    primary с `max_retries=0`: серверная ошибка/сетевой сбой primary НЕ ретраит сам себя, а СРАЗУ
+    поднимает исключение → ручной try/except в chat-узле уводит ход в фолбэк немедленно.
 
-    Без запаса (флаг OFF / primary уже Оса) `max_retries` НЕ трогаем — дефолтный клиентский retry
-    остаётся последним рубежом (сетевой блип ЕДИНСТВЕННОГО провайдера ретраить стоит: другого нет).
-    Гейт best-effort: сбой чтения settings → дефолтный retry (безопасная сторона)."""
+    `has_fallback` (R1 sol+terra MAJOR): ФАКТ построенного резерва от вызывающего —
+    `react_fallback_llm(...) is not None`. Гейтим fail-fast по РЕАЛЬНОМУ запасу, а НЕ по флагу:
+    флаг ВКЛ, но Groq-ключа нет → `react_fallback_llm` вернёт None → без этого primary остался бы
+    max_retries=0 при недостижимом резерве (transient 5xx → safe-reply без ретраев). None →
+    авто-гейт по `_react_fallback_available` (флаг+not-Groq) для standalone/back-compat вызовов.
+
+    Без запаса `max_retries` НЕ трогаем — дефолтный клиентский retry остаётся последним рубежом
+    (сетевой блип ЕДИНСТВЕННОГО провайдера ретраить стоит: другого нет). Гейт best-effort: сбой
+    чтения settings → дефолтный retry (безопасная сторона)."""
     from sreda.services.llm import get_chat_llm
     _kw: dict = {}
     try:
-        if _react_fallback_available(provider, settings):
-            _kw["max_retries"] = 0  # #401: 5xx primary не ретраим — сразу фолбэк (запас есть)
+        _ff = has_fallback if has_fallback is not None else _react_fallback_available(provider, settings)
+        if _ff:
+            _kw["max_retries"] = 0  # #401: 5xx primary не ретраим — сразу фолбэк (запас построен)
     except Exception:  # noqa: BLE001 — гейт best-effort; сомнение → дефолтный retry клиента
         logger.warning("react_loop: primary fail-fast gate failed → default retry", exc_info=True)
     return get_chat_llm(provider=provider, settings=settings, **_kw)
@@ -3492,6 +3499,11 @@ def _build_graph(llm: Any, all_tools: list, *,
                  tenant_id: str, user_id: str, today_str: str,
                  session: Any = None, provider_key: str = "",
                  fallback_llm: Any = None,  # #184: запасной LLM (Оса) при сбое primary
+                 # #401 (R1 sol MAJOR): Mercury-клиент с ДЕФОЛТНЫМ retry для позиции chat/fact-фолбэка
+                 # (последний рубеж после deepseek — нет тира за ним, retry сохранять). None → `llm`
+                 # (back-compat: тесты инжектят один llm). `llm` может быть fail-fast (task/SGR-primary,
+                 # за ним Оса) — его нельзя ставить последним рубежом в chat/fact без ретраев.
+                 chat_fallback_llm: Any = None,
                  # #197: state-driven селектор — граф строится ОДИН раз с ОБЕИМИ моделями; chat-узел
                  # выбирает по effective_intent. deepseek_llm=None (OFF/мисконфиг) → chat/fact на Фредди+web-only.
                  deepseek_llm: Any = None, chat_prompt: str = "",
@@ -3573,6 +3585,9 @@ def _build_graph(llm: Any, all_tools: list, *,
         # фолбэк»). Инициализация ДО развилок: финальный llm_calls-дикт читает их на всех ветках
         # (chat/fact, task, SGR). None → поле опускается (OFF-трейс и happy-path без резерва чисты).
         _primary_latency_ms, _fallback_latency_ms = None, None
+        # #401 (R1 sol MINOR): длительность SGR-попытки, если она была и упала в легаси — легаси-ветка
+        # аккумулирует её в итоговый latency_ms (иначе итог не отражает SGR+легаси). 0 без SGR.
+        _sgr_elapsed_ms = 0
         # #383 Ф2: состояние SGR-шага этого прохода (инициализация ДО интент-развилки —
         # финальный учёт/трейс читают их на обеих ветках; chat/fact SGR не касается).
         _sgr_field, _sgr_done, _sgr_usage_done = None, False, False
@@ -3607,8 +3622,12 @@ def _build_graph(llm: Any, all_tools: list, *,
                                type(_e).__name__, exc_info=True)
                 _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
                 _tfb = _time.perf_counter()  # #401: вызов резерва — отдельным таймингом
+                # #401 (R1 sol MAJOR): chat/fact-фолбэк — ПОСЛЕДНИЙ рубеж (Осы за ним нет) → берём
+                # Mercury с ДЕФОЛТНЫМ retry (chat_fallback_llm), а НЕ fail-fast `llm`: транзиентный
+                # блип Фредди тут стоит ретраить (15с-cap бортует латентность). None → `llm` (back-compat).
+                _chat_fb = chat_fallback_llm if chat_fallback_llm is not None else llm
                 resp = invoke_with_per_call_timeout(  # тот же web-only bound, НЕ task; #256: тоже короткий
-                    llm.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s,
+                    _chat_fb.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s,
                     provider=provider_key)  # #343: fallback Фредди → СВОЙ breaker-bucket, не primary
                 _fallback_latency_ms = int((_time.perf_counter() - _tfb) * 1000)  # #401
                 _used_provider, _used_model, _fallback_fired = provider_key, _model_name, True
@@ -3802,6 +3821,9 @@ def _build_graph(llm: Any, all_tools: list, *,
                     run_id=state.get("turn_key") or "",
                     user_text=_last_human_text(state["messages"]))
                 _sgr_field = _sgr_out["sgr"]
+                # #401 (R1 sol MINOR): длительность SGR-попытки — для аккумуляции в итог, если
+                # SGR упал в легаси (иначе latency_ms отразит только легаси, не SGR+легаси).
+                _sgr_elapsed_ms = _sgr_out.get("latency_ms") or 0
                 if _sgr_out["fallback_fired"]:
                     # CR R1 sol MINOR + R2 оба (не терять на «оба structured упали → легаси»):
                     # телеметрия structured-фолбэка — В ОБЩИЕ trace-поля БЕЗУСЛОВНО, как
@@ -3811,6 +3833,11 @@ def _build_graph(llm: Any, all_tools: list, *,
                     _fallback_fired = True
                     _primary_provider, _primary_model = provider_key, _model_name
                     _primary_error = _sgr_out["primary_error"]
+                    # #401 (R1 sol MINOR): под-тайминг фолбэка SGR нести БЕЗУСЛОВНО — иначе на
+                    # «SGR-фолбэк-успех → parse-fail → легаси» (resp=None) fallback_latency терялся,
+                    # а трейс показывал fallback_fired без времени. Легаси-фолбэк ниже перепишет.
+                    _primary_latency_ms = _sgr_out.get("primary_latency_ms")
+                    _fallback_latency_ms = _sgr_out.get("fallback_latency_ms")
                 if _sgr_out["resp"] is not None:
                     resp = _sgr_out["resp"]
                     _latency_ms = _sgr_out["latency_ms"]
@@ -3862,7 +3889,10 @@ def _build_graph(llm: Any, all_tools: list, *,
                         _bound_primary, _msgs, timeout_seconds=_react_timeout_s,
                         provider=_used_provider)  # #343: per-provider breaker keying
                     _primary_latency_ms = int((_time.perf_counter() - _t0) * 1000)  # #401
-                _latency_ms = int((_time.perf_counter() - _t0) * 1000)
+                # #401 (R1 sol MINOR): итог включает SGR-попытку, если она была и упала в легаси
+                # (0 без SGR → байт-в-байт прежнее). Легаси-инвок выше уже переписал primary_latency
+                # на свою попытку; итоговый latency_ms — сумма (SGR + легаси).
+                _latency_ms = _sgr_elapsed_ms + int((_time.perf_counter() - _t0) * 1000)
         # #175: учёт расхода LLM (деньги/#150) — по КАЖДОМУ вызову узла. Полностью guarded
         # (извлечение+запись): любой сбой учёта НЕ должен ронять ход пользователя.
         # #383 Ф2: SGR-успех уже учтён per-attempt в _sgr_structured_step (синтетический
@@ -4947,6 +4977,7 @@ async def handle_turn(
     llm: Any, user_text: str, inbound_message_id: str = "", channel: str = "react",
     resume_only: bool = False, expected_confirm_id: str = "",
     provider_key: str = "", fallback_llm: Any = None,  # #184: Оса как fallback Фредди
+    chat_fallback_llm: Any = None,  # #401: default-retry Mercury для позиции chat/fact-фолбэка
 ) -> "_Reply":
     """ВХОД нового цикла на одно входящее сообщение. Источник правды о паузе — сам
     checkpoint (_has_pause: interrupts + snap.created_at). turn_key минтится РАЗ на свежий ход из
@@ -5025,6 +5056,7 @@ async def handle_turn(
             tenant_id=tenant_id, user_id=user_id, today_str=today_str,
             session=session, provider_key=provider_key,  # #175: учёт расхода в chat-узле
             fallback_llm=fallback_llm,  # #184: Оса-fallback
+            chat_fallback_llm=chat_fallback_llm,  # #401: default-retry Mercury для chat/fact-фолбэка
             deepseek_llm=_deepseek_llm, chat_prompt=_chat_prompt,  # #197 state-driven селектор
             deepseek_provider_key=_deepseek_pk, preflight_enabled=_preflight,
             persona_overlay=_persona_overlay,  # #250: тот же overlay, что у chat-промта (1 чтение/ход)

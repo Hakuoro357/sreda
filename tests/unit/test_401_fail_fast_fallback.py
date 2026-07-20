@@ -81,6 +81,33 @@ def test_react_primary_keeps_retry_when_primary_already_osa(monkeypatch, primary
         f"primary уже Оса — retry не трогаем: {calls[-1]}"
 
 
+def test_react_primary_no_failfast_when_fallback_build_fails(monkeypatch):
+    """R1 sol+terra MAJOR: has_fallback=False (запас НЕ построился, хоть флаг ON) → retry сохранён.
+    Иначе primary был бы max_retries=0 при НЕДОСТИЖИМОМ резерве → transient 5xx → safe-reply без ретраев."""
+    monkeypatch.setenv("SREDA_REACT_OSA_FALLBACK", "1")
+    st_mod.get_settings.cache_clear()
+    calls = _capture_get_chat_llm(monkeypatch)
+    try:
+        react_loop.react_primary_llm("inception-mercury2", has_fallback=False)
+    finally:
+        st_mod.get_settings.cache_clear()
+    assert calls and "max_retries" not in calls[-1], \
+        f"запас не построен → fail-fast нельзя, retry сохранить: {calls[-1] if calls else None}"
+
+
+def test_react_primary_failfast_explicit_has_fallback(monkeypatch):
+    """has_fallback=True (запас реально построен) → max_retries=0, независимо от флага в env."""
+    monkeypatch.delenv("SREDA_REACT_OSA_FALLBACK", raising=False)  # даже с флагом «OFF» в env
+    st_mod.get_settings.cache_clear()
+    calls = _capture_get_chat_llm(monkeypatch)
+    try:
+        react_loop.react_primary_llm("inception-mercury2", has_fallback=True)
+    finally:
+        st_mod.get_settings.cache_clear()
+    assert calls and calls[-1].get("max_retries") == 0, \
+        f"явный has_fallback=True → fail-fast: {calls[-1] if calls else None}"
+
+
 def test_max_retries_reaches_openai_client():
     """Пламбинг-гейт: max_retries=0 через get_chat_llm доходит до openai-клиента (конструкция, без сети).
 
@@ -198,3 +225,47 @@ async def test_trace_primary_latency_on_success(db_session, monkeypatch):
     assert isinstance(c.get("primary_latency_ms"), int), f"нет primary_latency_ms: {c}"
     assert c.get("fallback_latency_ms") is None, \
         f"на успехе fallback_latency_ms не должно быть: {c}"
+
+
+# --- Ч1 concern B (R1 sol MAJOR): chat/fact-фолбэк — последний рубеж, берёт default-retry клиента ---
+
+def _run_chat_fact_graph(monkeypatch, *, deepseek, freddie, chat_fb, thread):
+    """Прямой прогон chat/fact-ветки графа (preflight ON, intent=chat) — паттерн из test_react_preflight_197."""
+    from langchain_core.messages import HumanMessage
+    from tests.unit.test_react_preflight_197 import _NoTrace, _toolset
+    monkeypatch.setattr(react_loop, "_record_react_usage", lambda **k: None)
+    monkeypatch.setattr(react_loop, "_trace", _NoTrace())
+    g = react_loop._build_graph(
+        freddie, _toolset({}), tenant_id="t", user_id="u", today_str="2026-07-20",
+        session=None, provider_key="inception-mercury2",
+        deepseek_llm=deepseek, chat_prompt="cp", deepseek_provider_key="openrouter-deepseek",
+        chat_fallback_llm=chat_fb, preflight_enabled=True)
+    return g.invoke(
+        {"messages": [HumanMessage("привет")], "turn_key": "tk", "active_families": [],
+         "guard_attempted_families": [], "turn_pass_count": 0, "guard_nudge": "",
+         "wrote_unkeyed": False, "intent": "chat",
+         "intent_meta": {"source": "classifier", "must_task": False, "classifier_raw": "chat"}},
+        {"configurable": {"thread_id": thread}})
+
+
+def test_chat_fact_fallback_uses_chat_fallback_llm(monkeypatch):
+    """deepseek падает → chat/fact-фолбэк берёт chat_fallback_llm (default-retry), НЕ fail-fast `llm`."""
+    from tests.unit.test_react_preflight_197 import _Chat
+    deepseek = _Chat("deepseek", classify="chat", raise_on_invoke=True)  # chat/fact primary падает
+    chat_fb = _Chat("chatfb", classify="chat", responses=[AIMessage(content="from-chat-fallback")])
+    freddie = _Chat("freddie", classify="chat", responses=[AIMessage(content="from-llm")])  # fail-fast llm
+    res = _run_chat_fact_graph(monkeypatch, deepseek=deepseek, freddie=freddie,
+                               chat_fb=chat_fb, thread="cf-uses")
+    assert res["messages"][-1].content == "from-chat-fallback", \
+        f"chat/fact-фолбэк должен идти через chat_fallback_llm, а не llm: {res['messages'][-1].content}"
+
+
+def test_chat_fact_fallback_defaults_to_llm_when_unset(monkeypatch):
+    """Back-compat: chat_fallback_llm не задан (None) → chat/fact-фолбэк = `llm` (прежнее поведение)."""
+    from tests.unit.test_react_preflight_197 import _Chat
+    deepseek = _Chat("deepseek", classify="chat", raise_on_invoke=True)
+    freddie = _Chat("freddie", classify="chat", responses=[AIMessage(content="from-llm")])
+    res = _run_chat_fact_graph(monkeypatch, deepseek=deepseek, freddie=freddie,
+                               chat_fb=None, thread="cf-default")
+    assert res["messages"][-1].content == "from-llm", \
+        f"без chat_fallback_llm фолбэк = llm (back-compat): {res['messages'][-1].content}"

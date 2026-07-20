@@ -1032,7 +1032,11 @@ async def _process_approved_max_turn(
                         except Exception:  # noqa: BLE001
                             logger.warning("max react confirm ack failed", exc_info=True)
                     _prov_r = react_loop.react_provider(onboarding.tenant_id)  # #184 «Оса» per-tenant
-                    _llm_r = react_loop.react_primary_llm(_prov_r, settings)  # #401: fail-fast primary на 5xx
+                    _fb_r = react_loop.react_fallback_llm(_prov_r)  # #184 Оса-fallback (ПЕРВЫМ — гейт #401)
+                    # #401: fail-fast primary ТОЛЬКО когда запас РЕАЛЬНО построен (R1 sol+terra MAJOR)
+                    _llm_r = react_loop.react_primary_llm(_prov_r, settings, has_fallback=(_fb_r is not None))
+                    from sreda.services.llm import get_chat_llm
+                    _chat_fb_r = get_chat_llm(provider=_prov_r, settings=settings)  # #401 default-retry chat/fact
                     # resume_only + expected_confirm_id: тап возобновляет ТОЛЬКО ту confirm-паузу,
                     # к которой кнопка привязана (id из callback_data). Устаревший/повторный/чужой
                     # тап → пустой ответ (no-op), свежий ход с «да/нет» НЕ стартуем (R3 Codex A/B).
@@ -1046,7 +1050,8 @@ async def _process_approved_max_turn(
                         resume_only=True,
                         expected_confirm_id=react_loop.confirm_callback_id(_cb_confirm),
                         provider_key=_prov_r,  # #175 учёт расхода + #184 «Оса»
-                        fallback_llm=react_loop.react_fallback_llm(_prov_r),  # #184 Оса-fallback
+                        fallback_llm=_fb_r,  # #184 Оса-fallback
+                        chat_fallback_llm=_chat_fb_r,  # #401 default-retry Mercury для chat/fact-фолбэка
                     )
                     trace.record(
                         "react_loop.resumed", chars=len(_reply_r or ""), channel="max",
@@ -1230,7 +1235,11 @@ async def _process_approved_max_turn(
                     from sreda.runtime import react_loop
 
                     _prov = react_loop.react_provider(onboarding.tenant_id)  # #184 «Оса» per-tenant
-                    _llm = react_loop.react_primary_llm(_prov, settings)  # #401: fail-fast primary на 5xx
+                    _fb = react_loop.react_fallback_llm(_prov)  # #184 Оса-fallback (ПЕРВЫМ — гейт #401)
+                    # #401: fail-fast primary ТОЛЬКО когда запас РЕАЛЬНО построен (R1 sol+terra MAJOR)
+                    _llm = react_loop.react_primary_llm(_prov, settings, has_fallback=(_fb is not None))
+                    from sreda.services.llm import get_chat_llm
+                    _chat_fb = get_chat_llm(provider=_prov, settings=settings)  # #401 default-retry chat/fact
                     # ack v3: «Секунду…» → правим ЕГО в ответ (PUT /messages, одно
                     # сообщение). Переиспользуем устойчивый _send_max_ack (defensive
                     # извлечение mid по нескольким формам ответа MAX — Codex/субагент MAJOR).
@@ -1248,7 +1257,8 @@ async def _process_approved_max_turn(
                         inbound_message_id=inbound_message_id,
                         channel="max",
                         provider_key=_prov,  # #175 учёт расхода + #184 «Оса»
-                        fallback_llm=react_loop.react_fallback_llm(_prov),  # #184 Оса-fallback
+                        fallback_llm=_fb,  # #184 Оса-fallback
+                        chat_fallback_llm=_chat_fb,  # #401 default-retry Mercury для chat/fact-фолбэка
                     )
                     trace.record(
                         "react_loop.replied", chars=len(_reply or ""), channel="max",
