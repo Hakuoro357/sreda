@@ -1023,7 +1023,6 @@ async def _process_approved_max_turn(
                         and onboarding.max_chat_id
                         and onboarding.tenant_id in settings.react_loop_enabled_tenants):
                     from sreda.runtime import react_loop
-                    from sreda.services.llm import get_chat_llm
                     # answer_callback ПЕРВЫМ (UX + ack идемпотентности кнопки)
                     _cb_id_r = (payload.get("callback") or {}).get("callback_id")
                     if _cb_id_r and settings.max_bot_token:
@@ -1033,7 +1032,7 @@ async def _process_approved_max_turn(
                         except Exception:  # noqa: BLE001
                             logger.warning("max react confirm ack failed", exc_info=True)
                     _prov_r = react_loop.react_provider(onboarding.tenant_id)  # #184 «Оса» per-tenant
-                    _llm_r = get_chat_llm(provider=_prov_r, settings=settings)
+                    _llm_r = react_loop.react_primary_llm(_prov_r, settings)  # #401: fail-fast primary на 5xx
                     # resume_only + expected_confirm_id: тап возобновляет ТОЛЬКО ту confirm-паузу,
                     # к которой кнопка привязана (id из callback_data). Устаревший/повторный/чужой
                     # тап → пустой ответ (no-op), свежий ход с «да/нет» НЕ стартуем (R3 Codex A/B).
@@ -1229,10 +1228,9 @@ async def _process_approved_max_turn(
                     and onboarding.tenant_id in settings.react_loop_enabled_tenants
                 ):
                     from sreda.runtime import react_loop
-                    from sreda.services.llm import get_chat_llm
 
                     _prov = react_loop.react_provider(onboarding.tenant_id)  # #184 «Оса» per-tenant
-                    _llm = get_chat_llm(provider=_prov, settings=settings)
+                    _llm = react_loop.react_primary_llm(_prov, settings)  # #401: fail-fast primary на 5xx
                     # ack v3: «Секунду…» → правим ЕГО в ответ (PUT /messages, одно
                     # сообщение). Переиспользуем устойчивый _send_max_ack (defensive
                     # извлечение mid по нескольким формам ответа MAX — Codex/субагент MAJOR).

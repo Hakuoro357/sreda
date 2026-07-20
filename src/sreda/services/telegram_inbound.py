@@ -349,7 +349,6 @@ async def _process_approved_turn_locked(
                 and not onboarding.is_new_user
                 and onboarding.tenant_id in get_settings().react_loop_enabled_tenants):
             from sreda.runtime import react_loop
-            from sreda.services.llm import get_chat_llm
             _cb_id = str(_cb.get("id") or "")
             if _cb_id:
                 try:
@@ -358,7 +357,7 @@ async def _process_approved_turn_locked(
                     pass
             _s2 = get_settings()
             _prov2 = react_loop.react_provider(onboarding.tenant_id)  # #184 «Оса» per-tenant
-            _llm2 = get_chat_llm(provider=_prov2, settings=_s2)
+            _llm2 = react_loop.react_primary_llm(_prov2, _s2)  # #401: fail-fast primary на 5xx
             # resume_only + expected_confirm_id: тап возобновляет ТОЛЬКО ту confirm-паузу,
             # к которой кнопка была привязана (id из callback_data). Устаревший/повторный/
             # чужой тап → пустой ответ (no-op), свежий ход не стартуем (R3 Codex MAJOR A/B).
@@ -564,11 +563,10 @@ async def _process_approved_turn_locked(
                             )
                             return
                 from sreda.runtime import react_loop
-                from sreda.services.llm import get_chat_llm
 
                 _s = get_settings()
                 _prov = react_loop.react_provider(onboarding.tenant_id)  # #184 «Оса» per-tenant
-                _llm = get_chat_llm(provider=_prov, settings=_s)
+                _llm = react_loop.react_primary_llm(_prov, _s)  # #401: fail-fast primary на 5xx
                 # ack v3 + #252: «Минутку…» (для голоса уже послан до расшифровки —
                 # переиспользуем _early_ack_mid), правим его ПО ЭТАПАМ пока идёт ход
                 # (_drive_ack_progress), в конце редактируем в финальный ответ (одно

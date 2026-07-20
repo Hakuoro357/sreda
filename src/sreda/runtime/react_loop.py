@@ -500,24 +500,58 @@ def react_provider(tenant_id: str) -> str:
 _FALLBACK_PROVIDER_KEY = "groq-gpt-oss-120b"  # #184: Оса @ Groq — запас Фредди в ReAct
 
 
+def _react_fallback_available(primary_provider: str = "", settings: Any = None) -> bool:
+    """#401/#184: доступен ли запас (Оса) для данного primary — ЕДИНЫЙ гейт для двух решений,
+    чтобы они НЕ разъехались: (1) `react_fallback_llm` — строить ли Осу; (2) `react_primary_llm`
+    — включать ли fail-fast primary на 5xx (max_retries=0). True ⇔ флаг SREDA_REACT_OSA_FALLBACK
+    ВКЛ И primary НЕ сам Groq/Оса (incl. `-low`) — иначе Groq+Groq = повтор того же сбоя + двойной
+    расход. Читает settings (снимок хода или свежий). Наружу исключения НЕ гасит (вызывающий сам
+    решает fail-soft): react_fallback_llm → None, react_primary_llm → дефолтный retry."""
+    from sreda.config.settings import get_settings
+    from sreda.services.llm import _GROQ_MODEL_BY_PROVIDER
+    s = settings or get_settings()
+    if not s.react_osa_fallback:
+        return False
+    return primary_provider not in _GROQ_MODEL_BY_PROVIDER
+
+
+def react_primary_llm(provider: str = "", settings: Any = None) -> Any:
+    """#401: основной ReAct-LLM (Фредди/Mercury) с fail-fast на серверную ошибку.
+
+    Инцидент 20.07: openai-клиент primary по умолчанию ретраит 5xx (`max_retries=2`, эксп.
+    бэкофф) ВНУТРИ одного `invoke` → на медленно-500-ящем Mercury накопилось ~40с ПОД wall-clock
+    60с перед фолбэком на Осу (которая сама отвечает 3-5с). Когда запас (Оса) ДОСТУПЕН
+    (`_react_fallback_available`), строим primary с `max_retries=0`: серверная ошибка/сетевой сбой
+    primary НЕ ретраит сам себя, а СРАЗУ поднимает исключение → ручной try/except в chat-узле
+    уводит ход в фолбэк немедленно.
+
+    Без запаса (флаг OFF / primary уже Оса) `max_retries` НЕ трогаем — дефолтный клиентский retry
+    остаётся последним рубежом (сетевой блип ЕДИНСТВЕННОГО провайдера ретраить стоит: другого нет).
+    Гейт best-effort: сбой чтения settings → дефолтный retry (безопасная сторона)."""
+    from sreda.services.llm import get_chat_llm
+    _kw: dict = {}
+    try:
+        if _react_fallback_available(provider, settings):
+            _kw["max_retries"] = 0  # #401: 5xx primary не ретраим — сразу фолбэк (запас есть)
+    except Exception:  # noqa: BLE001 — гейт best-effort; сомнение → дефолтный retry клиента
+        logger.warning("react_loop: primary fail-fast gate failed → default retry", exc_info=True)
+    return get_chat_llm(provider=provider, settings=settings, **_kw)
+
+
 def react_fallback_llm(primary_provider: str = "") -> Any:
     """#184: запасной LLM для ReAct — Оса (gpt-oss-120b @ Groq) при сбое primary (Фредди/Mercury).
     Включён флагом SREDA_REACT_OSA_FALLBACK. None → без запаса.
 
     Защиты:
     - R1: если effective primary УЖЕ Оса (SREDA_REACT_OSA_TENANTS) — само-fallback не нужен
-      (Groq+Groq = повтор того же сбоя + двойной расход) → None;
-    - R3 (MiMo MAJOR): ВЕСЬ body guarded (импорт + membership + build) — функция зовётся как
-      АРГУМENT до входа в handle_turn-guard, поэтому НИКОГДА не должна поднимать исключение;
-      любой сбой (импорт/мисконфиг Groq) → None (ReAct идёт без запаса, не падает)."""
+      (Groq+Groq = повтор того же сбоя + двойной расход) → None. Гейт (флаг + not-Groq) вынесен
+      в `_react_fallback_available` — общий с #401 `react_primary_llm`, чтобы решения не разошлись;
+    - R3 (MiMo MAJOR): ВЕСЬ body guarded (импорт + гейт + build) — функция зовётся как АРГУМЕНТ
+      до входа в handle_turn-guard, поэтому НИКОГДА не должна поднимать исключение; любой сбой
+      (импорт/мисконфиг Groq/чтение флага) → None (ReAct идёт без запаса, не падает)."""
     try:
-        from sreda.config.settings import get_settings
-        from sreda.services.llm import _GROQ_MODEL_BY_PROVIDER, get_chat_llm
-        if not get_settings().react_osa_fallback:
-            return None
-        # R2 MINOR (Codex high): любой Groq/Оса primary (incl. groq-gpt-oss-120b-low) → запас не
-        # нужен (Groq+Groq = повтор сбоя + двойной расход). Членство в groq-карте.
-        if primary_provider in _GROQ_MODEL_BY_PROVIDER:
+        from sreda.services.llm import get_chat_llm
+        if not _react_fallback_available(primary_provider):
             return None
         return get_chat_llm(provider=_FALLBACK_PROVIDER_KEY)
     except Exception:  # noqa: BLE001 — fallback недоступен (импорт/мисконфиг) → без запаса
@@ -2291,7 +2325,9 @@ def _sgr_structured_step(*, bound: list, allowed_read: Any, allowed_write: Any,
     (WIRE_SHAPE_BY_PROVIDER[...], в т.ч. на фолбэке — Opus Ф1 MINOR#3)."""
     out: dict = {"resp": None, "sgr": None, "latency_ms": 0,
                  "provider": None, "model": None, "usage_recorded": False,
-                 "fallback_fired": False, "primary_error": ""}
+                 "fallback_fired": False, "primary_error": "",
+                 # #401: под-тайминги structured-шага (раздельно primary / фолбэк)
+                 "primary_latency_ms": None, "fallback_latency_ms": None}
     stage = "slice_error"
     try:
         reason = _sgr_gate_reason(
@@ -2330,7 +2366,9 @@ def _sgr_structured_step(*, bound: list, allowed_read: Any, allowed_write: Any,
             raw = invoke_with_per_call_timeout(
                 llm.bind(response_format=_rf), sgr_msgs,
                 timeout_seconds=timeout_s, provider=provider_key)
+            out["primary_latency_ms"] = int((_time.perf_counter() - _t0) * 1000)  # #401
         except Exception as _pe:  # noqa: BLE001 — сетевой сбой/таймаут primary → structured-Оса (§5)
+            out["primary_latency_ms"] = int((_time.perf_counter() - _t0) * 1000)  # #401: попытка primary до сбоя
             fb_shape = _sgr.WIRE_SHAPE_BY_PROVIDER.get(fallback_provider_key or "")
             if fallback_llm is None or not fb_shape:
                 raise
@@ -2342,9 +2380,11 @@ def _sgr_structured_step(*, bound: list, allowed_read: Any, allowed_write: Any,
             _rf_fb = {"type": "json_schema",
                       "json_schema": {"name": "sgr_step", "strict": True,
                                       "schema": _sgr.build_wire_schema(sgr_tools, fb_shape)}}
+            _tfb = _time.perf_counter()  # #401: вызов structured-резерва — отдельным таймингом
             raw = invoke_with_per_call_timeout(
                 fallback_llm.bind(response_format=_rf_fb), sgr_msgs,
                 timeout_seconds=timeout_s, provider=fallback_provider_key)
+            out["fallback_latency_ms"] = int((_time.perf_counter() - _tfb) * 1000)  # #401
             used_provider, used_model = fallback_provider_key, fallback_model_name
         out["latency_ms"] = int((_time.perf_counter() - _t0) * 1000)
         # per-attempt учёт завершённой structured-попытки (guarded — учёт не валит ход)
@@ -3528,6 +3568,11 @@ def _build_graph(llm: Any, all_tools: list, *,
         # поток отброшен обёрткой). Идентичность+ошибку primary кладём в наблюдательный трейс (#192),
         # чтобы дашборд стоимости НЕ выглядел так, будто primary не вызывался/был бесплатным.
         _primary_provider, _primary_model, _primary_error = "", "", ""
+        # #401: под-тайминги вызова — раздельно попытка primary / вызов резерва (наблюдаемость
+        # под #396; один агрегат latency_ms не давал разложить инцидент 20.07 «primary-ретраи vs
+        # фолбэк»). Инициализация ДО развилок: финальный llm_calls-дикт читает их на всех ветках
+        # (chat/fact, task, SGR). None → поле опускается (OFF-трейс и happy-path без резерва чисты).
+        _primary_latency_ms, _fallback_latency_ms = None, None
         # #383 Ф2: состояние SGR-шага этого прохода (инициализация ДО интент-развилки —
         # финальный учёт/трейс читают их на обеих ветках; chat/fact SGR не касается).
         _sgr_field, _sgr_done, _sgr_usage_done = None, False, False
@@ -3555,13 +3600,17 @@ def _build_graph(llm: Any, all_tools: list, *,
                 resp = invoke_with_per_call_timeout(
                     _primary.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s,
                     provider=_used_provider)  # #343: per-provider breaker keying
+                _primary_latency_ms = int((_time.perf_counter() - _t0) * 1000)  # #401
             except Exception as _e:  # noqa: BLE001 — сбой/таймаут deepseek → fallback Фредди web-only
+                _primary_latency_ms = int((_time.perf_counter() - _t0) * 1000)  # #401: попытка primary до сбоя
                 logger.warning("react_loop: chat/fact primary (%s) сбой → fallback Фредди web-only",
                                type(_e).__name__, exc_info=True)
                 _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
+                _tfb = _time.perf_counter()  # #401: вызов резерва — отдельным таймингом
                 resp = invoke_with_per_call_timeout(  # тот же web-only bound, НЕ task; #256: тоже короткий
                     llm.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s,
                     provider=provider_key)  # #343: fallback Фредди → СВОЙ breaker-bucket, не primary
+                _fallback_latency_ms = int((_time.perf_counter() - _tfb) * 1000)  # #401
                 _used_provider, _used_model, _fallback_fired = provider_key, _model_name, True
             _latency_ms = int((_time.perf_counter() - _t0) * 1000)
         else:
@@ -3765,6 +3814,9 @@ def _build_graph(llm: Any, all_tools: list, *,
                 if _sgr_out["resp"] is not None:
                     resp = _sgr_out["resp"]
                     _latency_ms = _sgr_out["latency_ms"]
+                    # #401: SGR-шаг несёт свои под-тайминги primary/fallback (тот же паттерн)
+                    _primary_latency_ms = _sgr_out.get("primary_latency_ms")
+                    _fallback_latency_ms = _sgr_out.get("fallback_latency_ms")
                     _used_provider, _used_model = _sgr_out["provider"], _sgr_out["model"]
                     _sgr_done, _sgr_usage_done = True, bool(_sgr_out["usage_recorded"])
             # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
@@ -3788,13 +3840,19 @@ def _build_graph(llm: Any, all_tools: list, *,
                         resp = invoke_with_per_call_timeout(
                             _bound_primary, _msgs, timeout_seconds=_react_timeout_s,
                             provider=_used_provider)  # #343: per-provider breaker keying
+                        _primary_latency_ms = int((_time.perf_counter() - _t0) * 1000)  # #401
                     except Exception as _e:  # noqa: BLE001 — INVOKE primary упал/завис (сеть/5xx/таймаут) → запас
+                        # #401: попытка primary до сбоя — отдельным таймингом (на 5xx с fail-fast
+                        # клиентом это ~время одного round-trip, а не ~40с ретраев, как в инциденте 20.07).
+                        _primary_latency_ms = int((_time.perf_counter() - _t0) * 1000)
                         logger.warning("react_loop: primary LLM invoke сбой (%s) → fallback Оса",
                                        type(_e).__name__, exc_info=True)
                         _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
+                        _tfb = _time.perf_counter()  # #401: вызов резерва — отдельным таймингом
                         resp = invoke_with_per_call_timeout(
                             fallback_llm.bind_tools(bound), _msgs, timeout_seconds=_react_timeout_s,
                             provider=_FALLBACK_PROVIDER_KEY)  # #343: Оса → СВОЙ breaker-bucket
+                        _fallback_latency_ms = int((_time.perf_counter() - _tfb) * 1000)  # #401
                         _used_provider, _used_model = _FALLBACK_PROVIDER_KEY, _fallback_model_name
                         _fallback_fired = True
                 else:
@@ -3803,6 +3861,7 @@ def _build_graph(llm: Any, all_tools: list, *,
                     resp = invoke_with_per_call_timeout(
                         _bound_primary, _msgs, timeout_seconds=_react_timeout_s,
                         provider=_used_provider)  # #343: per-provider breaker keying
+                    _primary_latency_ms = int((_time.perf_counter() - _t0) * 1000)  # #401
                 _latency_ms = int((_time.perf_counter() - _t0) * 1000)
         # #175: учёт расхода LLM (деньги/#150) — по КАЖДОМУ вызову узла. Полностью guarded
         # (извлечение+запись): любой сбой учёта НЕ должен ронять ход пользователя.
@@ -3833,6 +3892,10 @@ def _build_graph(llm: Any, all_tools: list, *,
                 "provider_key": _used_provider, "model": _used_model,
                 "latency_ms": _latency_ms, "retries": (1 if _fallback_fired else 0),
                 "fallback_fired": _fallback_fired,
+                # #401: под-тайминги — раздельно попытка primary / вызов резерва (#396). latency_ms
+                # остаётся ИТОГОМ (back-compat). None → поле опускается (OFF/happy-path без резерва).
+                **({"primary_latency_ms": _primary_latency_ms} if _primary_latency_ms is not None else {}),
+                **({"fallback_latency_ms": _fallback_latency_ms} if _fallback_latency_ms is not None else {}),
                 "cache_read": _extract_cache_read(resp),  # #230 Срез 0a: наблюдаемость prompt-кеша (не деньги)
                 # #197 Слой 4: наблюдаемость роутинга — для отладки мисклассификации на проде.
                 "intent": eff or "task",
