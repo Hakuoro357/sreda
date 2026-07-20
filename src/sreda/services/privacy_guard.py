@@ -234,15 +234,17 @@ def _replace_url(match: re.Match[str], entities: list[SensitiveEntity]) -> str:
 # легитимные URL («design», «monkey», «keyboard») — over-redaction на
 # разговорном hot-path деградировал контент, уходящий в LLM.
 #
-# 2026-07-18 (R1 C5): compound-маркеры «apikey»/«secretkey» — слитные и
-# camelCase сегменты пути (``/apikey/<SECRET>``, ``/secretKey/<SECRET>``)
-# не режутся токенизатором на «api»+«key» и раньше обходили redaction.
-# Семантика прежняя — равенство токена, не подстрока: «monkey»/«keyboard»
-# целиком не равны маркерам и по-прежнему НЕ триггерятся.
+# 2026-07-18 (R1 C5): compound-маркеры — слитные и camelCase сегменты пути
+# (``/apikey/<SECRET>``, ``/secretKey/<SECRET>``, ``/accessToken/<SECRET>``)
+# не режутся токенизатором на «api»+«key»/«access»+«token» и раньше обходили
+# redaction. Все — ТОЧНЫЕ токены (равенство, не подстрока): «monkey»/«keyboard»
+# целиком не равны маркерам и по-прежнему НЕ триггерятся (ни один из compound'ов
+# не является обычным словом-сегментом пути → false-positive'ов не даёт).
 _SECRET_URL_MARKERS: Final = frozenset(
     {
         "token", "key", "secret", "sig", "signature", "password", "pwd",
-        "apikey", "secretkey",
+        "apikey", "secretkey", "apitoken", "accesstoken", "authtoken",
+        "refreshtoken", "privatekey", "accesskey", "clientsecret",
     }
 )
 _URL_TOKEN_SPLIT_RE: Final = re.compile(r"[^a-z0-9]+")

@@ -88,12 +88,20 @@ def _audit_admin_view(
         "ua": (request.headers.get("user-agent") or "")[:120],
     }
     md.update(metadata)
+    # 2026-07-18 (R1 M20): audit_event по умолчанию commit=False (только
+    # add+flush, транзакцией владеет caller). Admin GET-view'ы читают под
+    # privileged_session, которая на выходе делает session.close() БЕЗ commit
+    # → аудит-запись чтения PII молча откатывалась (нет compliance-следа).
+    # Здесь запись — единственный write запроса, поэтому commit=True (caller
+    # владеет сессией и хочет немедленную durability; роль/RLS от commit не
+    # страдают — она задана коннектом privileged-движка, не SET LOCAL).
     audit_event(
         session,
         actor_type="admin",
         actor_id=actor,
         action=action,
         metadata=md,
+        commit=True,
     )
 
 
