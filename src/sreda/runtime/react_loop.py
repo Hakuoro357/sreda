@@ -4491,12 +4491,25 @@ def _redact_identity(text: str) -> str:
     return text
 
 
+# #393 R4 (Codex sol R4): okv2-конверт (машинный wire-формат #115) НИКОГДА не должен утечь юзеру.
+# Страховка #393 подменяет грязный grounded-ответ чистым fallback, НО когда акт неназемляем (латиница/
+# id в имени → fail-closed drop) fallback'а нет и okv2 из ответа модели уходил юзеру. Чистим в _postformat
+# (универсально, любой путь ответа). + длинное тире → дефис (правило «без «—» в отправляемых никогда»).
+_OKV2_LEAK_RE = re.compile(r"\(?\s*okv2:[a-zа-яё_]*(?::\{[^}]*\})?[^\s)]*\s*\)?", re.IGNORECASE)
+
+
+def _strip_tech_leak(text: str) -> str:
+    t = _OKV2_LEAK_RE.sub("", text or "")
+    t = re.sub(r"[—–―]", "-", t)          # длинное/среднее тире → обычный дефис
+    return re.sub(r"[ \t]{2,}", " ", t)
+
+
 def _postformat(text: str) -> str:
-    """Единый пост-формат ответа Фредди: снять id/ref → снять markdown → разбить
-    шаги/списки. Порядок важен: markdown снимаем ДО разбивки шагов.
+    """Единый пост-формат ответа Фредди: снять машинную утечку (okv2/тире) → снять id/ref → снять
+    markdown → разбить шаги/списки. Порядок важен: markdown снимаем ДО разбивки шагов.
     #216-гард `_redact_identity` ОТКЛЮЧЁН (ложные срабатывания на бренд в контенте) —
     от само-раскрытия защищает промпт-правило <identity>."""
-    return _format_lists(_strip_md(_scrub_ids(text)))
+    return _format_lists(_strip_md(_scrub_ids(_strip_tech_leak(text))))
 
 
 def _interrupt_age_seconds(created_at: Any) -> float:
@@ -5487,8 +5500,9 @@ async def handle_turn(
         # (grounding_note в chat) уже помогла голосу назвать результат — здесь ловим оставшиеся
         # промахи. PATH-AGNOSTIC (НЕ гейтится _unified_execute_for: issue P0 «все тенанты», репро на
         # легаси). Success-детект по артефакту (result_kind ok + ok:/okv2: префикс) → confirm-ОТКАЗ
-        # («Хорошо, не трогаю.») сюда НЕ попадает; _declined_confirm-текст (unified) не трогаем (elif).
-        elif _post_tool_report_enabled():
+        # («Хорошо, не трогаю.») в collect НЕ попадает. НЕ elif (Codex sol R4): при _declined_confirm
+        # смешанный батч «отказ confirm-действия + ДРУГОЙ успешный write» иначе терял бы отчёт об успехе.
+        if _post_tool_report_enabled():
             try:
                 from sreda.runtime.react_result_report import (
                     collect_successful_writes,
@@ -5499,12 +5513,16 @@ async def handle_turn(
                 _writes393 = collect_successful_writes(result.get("messages") or [])
                 if _writes393:
                     _fb393 = fallback_reply(_writes393)
-                    # подмена ЧИСТОЙ страховкой, если: (а) реплика НЕ называет результат ИЛИ (б) называет,
-                    # но несёт машинную утечку (okv2/id=/ref=/«—»/hex-id — Codex terra R3: grounded-ответ с
-                    # техследом проходил детектор, _postformat не всё чистит). Только когда страховка есть.
-                    if _fb393 and (not reply_grounds_result(text, _writes393)
-                                   or reply_has_tech_leak(text)):
-                        text = _fb393
+                    if _fb393:
+                        if _declined_confirm:
+                            # отказ + ДРУГИЕ успешные write (declined-акт коллектор уже исключил): к
+                            # детерминированному тексту отказа ДОПИСЫВАЕМ отчёт об успехах (sol R4).
+                            text = f"{text} {_fb393}"
+                        elif (not reply_grounds_result(text, _writes393)
+                              or reply_has_tech_leak(text)):
+                            # подмена ЧИСТОЙ страховкой, если реплика НЕ называет результат ИЛИ несёт
+                            # машинную утечку (okv2/id=/ref=/«—» — Codex terra R3).
+                            text = _fb393
             except Exception:  # noqa: BLE001 — заземление best-effort, ход пользователя не роняем
                 logger.warning("react_loop: post-tool report (#393) failed", exc_info=True)
         reply = _Reply(_postformat(text) or "Готово.")
