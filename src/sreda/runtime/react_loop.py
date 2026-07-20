@@ -2030,7 +2030,8 @@ def _maybe_alert_degraded_turn(
                   f"тенант: {tenant_id} · turn_key: {turn_key}\n"
                   f"вопрос: {_q}\nответ: {_a}"),
             dedupe_key=f"degraded:{reason}:{tenant_id}",
-            both_channels=True,  # #294: деградации — в оба канала (MAX + TG), не fallback
+            # #395: дуал TG+MAX — теперь ДЕФОЛТ доставки admin_alerts (ранее явный
+            # both_channels=True #294; флаг убран, поведение сохранено — оба канала).
         )
     except Exception as _aexc:  # noqa: BLE001 — алерт НЕ валит ход
         # #366: exc_info=True здесь ОСОБО опасен — alert-body несёт user_text[:160]/

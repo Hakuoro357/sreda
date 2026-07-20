@@ -49,7 +49,7 @@ def alert_spy(monkeypatch):
     """
     calls: list[dict] = []
 
-    def _spy(severity, title, body, *, dedupe_key=None, extra_context=None, both_channels=False):
+    def _spy(severity, title, body, *, dedupe_key=None, extra_context=None):
         assert severity in ("P0", "P1", "P2", "INFO")
         calls.append({"severity": severity, "title": title, "body": body,
                       "dedupe_key": dedupe_key})
