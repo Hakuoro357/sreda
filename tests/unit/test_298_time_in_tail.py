@@ -185,6 +185,10 @@ async def test_time_before_directives_247(db_session, monkeypatch):
         thread_id="298-dir-1", llm=stub, user_text="покажи дела",
         inbound_message_id="298-dir-1-msg", channel="react",
     )
+    # #356: гейт свежести добавляет сценарию ФОРС-проход (стаб не вызвал чтение);
+    # контракт «последняя инструкция несёт время» держится и там: директива идёт
+    # отдельным trailing-user С якорем времени (R1 субагент CRITICAL - иначе класс
+    # #298 возвращался на форс-проходе). Проверяем ПОСЛЕДНИЙ батч как и раньше.
     batch = stub.seen_messages[-1]
     last_human = [m for m in batch if isinstance(m, HumanMessage)][-1]
     content = str(last_human.content)

@@ -130,7 +130,9 @@ def test_get_login_sets_cookies_and_renders(client, monkeypatch):
     resp = client.get("/admin/login", follow_redirects=False)
     assert resp.status_code == 200
     # deep-link with the public challenge_id (adm_ prefix), human_code shown.
-    assert "t.me/sreda01_bot?start=adm_" in resp.text
+    # #370: t.me выпал из DNS 2026-07-14 → admin-login deep-link на telegram.me.
+    assert "telegram.me/sreda01_bot?start=adm_" in resp.text
+    assert "//t.me/" not in resp.text
     # both login cookies set (Strict / HttpOnly).
     setcookies = resp.headers.get_list("set-cookie")
     joined = " ".join(setcookies)

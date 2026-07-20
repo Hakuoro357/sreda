@@ -5,7 +5,7 @@
 **Related code:** `src/sreda/runtime/react_loop.py` (узел `chat`, `_build_graph` — потребление; меняется по многим причинам, freshness НЕ трекаем)
 **Tests:** `tests/unit/` — калибровка `_must_task` (`test_must_task_high_precision`), классификаторы интента/доменов, политика `compute_allowed_domains`
 **Status:** задеплоено. Флаг `SREDA_REACT_PREFLIGHT_ENABLED` ВКЛ на проде (2026-06-24); доменный роутер #221 — execute глобально. **С 2026-07-08 поверх конвейера на ВСЕХ тенантах работает ЕДИНЫЙ ПУТЬ #285 (`SREDA_REACT_UNIFIED_TENANTS=*`) — см. «Слой 3»: интент-сплит и #221-домены переопределяются единой политикой; слои 1-2 остаются подложкой и полным поведением при откате**
-**Verified-against:** `fc58e81` (сверено с кодом 2026-07-09; doc-sync на закрытии эпика #285)
+**Verified-against:** `bc200e3` (сверено с кодом 2026-07-16; doc-sync #376 слой-2 — калибровка `classify_checklist_query`: окно overview-фраз `{0,4}` («какие ещё у меня списки» → overview), write-основы `внеси|впиши|зафиксируй` → None; потребители — Срез B cross-check (#213) и сужение read-бинда #376 слой-2 в react_loop)
 **Флаги:** `SREDA_REACT_PREFLIGHT_ENABLED` (default `False`); `SREDA_REACT_PREFLIGHT_CHAT_PROVIDER` (default `openrouter-deepseek` — это и есть прод; история: #224 переводил на `gemini-2.5-flash-lite` ради скорости, #257 вернул на `openrouter-deepseek` — gemini-lite зависал); `SREDA_CHECKLIST_UNIFIED` (default `False`) меняет текст checklist-директивы (#213, см. `route_domains`); **`SREDA_REACT_UNIFIED_PATH_ENABLED` + `SREDA_REACT_UNIFIED_TENANTS` (#285)** — единый путь: флаг ON + тенант в списке (`*` = все) → слой 3 переопределяет слои 1-2; флаг OFF или список пуст → byte-identical слоям 1-2
 
 ## Зачем это существует
@@ -76,7 +76,7 @@ flowchart TD
 
 - **Вход:** текст сообщения.
 - **Логика:** токены → разделы по онтологии (`_ontology`, слияние `FAMILY_ROOTS` + `_SEC_*` #215). Домены: `reminders, tasks, checklists, shopping, menu, recipes, household, memory, web`. Longest-match фразы («список покупок» → shopping, «список дел» → checklists); action-домены (глагол: напомни/запомни) приоритетнее content; составное (compound) — только при союзе МЕЖДУ клаузами; направленное кросс-намерение «X из Y» (единственное — «покупки **из** меню»). С #270: creation-фразы категории/раздела памяти (`_MEMORY_CREATION_PHRASES`: «заведи категорию X», «создай раздел памяти», …) → детерминированно `memory`, но ТОЛЬКО если в клаузе нет контент-домена («создай раздел покупок» остаётся shopping); голое «категория» в memory НЕ роутится (общее с shopping).
-- **Выход — `RouteResult`:** `primary_domain`, `secondary_domains`, `suppressed_domains`, `compound_by_connector`, `intent_hint` (`"task"` только от task-сигнала #197/#215, иначе `None`), `intent_only`, `active_families` (ленивые семьи на предзагрузку), `directive` (подсказка-промпт раздела; для `checklists` текст флаг-условный — при `SREDA_CHECKLIST_UNIFIED=ON` велит `get_checklist(mode,name)` вместо `list_checklists`, #213), `all_domains`, `cross_intent`.
+- **Выход — `RouteResult`:** `primary_domain`, `secondary_domains`, `suppressed_domains`, `compound_by_connector`, `intent_hint` (`"task"` только от task-сигнала #197/#215, иначе `None`), `intent_only`, `active_families` (ленивые семьи на предзагрузку), `directive` (подсказка-промпт раздела; для `checklists` текст флаг-условный: при `SREDA_CHECKLIST_UNIFIED=ON` велит `get_checklist(mode,name)`, #213; при OFF #374-текст РАЗЛИЧАЕТ конкретный список по имени → `show_checklist` от «раздел без имени / какие списки» → `list_checklists`, + оговорка «покупки отдельно → `list_shopping`, не чек-лист». `shopping` собственной директивы НЕ имеет — `None` (#374 R2 пробовал shopping-директиву, откатил: глушила write/compound/cross покупок)), `all_domains`, `cross_intent`.
 
 ### `classify_domains(recent_messages, user_text, freddie_llm, timeout=4.0, raw_sink=None) -> DomainClassResult` (LLM-фолбэк на Фредди)
 
@@ -114,10 +114,19 @@ flowchart TD
   state-каналы `router_allowed_*` (переиспользует #221-машинерию `_apply_domain_policy`);
 - **write двухъярусный (B2):** сигнал+продуктивный домен → инструмент напрямую; БЕЗ сигнала → все write-инструменты
   биндятся КАНДИДАТАМИ под универсальный confirm на dispatch (`_apply_unified_policy` → `_generic_confirm_wrap`;
-  превью без чтения БД; инвариант «нет молчаливой записи»);
+  превью без чтения БД; инвариант «нет молчаливой записи»). Исключение #389: `add_shopping_items`
+  (`_UNIFIED_AUTOEXEC_WRITE_TOOLS`, import-time гвард реестра) биндится прямым, если роутер НЕ дал
+  КОНКУРИРУЮЩЕГО write-домена (aw ⊆ доменов инструмента; «добавь в список дел купить молоко» →
+  aw={checklists} → кандидат+confirm, примиряющий расхождение «роутер vs модель») — прод-трассы показали
+  чистое трение confirm'а на продолжении диктовки покупок («1 литр молока», «ещё добавь соль» → оба yes);
+  аддитивно/видимо/обратимо; фикс НЕ расширяет autoexec на деструктив (remove_*/clear_* — в общем
+  двухъярусном контуре, candidate-confirm при aw=∅ — пред-существующее поведение, не гарантия #389);
 - **промпт единый (B4):** task-персона + user-role хвост честности из ФАКТИЧЕСКОГО bound
   (`_unified_availability_directive`, #279-семантика: «под рукой в этом ходе», отмена → «сообщи и остановись»,
-  заметку не пересказывать; тон — «ответь ПО СУЩЕСТВУ, опираясь на результаты»);
+  заметку не пересказывать; тон — «ответь ПО СУЩЕСТВУ, опираясь на результаты»). NB: хвост узла `chat` —
+  КОМБИНАЦИЯ per-turn директив (`_assemble_msgs`): `nudge` (guard) + availability + `_sec` (директива раздела)
+  + `_recur` (#333) + `_stale` (#stale) + `_ground393` (заземление реплики на результат, #393). Последняя —
+  PATH-AGNOSTIC (легаси И unified), см. «Связанное»;
 - **директива раздела** (`route_domains(...).directive`) на unified гейтится по фактически allowed-доменам
   (не зовёт незабинженный тул — иначе петля domain_blocked; + loop-guard `_domain_blocked_count`);
 - **паузы (канарейка-фиксы):** новый запрос во время ЖИВОЙ паузы → свежий ход (`_should_redirect_on_pause`:
@@ -145,4 +154,13 @@ flowchart TD
 - Интент: #197. Домены: #215 (карта «слово→раздел»), #221 (ontology-роутер + write-gate), #263 (write при уверенном разделе), #270 (создание категории памяти голосом), #213 (единый `get_checklist` — флаг-условная директива).
 - Выбор рассуждающей модели: #173 (eval — честность + скорость), #224 (chat/fact → gemini-2.5-flash-lite), #257 (откат на openrouter-deepseek — gemini-lite зависал). Персона/honesty chat/fact: #242/#121, #251, #279.
 - Наблюдаемость: #192 (трейс `classifier_raw`).
+- Заземление реплики на результат: **#393** (класс #376 «сделала, но сказала не то»), решение владельца
+  **вариант C**. PATH-AGNOSTIC (легаси И unified, гейт `react_post_tool_report_enabled`, НЕ `_unified_execute_for`):
+  (1) `_ground393` — хвост-директива узла `chat` со сводкой ТОЛЬКО СЕРВЕРНЫХ ФАКТОВ результата (статус/
+  количество/тип, БЕЗ сырых имён — так ни одна юзер-строка не входит в инструкции модели, инъекц-surface закрыт
+  структурно); имена голос называет из tool-результата в истории (data-role); (2) страховка в финализации
+  `handle_turn` — если реплика не называет результат ИЛИ несёт машинную утечку (okv2/id), детерминированная
+  заземлённая подмена (имена — из РЕЗУЛЬТАТА инструмента, только в ВЫВОДЕ юзеру; неотображаемое имя → грациозная
+  деградация к фактам). Ядро — `react_result_report.py` (allowlist заземляемых действий + проверка эффекта +
+  дисплей-гигиена имён + токенный детектор полноты; прецедент детерминированной подмены — `_declined_reply` #321).
 - Таксономия семей инструментов: [tool-family-taxonomy.md](./tool-family-taxonomy.md).

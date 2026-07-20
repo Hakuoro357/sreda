@@ -888,10 +888,12 @@ async def _handle_reminder_callback(
     original message to remove the keyboard (so the user can't tap
     twice) and answers the callback with a short toast.
     """
-    from sreda.db.models.housewife import FamilyReminder
     from sreda.services.housewife_reminders import (
+        REMINDER_CALLBACK_BUSY_TEXT,
         SNOOZE_DEFAULT_MINUTES,
         HousewifeReminderService,
+        ReminderLockTimeout,
+        read_reminder_for_callback,
     )
 
     action, _, reminder_id = data.partition(":")
@@ -902,7 +904,30 @@ async def _handle_reminder_callback(
     message_id = message.get("message_id") if isinstance(message, dict) else None
     original_text = (message.get("text") or "") if isinstance(message, dict) else ""
 
-    reminder = session.get(FamilyReminder, reminder_id) if reminder_id else None
+    # #344 F5 (Opus-адверсар + Codex sol, cross-process ack/snooze гонка): этот
+    # обработчик живёт в UVICORN-процессе, а reminder-fire-цикл — в JOB_RUNNER.
+    # ``read_reminder_for_callback`` читает строку под ``FOR UPDATE`` (PG-only) с
+    # ОГРАНИЧЕННЫМ ``lock_timeout``: держим лок до ``session.commit()`` ниже, но не
+    # стопорим весь event-loop на неограниченное ожидание держателя-воркера. Лок
+    # нужен не «прочитать посвежее»: ``acknowledge``/``snooze`` — read-modify-write,
+    # SQLAlchemy кладёт в UPDATE лишь изменившиеся поля; без лока snooze прочитал бы
+    # ``pending`` ДО воркерского ``fired`` → partial-UPDATE (без ``status``) поверх
+    # ``fired`` → рассинхрон, snooze потерян. Под FOR UPDATE обработчик дожидается
+    # воркера и перечитывает свежий ``fired`` → ``fired→pending`` реально попадает в
+    # UPDATE. Сеть (answer/edit) — уже ПОСЛЕ commit.
+    try:
+        reminder = read_reminder_for_callback(session, reminder_id)
+    except ReminderLockTimeout:
+        # Строку сейчас держит reminder-воркер (fire-цикл). Не блокируем loop
+        # ожиданием — просим повторить; кнопки НЕ трогаем (юзер перетапнет).
+        if callback_id:
+            try:
+                await telegram_client.answer_callback_query(
+                    callback_id, text=REMINDER_CALLBACK_BUSY_TEXT
+                )
+            except TelegramDeliveryError:
+                pass
+        return
     if reminder is None:
         if callback_id:
             try:

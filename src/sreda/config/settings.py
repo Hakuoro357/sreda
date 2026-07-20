@@ -603,6 +603,29 @@ class Settings(BaseSettings):
     react_preflight_enabled: bool = Field(
         default=False, validation_alias="SREDA_REACT_PREFLIGHT_ENABLED"
     )
+    # #356: механический гейт свежести own-data (read-кюс без успешного чтения → один
+    # форс-проход «сначала прочитай»). Default ON = фикс живого инцидента активен с
+    # деплоя; OFF = kill-switch БЕЗ деплоя (R1 субагент: у greedy-кюса осознанные
+    # residual'ы - откат должен быть env'ом, g-065). Гейт дополнительно требует
+    # eff=="task" → при preflight OFF (rollback-путь) не исполняется вовсе
+    # (байт-идентичность отката не тронута).
+    # КОНТРАКТ ФЛАГА (R3 terra): выключает ТОЛЬКО механику (route/guard форс-проход).
+    # Промпт-канон _DATA_DISCIPLINE флагом НЕ гейтится: текст промпта - отдельный слой,
+    # его откат = деплой (как у любой промпт-правки); флаговать промпт = рвать кеш на
+    # переключении и плодить матрицу промпт-вариантов.
+    react_freshness_gate_enabled: bool = Field(
+        default=True, validation_alias="SREDA_REACT_FRESHNESS_GATE"
+    )
+    # #393: заземление финальной реплики на РЕЗУЛЬТАТ успешного мутирующего действия
+    # (класс #376 «сделала, но сказала не то»). ON (дефолт) = фикс активен: (1) grounding_note
+    # инжектится в контекст перед финальным проходом (голос озвучит имена тепло, #121);
+    # (2) страховка — если реплика всё равно не называет результат, подменяем детерминированной
+    # заземлённой репликой (fallback_reply) в финализации handle_turn. PATH-AGNOSTIC (легаси И
+    # unified, НЕ гейтится _unified_execute_for — issue P0 «все тенанты», репро на легаси).
+    # OFF = kill-switch БЕЗ деплоя (g-065): реплики снова полностью модель-сочинённые.
+    react_post_tool_report_enabled: bool = Field(
+        default=True, validation_alias="SREDA_REACT_POST_TOOL_REPORT"
+    )
     # #197: провайдер рассуждающей модели для chat/fact-пути (eval #173 → deepseek-v4-flash). Строится
     # через get_chat_llm(provider=...). Недоступен/мисконфиг → fail-open в task (Фредди), scope web-only.
     react_preflight_chat_provider: str = Field(
@@ -685,6 +708,27 @@ class Settings(BaseSettings):
     # ``*`` → все (Фаза F). Дизайн-решение: plans/285-phaseA-design.md, Решение 1.
     react_unified_tenants_raw: str | None = Field(
         default=None, validation_alias="SREDA_REACT_UNIFIED_TENANTS"
+    )
+    # #376: subtract-дизамбигуация неоднозначной read-кюс-группы умным классификатором
+    # (classify_domains на КАЖДОМ свежем task-ходе, спецификация владельца 2026-07-15).
+    # Флаг OFF (дефолт) → байт-в-байт текущее (classify только по #352-континуации);
+    # ON + тенант в списке → every-turn вызов + subtract + diff-нотификация владельцу;
+    # ``*`` → все. Канарейка: сперва тенант владельца.
+    domain_clf_disambig_enabled: bool = Field(
+        default=False, validation_alias="SREDA_DOMAIN_CLF_DISAMBIG"
+    )
+    domain_clf_disambig_tenants_raw: str | None = Field(
+        default=None, validation_alias="SREDA_DOMAIN_CLF_DISAMBIG_TENANTS"
+    )
+    # #383: SGR-шаг планировщика (схемное принуждение) для домена чеклистов.
+    # OFF (дефолт) → байт-в-байт текущий путь (react_sgr даже не импортируется);
+    # ON + тенант в списке + «чисто чеклистовый» unified-ход → structured-вызов
+    # планировщика (анкета + объединение sgr_tools). Канарейка: тенант владельца.
+    sgr_planner_enabled: bool = Field(
+        default=False, validation_alias="SREDA_SGR_PLANNER_ENABLED"
+    )
+    sgr_planner_tenants_raw: str | None = Field(
+        default=None, validation_alias="SREDA_SGR_PLANNER_TENANTS"
     )
     # #149 M5: tenants whose substituted reply text may be previewed in admin
     # alerts. Dedicated privacy allowlist — NOT planner_enabled_tenants (that's
@@ -1298,6 +1342,19 @@ class Settings(BaseSettings):
         Пусто (дефолт) → НИКОМУ execute (флаг ON = глобальный SHADOW); ``*`` → ВСЕ (Фаза F).
         В Фазе A ветки execute не существует — список задел на B."""
         return _parse_tenant_gate(self.react_unified_tenants_raw)
+
+    @property
+    def domain_clf_disambig_tenants(self) -> frozenset[str]:
+        """#376: тенанты every-turn дизамбигуации доменов (при включённом
+        domain_clf_disambig_enabled). Пусто (дефолт) → никому; ``*`` → все.
+        Канарейка: сперва тенант владельца."""
+        return _parse_tenant_gate(self.domain_clf_disambig_tenants_raw)
+
+    @property
+    def sgr_planner_tenants(self) -> frozenset[str]:
+        """#383: тенанты SGR-шага планировщика (при включённом sgr_planner_enabled).
+        Пусто (дефолт) → никому; ``*`` → все. Канарейка: тенант владельца."""
+        return _parse_tenant_gate(self.sgr_planner_tenants_raw)
 
     @property
     def admin_alert_preview_tenants(self) -> frozenset[str]:

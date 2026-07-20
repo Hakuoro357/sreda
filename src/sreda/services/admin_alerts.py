@@ -26,6 +26,10 @@ severity-based rate limits.
   severity rate-limit). **Use this для recurring error classes** (LLM
   fallback, tool errors, provider 5xx).
 
+#395 (2026-07-20): оба входа доставляют DUAL — Telegram основной (шлём первым) +
+MAX дубль (вторым), best-effort на канал, «доставлено» = долетело ≥1 канал.
+Разворачивает R-28 «MAX-primary → TG-fallback» (решение владельца).
+
 Both best-effort; exceptions swallowed.
 """
 
@@ -108,20 +112,20 @@ def _release_in_flight(dedupe_key: str) -> None:
 
 
 async def alert_admin_async(text: str) -> bool:
-    """Send a critical alert through admin channel (MAX primary → TG fallback).
+    """Send a service alert through admin channel — DUAL: Telegram primary + MAX duplicate.
 
-    R-28 amendment 2026-05-15 (Codex review MAJOR): этот legacy async helper
-    использовался callers'ами в ``main.py``/``embeddings.py``/``miniapp.py``/
-    ``max_subscription_health.py``/``outbox_delivery.py`` и ходил только в
-    Telegram. После переезда админ-канала на MAX надо чтобы и legacy path
-    использовал MAX-primary + TG-fallback — иначе при removed TG chat_id
-    эти alerts silently уходят в никуда.
+    #395 (2026-07-20): служебные алерты дублируются в ОБА канала — Telegram основной
+    (шлём ПЕРВЫМ), MAX дубль (ВТОРЫМ). Best-effort на канал: сбой/таймаут одного НЕ
+    мешает другому. Returns True если доставлено ХОТЯ БЫ в один канал. Разворачивает
+    R-28 (2026-05-15: MAX-primary → TG-fallback) — решение владельца #395.
 
-    Реализация: async wrapper'ит sync ``_post_max_sync`` / ``_post_telegram_sync``
-    через ``asyncio.to_thread`` (5s timeout each, total ≤10s в worst case).
-    Returns True если **любой** канал доставил.
+    Этот legacy async helper используют callers в ``main.py``/``embeddings.py``/
+    ``miniapp.py``/``max_subscription_health.py``/``outbox_delivery.py`` и #376-нотификация
+    расхождения доменов (``react_loop._dis376_send_alert``).
 
-    Text может быть многострочным; обрезается до 4000 chars (MAX/TG limit).
+    Реализация: делегирует общему sync-хелперу ``_deliver_dual_sync`` через ОДИН
+    ``asyncio.to_thread`` (оба канала в одном потоке, TG→MAX) — отмена корутины-awaiter'а
+    не расщепляет каналы (поток доводит оба). Text обрезается до 4000 chars (MAX/TG limit).
     """
     import asyncio
 
@@ -145,36 +149,27 @@ async def alert_admin_async(text: str) -> bool:
     if len(text) > 4000:
         text = text[:3990] + "\n…[truncated]"
 
-    # Try MAX first if configured.
-    if max_ok:
-        try:
-            ok = await asyncio.to_thread(
-                _post_max_sync, max_bot_token, max_chat_id, text,
-            )
-            if ok:
-                logger.info("alert_admin: delivered via MAX")
-                return True
-            logger.warning("alert_admin: MAX failed, falling back to Telegram")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("alert_admin: MAX exception: %s, fallback to TG", exc)
-
-    # Fallback (or primary if MAX unconfigured) — Telegram.
-    if tg_ok:
-        try:
-            ok = await asyncio.to_thread(
-                _post_telegram_sync, tg_bot_token, tg_chat_id, text,
-            )
-            if ok:
-                logger.info("alert_admin: delivered via Telegram")
-                return True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "alert_admin: Telegram exception (chat=%s): %s",
-                tg_chat_id, exc,
-            )
-
-    logger.warning("alert_admin: delivery failed across all channels")
-    return False
+    # #395 (R1 sol): дуал ОДНИМ to_thread через общий sync-helper — оба канала (TG→MAX)
+    # в одном потоке; отмена корутины-awaiter'а не расщепляет каналы (поток доводит оба).
+    # #395 (R2 sol/terra): внешний guard — сбой САМОГО to_thread (executor shutdown /
+    # отказ создать поток) НЕ должен пробиться в caller (best-effort контракт «exceptions
+    # swallowed»); CancelledError пробрасываем (кооперативная отмена не глотается).
+    try:
+        delivered, delivered_via = await asyncio.to_thread(
+            _deliver_dual_sync, text,
+            tg_bot_token=tg_bot_token, tg_chat_id=tg_chat_id,
+            max_bot_token=max_bot_token, max_chat_id=max_chat_id,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — best-effort: не роняем caller
+        logger.warning("alert_admin: delivery dispatch failed: %s", type(exc).__name__)
+        return False
+    if delivered:
+        logger.info("alert_admin: delivered via %s", delivered_via)
+    else:
+        logger.warning("alert_admin: delivery failed across all channels")
+    return delivered
 
 
 # =====================================================================
@@ -359,6 +354,46 @@ def _post_max_sync(bot_token: str, chat_id: str, text: str) -> bool:
         return False
 
 
+def _deliver_dual_sync(
+    text: str,
+    *,
+    tg_bot_token: str | None,
+    tg_chat_id: str | None,
+    max_bot_token: str | None,
+    max_chat_id: str | None,
+) -> tuple[bool, str | None]:
+    """#395: доставка служебного алерта в ОБА канала — Telegram основной (ПЕРВЫМ) +
+    MAX дубль (ВТОРЫМ), best-effort. ЕДИНЫЙ источник дуал-логики для обоих входов
+    (``alert_admin_async`` и ``_deliver_in_thread``) — чтобы порядок/семантика не
+    расходились (R1 sol). Сконфигурен один канал → уходит только туда.
+
+    Каждый канал в своём try/except: ``_post_*_sync`` и так глотают исключения → bool,
+    это двойная страховка (если будущая реализация бросит — сбой одного канала НЕ
+    мешает другому).
+
+    Returns ``(delivered, delivered_via)``: delivered=True если долетело ≥1 канал;
+    delivered_via — какие каналы сработали ("telegram" / "max" / "telegram+max" / None).
+
+    Синхронный: вызывается напрямую из daemon-потока (``_deliver_in_thread``) и из
+    ``alert_admin_async`` ОДНИМ ``asyncio.to_thread`` — тогда отмена корутины-awaiter'а
+    не расщепляет каналы (поток доводит оба).
+    """
+    _tg = False
+    _max = False
+    if tg_bot_token and tg_chat_id:
+        try:
+            _tg = _post_telegram_sync(tg_bot_token, tg_chat_id, text)
+        except Exception as exc:  # noqa: BLE001 — best-effort, второй канал не блокируем
+            logger.warning("admin_alerts: Telegram exception: %s", type(exc).__name__)
+    if max_bot_token and max_chat_id:
+        try:
+            _max = _post_max_sync(max_bot_token, max_chat_id, text)
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning("admin_alerts: MAX exception: %s", type(exc).__name__)
+    delivered_via = "+".join(c for c, s in (("telegram", _tg), ("max", _max)) if s) or None
+    return (_tg or _max), delivered_via
+
+
 def _deliver_in_thread(
     *,
     dedupe_key: str,
@@ -370,7 +405,6 @@ def _deliver_in_thread(
     tg_chat_id: str | None,
     max_bot_token: str | None,
     max_chat_id: str | None,
-    both_channels: bool = False,
 ) -> None:
     """Background-thread payload: dedup check + format + POST + mark.
 
@@ -378,17 +412,13 @@ def _deliver_in_thread(
     decouples 5s HTTP latency from caller's request path). Exceptions
     swallowed via _post_*_sync/dedup fail-open. Caller never blocks.
 
-    R-28 amendment 2026-05-15: **MAX primary + TG fallback**. Boris
-    directive «пусть прилетает в макс а не в телегу». Если MAX configured
-    (max_bot_token + max_chat_id) — пробуем MAX первым; на любой failure
-    (HTTP non-2xx, timeout, exception) — fall through to TG если
-    configured. Mark-sent fires только после первого успешного POST
-    (любого канала) — duplicate suppression работает cross-channel.
-
-    #294: ``both_channels=True`` — dual-delivery: POST в MAX И TG независимо
-    (требует ОБА канала полностью сконфигуренными, иначе warning + одиночная
-    доставка по обычной цепочке). ok=True если доставил хотя бы один;
-    dedup/burst/mark_sent — по-прежнему один раз на alert, не на канал.
+    #395 (2026-07-20): **DUAL by default** — Telegram основной (POST'им ПЕРВЫМ) +
+    MAX дубль (ВТОРЫМ). Каналы независимы, best-effort (каждый _post_*_sync сам
+    глотает исключения → bool). ok=True если доставил ХОТЯ БЫ один; сконфигурен
+    только один канал → уходит только туда. dedup/burst/mark_sent — один раз на
+    alert (по dedupe_key), НЕ на канал, поэтому потеря одного канала не крутит
+    ре-файр. Разворачивает R-28 (MAX-primary → TG-fallback) и поглощает #294
+    (явный both_channels больше не нужен — дуал стал дефолтом).
     """
     # Phase 1: in-flight lease (Codex R3 MAJOR fix). MUST take BEFORE dedup
     # check — иначе stale-then-release race:
@@ -448,52 +478,15 @@ def _deliver_in_thread(
     if len(text_payload) > 4000:
         text_payload = text_payload[:3950] + "\n\n…(truncated)"
 
-    # Phase 4: deliver (sync httpx — already в background thread, no blocking)
-    # R-28 amendment: MAX primary → TG fallback. ok=True если **любой** канал
-    # доставил; mark_sent при первом успехе. delivered_via — для diagnostic
-    # logs (audit какой канал реально сработал).
-    ok = False
-    delivered_via: str | None = None
-    # #294 MINOR (ревью): дуал запрошен, но сконфигурен лишь один канал — не молчать
-    # о потере избыточности (алерт всё равно уйдёт одиночной цепочкой ниже).
-    if both_channels and not (max_bot_token and max_chat_id and tg_bot_token and tg_chat_id):
-        logger.warning(
-            "admin_alerts: dual-channel requested (key=%s) but only one "
-            "channel configured — delivering single-channel",
-            dedupe_key,
-        )
+    # Phase 4: deliver — DUAL by default (#395) через общий _deliver_dual_sync (Telegram
+    # основной, MAX дубль; best-effort, ok если ≥1). mark_sent один раз на alert (после
+    # ≥1 успеха) → потеря одного канала не крутит ре-файр. delivered_via — diagnostic-лог.
     try:
-        if both_channels and max_bot_token and max_chat_id and tg_bot_token and tg_chat_id:
-            # #294: dual-channel — деградации дублируются в ОБА канала (Boris:
-            # «оставь в макс, продублируй в тг, так надёжнее»). Каналы независимы;
-            # ok=True если доставил ХОТЯ БЫ один (dedup/mark_sent корректны — один
-            # alert = один dedupe_key = один dedup-чек на оба канала).
-            _max = _post_max_sync(max_bot_token, max_chat_id, text_payload)
-            _tg = _post_telegram_sync(tg_bot_token, tg_chat_id, text_payload)
-            if _max or _tg:
-                ok = True
-                delivered_via = "+".join(c for c, s in (("max", _max), ("telegram", _tg)) if s)
-        elif max_bot_token and max_chat_id:
-            if _post_max_sync(max_bot_token, max_chat_id, text_payload):
-                ok = True
-                delivered_via = "max"
-            else:
-                # MAX упал — fallback на TG если configured.
-                if tg_bot_token and tg_chat_id:
-                    logger.warning(
-                        "admin_alerts: MAX delivery failed for key=%s, "
-                        "falling back to Telegram",
-                        dedupe_key,
-                    )
-                    if _post_telegram_sync(tg_bot_token, tg_chat_id, text_payload):
-                        ok = True
-                        delivered_via = "telegram_fallback"
-        elif tg_bot_token and tg_chat_id:
-            # MAX не configured — TG как single channel (legacy behavior).
-            if _post_telegram_sync(tg_bot_token, tg_chat_id, text_payload):
-                ok = True
-                delivered_via = "telegram"
-
+        ok, delivered_via = _deliver_dual_sync(
+            text_payload,
+            tg_bot_token=tg_bot_token, tg_chat_id=tg_chat_id,
+            max_bot_token=max_bot_token, max_chat_id=max_chat_id,
+        )
         if ok:
             logger.info(
                 "admin_alerts: delivered via %s (key=%s severity=%s)",
@@ -520,9 +513,11 @@ def send_admin_alert(
     *,
     dedupe_key: str | None = None,
     extra_context: dict | None = None,
-    both_channels: bool = False,
 ) -> None:
     """R-28: send admin alert with dedup + burst cap + severity rate-limit.
+
+    #395 (2026-07-20): доставка DUAL — Telegram основной (первым) + MAX дубль
+    (вторым), best-effort на канал; «доставлено» = долетело ≥1 канал.
 
     **Fire-and-forget**: spawns daemon thread for delivery (Xiaomi R1 medium:
     avoids blocking caller на 5s HTTP timeout when caller is already на
@@ -532,7 +527,7 @@ def send_admin_alert(
       1. **Dedup**: drop if same ``dedupe_key`` sent within severity window.
       2. **Burst cap**: drop if >10 sends/min process-wide (after dedup —
          Codex R1 M1).
-      3. **Format + POST**: send Telegram message.
+      3. **Format + POST**: dual-send — Telegram (primary) + MAX (duplicate).
       4. **Mark sent**: update ``last_sent_at`` только если POST succeeded
          (Codex R1 M2).
 
@@ -547,9 +542,6 @@ def send_admin_alert(
         dedupe_key: stable id like ``"llm_fallback:BadRequestError:housewife_assistant"``.
                     None → derived from sha256(severity + title).
         extra_context: optional dict → serialized as " • key: value" footer
-        both_channels: #294 — True = дублировать в MAX И TG одновременно
-                       (для деградационных алертов); False (default) =
-                       прежняя цепочка MAX-primary → TG-fallback
     """
     # Early exit checks на caller thread (no I/O)
     settings = get_settings()
@@ -591,7 +583,6 @@ def send_admin_alert(
                 "tg_chat_id": tg_chat_id if tg_ok else None,
                 "max_bot_token": max_bot_token if max_ok else None,
                 "max_chat_id": max_chat_id if max_ok else None,
-                "both_channels": both_channels,
             },
             daemon=True,
             name=f"admin-alert-{severity}",

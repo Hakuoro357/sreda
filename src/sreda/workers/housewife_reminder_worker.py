@@ -82,7 +82,34 @@ class HousewifeReminderWorker:
         for reminder_id, tenant_id in due_ids:
             try:
                 with tenant_session(tenant_id) as s:
-                    reminder = s.get(FamilyReminder, reminder_id)
+                    # #344 F5 (Opus-адверсар, cross-process ack/snooze гонка):
+                    # кнопки «Сделал ✅»/«Отложить ⏰» обрабатываются в ДРУГОМ
+                    # процессе (uvicorn, telegram_bot._handle_reminder_callback), а
+                    # этот воркер — в job_runner → второй конкурентный писатель в
+                    # family_reminders уже при ОДНОМ воркере. Читали строку plain
+                    # ``s.get`` без лока: fence видел pending, затем конкурентный
+                    # ack/snooze коммитил новое состояние, а слепой ``mark_fired``
+                    # ниже перетирал его (ack/snooze ТИХО ТЕРЯЛСЯ → повторный пинг /
+                    # закрытие отложенного). Берём строку под ``SELECT ... FOR UPDATE``
+                    # и держим лок до commit тика: конкурентный ack/snooze-UPDATE
+                    # сериализуется — либо коммитится ДО (fence перечитает свежие
+                    # status/next_trigger_at и пропустит), либо ПОСЛЕ нашего commit
+                    # (его правка ложится поверх и выигрывает). PG-only (как due_now);
+                    # SQLite (unit, 1 воркер) — без лока, поведение то же.
+                    _bind = s.bind
+                    _for_update = (
+                        {"key_share": False}
+                        if _bind is not None and _bind.dialect.name == "postgresql"
+                        else None
+                    )
+                    # populate_existing: форсим свежий SELECT (с FOR UPDATE) даже
+                    # если строка уже в identity-map — иначе get вернул бы кэш БЕЗ
+                    # лока (Opus MINOR: latent identity-map fragility). Здесь сессия
+                    # свежая per-row, но требование свежести делаем явным.
+                    reminder = s.get(
+                        FamilyReminder, reminder_id,
+                        with_for_update=_for_update, populate_existing=True,
+                    )
                     if reminder is None:
                         continue  # исчез между сканом и действием
                     # #187 soft-delete — fencing-recheck (дверь #10): тенант мог
@@ -97,6 +124,32 @@ class HousewifeReminderWorker:
                             reminder_id, tenant_id,
                         )
                         continue
+                    # #344 F5 fencing: reminder мог быть advance'нут другим воркером
+                    # или прошлым тиком МЕЖДУ scan (due_now) и этим действием. due_now
+                    # держал FOR UPDATE SKIP LOCKED только в scan-сессии — здесь строку
+                    # не лочим, поэтому перепроверяем due/status по СВЕЖЕМУ состоянию:
+                    #  - status != 'pending' (уже финализирован другим воркером) → skip;
+                    #  - next_trigger_at в БУДУЩЕМ (advance'нут в след. эскалацию/итерацию)
+                    #    → ещё не due → skip.
+                    # Без этого late-grace видит future-триггер как «не просрочено» и
+                    # фаерит преждевременно (двойной fire/advance). Двойную ДОСТАВКУ того
+                    # же fire держит idempotency_key — здесь про fencing, не про delivery.
+                    if reminder.status != "pending":
+                        logger.info(
+                            "reminder %s: status=%s (не pending) между scan и действием — "
+                            "fencing skip", reminder_id, reminder.status,
+                        )
+                        continue
+                    _ntt = reminder.next_trigger_at
+                    if _ntt is not None:
+                        if _ntt.tzinfo is None:
+                            _ntt = _ntt.replace(tzinfo=timezone.utc)
+                        if _ntt > current:
+                            logger.info(
+                                "reminder %s: next_trigger_at в будущем (advance'нут) — "
+                                "fencing skip без fire", reminder_id,
+                            )
+                            continue
                     service = HousewifeReminderService(s)
                     # 2026-04-23 «баг 2b»: если напоминание просрочено больше
                     # чем LATE_FIRE_GRACE_MINUTES — закрываем silently без
@@ -158,11 +211,14 @@ class HousewifeReminderWorker:
             )
             return
 
-        # Escalation UI: inline keyboard. NB: callback_data format is
-        # TG-style; для MAX inline-button format probe required (планируется
-        # в follow-up). Сейчас MAX outbox row будет отправлена как text-only
-        # т.к. ``OutboxDeliveryWorker._send_now_max`` не понимает TG
-        # inline_keyboard schema.
+        # Escalation UI: inline keyboard (кнопки «Сделал ✅»/«Отложить ⏰»).
+        # ``callback_data`` — TG-style; MAX-доставка КОНВЕРТИРУЕТ их в свои inline-
+        # attachments через ``render_max_inline_keyboard_attachment``
+        # (``OutboxDeliveryWorker._send_now_max`` → ``integrations/max/client.py``),
+        # так что MAX-юзер эти кнопки ВИДИТ и жмёт — обработчик
+        # ``max_inbound._handle_max_reminder_callback`` (обе стороны ack/snooze
+        # берут строку под FOR UPDATE, #344 F5). [Был устаревший коммент «MAX
+        # text-only» — MAX давно рендерит кнопки; поправлено #344 F5.]
         from sreda.services.ui_labels import BUTTON_ACK, BUTTON_SNOOZE
 
         text = f"🔔 {reminder.title}"

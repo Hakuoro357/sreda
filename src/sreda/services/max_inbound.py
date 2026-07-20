@@ -1823,10 +1823,12 @@ async def _handle_max_reminder_callback(
     Lookup FamilyReminder → acknowledge/snooze → ack с replacement
     message. Cross-tenant defensive check сохранён.
     """
-    from sreda.db.models.housewife import FamilyReminder
     from sreda.services.housewife_reminders import (
+        REMINDER_CALLBACK_BUSY_TEXT,
         SNOOZE_DEFAULT_MINUTES,
         HousewifeReminderService,
+        ReminderLockTimeout,
+        read_reminder_for_callback,
     )
 
     action, _, reminder_id = data.partition(":")
@@ -1845,6 +1847,27 @@ async def _handle_max_reminder_callback(
             txt = body.get("text")
             if isinstance(txt, str):
                 original_text = txt.lstrip(_CLEANUP_PREFIX).strip()
+                # #344 F5 (Codex sol+terra R2 MINOR): lock-timeout replacement
+                # осаждает retry-строку в теле («🔔 X\nСекунду, попробуйте ещё раз»).
+                # На следующем tap она бы дублировалась (timeout→timeout) или
+                # протекла в финальный ✅/⏰-текст (timeout→success). Снимаем её с
+                # хвоста. R3 (Codex sol+terra MINOR): матчим ТОЛЬКО отдельную
+                # trailing-СТРОКУ (разделитель \n или \r\n — как мы её и генерируем),
+                # НЕ любой суффикс — иначе легитимный заголовок, ОКАНЧИВАЮЩИЙСЯ этой
+                # фразой на той же строке («Записать: Секунду, попробуйте ещё раз»),
+                # обрезался бы (потеря данных). while — на случай накопления.
+                _retry_lines = (
+                    f"\r\n{REMINDER_CALLBACK_BUSY_TEXT}",
+                    f"\n{REMINDER_CALLBACK_BUSY_TEXT}",
+                )
+                _stripping = True
+                while _stripping:
+                    _stripping = False
+                    for _sfx in _retry_lines:
+                        if original_text.endswith(_sfx):
+                            original_text = original_text[: -len(_sfx)].rstrip("\r\n \t")
+                            _stripping = True
+                            break
 
     async def _ack_with_replacement(new_text: str) -> None:
         """Send /answers с message field — replaces original message body
@@ -1878,9 +1901,46 @@ async def _handle_max_reminder_callback(
                     exc_info=True,
                 )
 
-    reminder = (
-        session.get(FamilyReminder, reminder_id) if reminder_id else None
-    )
+    # #344 F5 (Opus-адверсар MAJOR#1) — ЗЕРКАЛО TG-фикса. MAX-доставка рендерит те
+    # же ``rem_done``/``rem_snooze`` кнопки (``_send_now_max`` →
+    # ``render_max_inline_keyboard_attachment``), а этот обработчик живёт в UVICORN —
+    # второй конкурентный писатель в ``family_reminders`` (fire-цикл — в JOB_RUNNER).
+    # Читаем строку под ``FOR UPDATE`` с ограниченным ``lock_timeout`` (общий helper
+    # с TG): без лока snooze тихо терялся бы (partial-UPDATE поверх воркерского
+    # ``fired``), а неограниченный ``FOR UPDATE`` стопорил бы event-loop.
+    try:
+        reminder = read_reminder_for_callback(session, reminder_id)
+    except ReminderLockTimeout:
+        # Строку держит reminder-воркер — не стопорим event-loop ожиданием (лок уже
+        # откачен в helper). Показываем ВИДИМУЮ просьбу повторить, СОХРАНИВ кнопки:
+        # MAX глушит ``notification`` в DM (probe 2026-05-05, docstring выше; Codex
+        # sol+terra R1), поэтому используем message-replacement (как весь остальной
+        # UX хендлера) и заново прикрепляем те же rem_done/rem_snooze — юзер
+        # перетапнет. Напоминание НЕ тронуто (snooze/ack не применён).
+        if callback_id:
+            from sreda.integrations.max.client import (
+                render_max_inline_keyboard_attachment,
+            )
+            from sreda.services.ui_labels import BUTTON_ACK, BUTTON_SNOOZE
+
+            _retry_kb = render_max_inline_keyboard_attachment({
+                "inline_keyboard": [[
+                    {"text": BUTTON_ACK, "callback_data": f"rem_done:{reminder_id}"},
+                    {"text": BUTTON_SNOOZE, "callback_data": f"rem_snooze:{reminder_id}"},
+                ]],
+            })
+            _retry_text = (
+                f"🔔 {original_text}\n{REMINDER_CALLBACK_BUSY_TEXT}"
+                if original_text else REMINDER_CALLBACK_BUSY_TEXT
+            )
+            try:
+                await max_client.answer_callback(
+                    str(callback_id),
+                    message={"text": _retry_text, "attachments": _retry_kb or []},
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("max reminder cb busy-ack failed", exc_info=True)
+        return
     if reminder is None:
         await _ack_with_replacement("Это напоминание уже выполнено.")
         return
@@ -1891,6 +1951,11 @@ async def _handle_max_reminder_callback(
             "max reminder cb cross-tenant: caller=%s reminder=%s — refused",
             onboarding.tenant_id, reminder.tenant_id,
         )
+        # #344 F5 (Codex sol R1 MINOR): отпускаем FOR UPDATE-лок строки ДО сетевого
+        # ответа — иначе refuse-путь держал бы чужую строку через network
+        # (``_ack_with_replacement``), и легитимный callback на ту же строку словил
+        # бы наш lock_timeout. Тенант не наш — мутаций нет, rollback безопасен.
+        session.rollback()
         await _ack_with_replacement("Это напоминание не ваше.")
         return
 

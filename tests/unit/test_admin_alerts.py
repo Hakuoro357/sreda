@@ -426,54 +426,53 @@ def _db_max(monkeypatch, tmp_path):
     get_session_factory.cache_clear()
 
 
-# ── (8) R-28 amendment 2026-05-15: MAX primary + TG fallback ────────
+# ── (8) #395: DUAL channel contract + best-effort (было R-28 MAX-primary) ──
 
 
-def test_max_primary_succeeds_no_tg_call(_db_max) -> None:
-    """MAX configured + MAX succeeds → no TG POST. Boris default path."""
+def test_max_payload_contract_in_dual(_db_max) -> None:
+    """#395: дуал (TG+MAX). Контракт MAX-POST (2-й вызов) сохранён: chat_id в query,
+    body только text (без chat_id), Authorization без Bearer."""
     with patch("sreda.services.admin_alerts.httpx.post") as mock_post:
         mock_post.return_value = MagicMock(status_code=200, text="ok")
         send_admin_alert(
             severity="P1", title="MAX path", body="b", dedupe_key="max_only",
         )
-        # Only MAX POST should have fired.
-        assert mock_post.call_count == 1
-        url_called = mock_post.call_args.args[0]
-        assert "platform-api2.max.ru" in url_called
+        # Дуал: оба канала POST'ятся (TG первым, MAX вторым).
+        assert mock_post.call_count == 2
+        max_call = next(c for c in mock_post.call_args_list
+                        if "platform-api2.max.ru" in c.args[0])
         # Query string carries chat_id
-        params = mock_post.call_args.kwargs["params"]
-        assert params["chat_id"] == "320955459"
+        assert max_call.kwargs["params"]["chat_id"] == "320955459"
         # Body has text only (no chat_id)
-        payload = mock_post.call_args.kwargs["json"]
+        payload = max_call.kwargs["json"]
         assert "text" in payload
         assert "chat_id" not in payload
         # Auth header без Bearer
-        headers = mock_post.call_args.kwargs["headers"]
-        assert headers["Authorization"] == "test-max-token"
+        assert max_call.kwargs["headers"]["Authorization"] == "test-max-token"
 
 
-def test_max_failure_falls_back_to_tg(_db_max) -> None:
-    """MAX returns 500 → TG fallback POSTs successfully."""
+def test_dual_tg_delivers_when_max_500(_db_max) -> None:
+    """#395 best-effort: MAX отдаёт 500 → TG (основной) всё равно доставил; оба канала
+    попробованы (не «fallback», а параллельный дубль)."""
     def _post_side_effect(url, *args, **kwargs):
         if "platform-api2.max.ru" in url:
             return MagicMock(status_code=500, text="max down")
-        # TG path
         return MagicMock(status_code=200, text="ok")
 
     with patch("sreda.services.admin_alerts.httpx.post") as mock_post:
         mock_post.side_effect = _post_side_effect
         send_admin_alert(
-            severity="P1", title="Fallback", body="b", dedupe_key="fb_key",
+            severity="P1", title="MAX500", body="b", dedupe_key="fb_key",
         )
-        # Both MAX (failed) + TG (success) POSTed.
         assert mock_post.call_count == 2
         urls = [c.args[0] for c in mock_post.call_args_list]
         assert any("platform-api2.max.ru" in u for u in urls)
         assert any("api.telegram.org" in u for u in urls)
 
 
-def test_max_exception_falls_back_to_tg(_db_max) -> None:
-    """MAX raises (timeout/network) → TG fallback engaged."""
+def test_dual_tg_delivers_when_max_raises(_db_max) -> None:
+    """#395 best-effort: MAX бросает (timeout/network) — исключение проглочено в
+    _post_max_sync, TG (основной) доставил, ход не падает."""
     def _post_side_effect(url, *args, **kwargs):
         if "platform-api2.max.ru" in url:
             raise Exception("max timeout")
@@ -485,27 +484,6 @@ def test_max_exception_falls_back_to_tg(_db_max) -> None:
             severity="P0", title="MAX dies", body="b", dedupe_key="exc_key",
         )
         assert mock_post.call_count == 2
-
-
-def test_both_channels_fail_no_mark_sent(_db_max) -> None:
-    """Both MAX+TG fail → last_sent_at unchanged → retry next occurrence."""
-    with patch("sreda.services.admin_alerts.httpx.post") as mock_post:
-        mock_post.return_value = MagicMock(status_code=500, text="down")
-        send_admin_alert(
-            severity="P1", title="Allfail", body="b1", dedupe_key="all_fail",
-        )
-        # Both channels attempted.
-        assert mock_post.call_count == 2
-
-        # Reset mock — second occurrence should retry (since last_sent_at не mark'нулся).
-        mock_post.reset_mock()
-        mock_post.return_value = MagicMock(status_code=200, text="ok")
-        send_admin_alert(
-            severity="P1", title="Allfail", body="b2", dedupe_key="all_fail",
-        )
-        # Second attempt: MAX retried → succeeds на этот раз → no TG fallback.
-        assert mock_post.call_count == 1
-        assert "platform-api2.max.ru" in mock_post.call_args.args[0]
 
 
 def test_max_only_no_tg_configured(monkeypatch, tmp_path) -> None:
@@ -536,10 +514,9 @@ def test_max_only_no_tg_configured(monkeypatch, tmp_path) -> None:
 
 
 @pytest.mark.no_sync_thread
-def test_alert_admin_async_uses_max_primary(_db_max, monkeypatch) -> None:
-    """Codex R5 MAJOR fix: alert_admin_async must also use MAX-primary +
-    TG-fallback (was Telegram-only). Validates legacy async path now uses
-    MAX path when configured.
+def test_alert_admin_async_dual_passes_correct_chat_ids(_db_max, monkeypatch) -> None:
+    """#395: alert_admin_async дуалит — в КАЖДЫЙ канал уходит его chat_id
+    (TG=111111111 основной, MAX=320955459 дубль), оба вызваны.
 
     Mocks ``_post_max_sync`` / ``_post_telegram_sync`` directly (rather than
     via httpx) — bypasses ``asyncio.to_thread`` interaction with the
@@ -554,7 +531,7 @@ def test_alert_admin_async_uses_max_primary(_db_max, monkeypatch) -> None:
 
     def _max_stub(token, chat, text):
         max_calls.append((token, chat, text))
-        return True  # MAX success
+        return True
 
     def _tg_stub(token, chat, text):
         tg_calls.append((token, chat, text))
@@ -565,14 +542,17 @@ def test_alert_admin_async_uses_max_primary(_db_max, monkeypatch) -> None:
 
     result = asyncio.run(alert_admin_async("startup test message"))
     assert result is True
+    # #395: оба канала получили (дубль), каждый — со своим chat_id.
+    assert len(tg_calls) == 1
+    assert tg_calls[0][1] == "111111111"   # TG chat_id (основной)
     assert len(max_calls) == 1
-    assert max_calls[0][1] == "320955459"  # chat_id
-    assert len(tg_calls) == 0  # TG not called when MAX succeeds
+    assert max_calls[0][1] == "320955459"  # MAX chat_id (дубль)
 
 
 @pytest.mark.no_sync_thread
-def test_alert_admin_async_falls_back_to_tg(_db_max, monkeypatch) -> None:
-    """alert_admin_async: MAX fails → TG fallback POSTs."""
+def test_alert_admin_async_max_down_tg_delivers(_db_max, monkeypatch) -> None:
+    """#395: alert_admin_async — MAX (дубль) падает → TG (основной) доставил;
+    результат True (≥1 канал), оба попробованы."""
     import asyncio
     from sreda.services.admin_alerts import alert_admin_async
 
@@ -665,3 +645,250 @@ def test_no_stale_dedup_race_after_release(_db) -> None:
             severity="P1", title="X", body="b", dedupe_key="race_key",
         )
         assert mock_post.call_count == 1  # still 1, not 2
+
+
+# ── (9) #395: DUAL by default — Telegram primary + MAX duplicate ─────
+#
+# 2026-07-20: служебные алерты дублируются в ОБА канала — Telegram основной
+# (первым), MAX дубль (вторым). Разворачивает R-28 MAX-primary → TG-fallback.
+# Best-effort на канал; «доставлено» = долетело ХОТЯ БЫ в один.
+
+
+def test_395_dual_delivers_both_channels(_db_max) -> None:
+    """#395: оба канала сконфигурены → alert уходит в TG И в MAX (два POST)."""
+    with patch("sreda.services.admin_alerts.httpx.post") as mock_post:
+        mock_post.return_value = MagicMock(status_code=200, text="ok")
+        send_admin_alert(
+            severity="P1", title="dual", body="b", dedupe_key="dual_key",
+        )
+        assert mock_post.call_count == 2
+        urls = [c.args[0] for c in mock_post.call_args_list]
+        assert any("api.telegram.org" in u for u in urls)
+        assert any("platform-api2.max.ru" in u for u in urls)
+
+
+def test_395_telegram_is_primary_posted_first(_db_max) -> None:
+    """#395: Telegram — основной, POST'ится ПЕРВЫМ; MAX (дубль) — вторым."""
+    with patch("sreda.services.admin_alerts.httpx.post") as mock_post:
+        mock_post.return_value = MagicMock(status_code=200, text="ok")
+        send_admin_alert(
+            severity="P1", title="order", body="b", dedupe_key="order_key",
+        )
+        assert mock_post.call_count == 2
+        assert "api.telegram.org" in mock_post.call_args_list[0].args[0]
+        assert "platform-api2.max.ru" in mock_post.call_args_list[1].args[0]
+
+
+def test_395_tg_down_max_still_delivers_and_marks_sent(_db_max) -> None:
+    """#395 best-effort: TG падает (500) → MAX всё равно получает; «доставлено»
+    истинно при ≥1 канале (mark_sent сработал → повтор в окне подавлен целиком)."""
+    def _side(url, *a, **k):
+        if "api.telegram.org" in url:
+            return MagicMock(status_code=500, text="tg down")
+        return MagicMock(status_code=200, text="ok")
+
+    with patch("sreda.services.admin_alerts.httpx.post") as mock_post:
+        mock_post.side_effect = _side
+        send_admin_alert(
+            severity="P1", title="tgfail", body="b", dedupe_key="tgfail_key",
+        )
+        # Оба канала попробованы (дуал), несмотря на падение TG.
+        assert mock_post.call_count == 2
+        # MAX доставил → delivered=True → mark_sent → второй с тем же ключом подавлен.
+        mock_post.reset_mock()
+        mock_post.side_effect = _side
+        send_admin_alert(
+            severity="P1", title="tgfail", body="b2", dedupe_key="tgfail_key",
+        )
+        assert mock_post.call_count == 0
+
+
+def test_395_max_down_tg_still_delivers_and_marks_sent(_db_max) -> None:
+    """#395 best-effort (зеркало): MAX (дубль) падает → TG (основной) доставил;
+    «доставлено» истинно → повтор подавлен."""
+    def _side(url, *a, **k):
+        if "platform-api2.max.ru" in url:
+            return MagicMock(status_code=500, text="max down")
+        return MagicMock(status_code=200, text="ok")
+
+    with patch("sreda.services.admin_alerts.httpx.post") as mock_post:
+        mock_post.side_effect = _side
+        send_admin_alert(
+            severity="P1", title="maxfail", body="b", dedupe_key="maxfail_key",
+        )
+        assert mock_post.call_count == 2
+        mock_post.reset_mock()
+        mock_post.side_effect = _side
+        send_admin_alert(
+            severity="P1", title="maxfail", body="b2", dedupe_key="maxfail_key",
+        )
+        assert mock_post.call_count == 0
+
+
+def test_395_both_channels_fail_no_mark_sent_retries(_db_max) -> None:
+    """#395: оба канала упали → last_sent_at не тронут → следующее вхождение ретраит
+    (и снова дуалит)."""
+    with patch("sreda.services.admin_alerts.httpx.post") as mock_post:
+        mock_post.return_value = MagicMock(status_code=500, text="down")
+        send_admin_alert(
+            severity="P1", title="allfail", body="b1", dedupe_key="af_key",
+        )
+        assert mock_post.call_count == 2  # оба попробованы
+        mock_post.reset_mock()
+        mock_post.return_value = MagicMock(status_code=200, text="ok")
+        send_admin_alert(
+            severity="P1", title="allfail", body="b2", dedupe_key="af_key",
+        )
+        # Ретрай снова дуалит (оба ok на этот раз).
+        assert mock_post.call_count == 2
+
+
+def test_395_dedup_once_per_alert_across_both_channels(_db_max) -> None:
+    """#395: один dedupe_key = один дедуп-чек на ОБА канала; повтор в окне подавлен
+    целиком (не «TG подавлен, MAX прошёл»)."""
+    with patch("sreda.services.admin_alerts.httpx.post") as mock_post:
+        mock_post.return_value = MagicMock(status_code=200, text="ok")
+        send_admin_alert(severity="P1", title="d", body="b1", dedupe_key="dk")
+        send_admin_alert(severity="P1", title="d", body="b2", dedupe_key="dk")
+        # Первый: дуал → 2 POST. Второй: подавлен целиком → 0. Итого 2.
+        assert mock_post.call_count == 2
+
+
+def test_395_single_channel_configured_delivers_alone(_db) -> None:
+    """#395: сконфигурен ОДИН канал (TG-only фикстура _db) → уходит только туда, без
+    ошибок про отсутствующий MAX."""
+    with patch("sreda.services.admin_alerts.httpx.post") as mock_post:
+        mock_post.return_value = MagicMock(status_code=200, text="ok")
+        send_admin_alert(
+            severity="P1", title="solo", body="b", dedupe_key="solo_key",
+        )
+        assert mock_post.call_count == 1
+        assert "api.telegram.org" in mock_post.call_args.args[0]
+
+
+@pytest.mark.no_sync_thread
+def test_395_alert_admin_async_dual_tg_first_then_max(_db_max, monkeypatch) -> None:
+    """#395: alert_admin_async (legacy-вход, его использует #376) тоже дуалит —
+    TG первым, MAX вторым, оба вызваны."""
+    import asyncio
+    from sreda.services.admin_alerts import alert_admin_async
+
+    order: list[str] = []
+    monkeypatch.setattr(aa, "_post_telegram_sync", lambda *a: order.append("tg") or True)
+    monkeypatch.setattr(aa, "_post_max_sync", lambda *a: order.append("max") or True)
+
+    result = asyncio.run(alert_admin_async("m"))
+    assert result is True
+    assert order == ["tg", "max"]
+
+
+@pytest.mark.no_sync_thread
+def test_395_alert_admin_async_tg_down_max_delivers(_db_max, monkeypatch) -> None:
+    """#395: alert_admin_async — TG падает → MAX всё равно доставляет; результат True
+    (≥1 канал), оба попробованы."""
+    import asyncio
+    from sreda.services.admin_alerts import alert_admin_async
+
+    calls: list[str] = []
+    monkeypatch.setattr(aa, "_post_telegram_sync", lambda *a: calls.append("tg") or False)
+    monkeypatch.setattr(aa, "_post_max_sync", lambda *a: calls.append("max") or True)
+
+    result = asyncio.run(alert_admin_async("m"))
+    assert result is True
+    assert calls == ["tg", "max"]
+
+
+# ── (10) #395 (R1 sol): общий sync-helper _deliver_dual_sync ─────────
+
+
+def test_395_deliver_dual_sync_order_and_best_effort(monkeypatch) -> None:
+    """#395 (R1 sol): единый sync-helper — TG первым, MAX вторым; исключение одного
+    канала проглочено (best-effort), второй доставляет; delivered/via корректны."""
+    order: list[str] = []
+
+    def _tg(_t, _c, _x):
+        order.append("tg")
+        raise RuntimeError("tg boom")
+
+    def _mx(_t, _c, _x):
+        order.append("max")
+        return True
+
+    monkeypatch.setattr(aa, "_post_telegram_sync", _tg)
+    monkeypatch.setattr(aa, "_post_max_sync", _mx)
+
+    delivered, via = aa._deliver_dual_sync(
+        "text", tg_bot_token="tk", tg_chat_id="tc",
+        max_bot_token="mk", max_chat_id="mc",
+    )
+    assert order == ["tg", "max"]  # TG первым несмотря на его падение
+    assert delivered is True       # MAX доставил → ≥1
+    assert via == "max"
+
+
+def test_395_deliver_dual_sync_both_ok_via_string(monkeypatch) -> None:
+    """#395: оба канала ok → via='telegram+max', delivered=True."""
+    monkeypatch.setattr(aa, "_post_telegram_sync", lambda *a: True)
+    monkeypatch.setattr(aa, "_post_max_sync", lambda *a: True)
+    delivered, via = aa._deliver_dual_sync(
+        "t", tg_bot_token="tk", tg_chat_id="tc",
+        max_bot_token="mk", max_chat_id="mc",
+    )
+    assert delivered is True
+    assert via == "telegram+max"
+
+
+def test_395_deliver_dual_sync_no_channel(monkeypatch) -> None:
+    """#395: ни один канал не сконфигурен → ничего не шлём, delivered=False, via=None."""
+    tg_called: list = []
+    max_called: list = []
+    monkeypatch.setattr(aa, "_post_telegram_sync", lambda *a: tg_called.append(a) or True)
+    monkeypatch.setattr(aa, "_post_max_sync", lambda *a: max_called.append(a) or True)
+    delivered, via = aa._deliver_dual_sync(
+        "t", tg_bot_token=None, tg_chat_id=None,
+        max_bot_token=None, max_chat_id=None,
+    )
+    assert delivered is False
+    assert via is None
+    assert tg_called == [] and max_called == []
+
+
+@pytest.mark.no_sync_thread
+def test_395_alert_admin_async_to_thread_failure_swallowed(_db_max, monkeypatch) -> None:
+    """#395 (R2 sol MAJOR / terra): сбой САМОГО asyncio.to_thread (executor shutdown,
+    отказ создать поток) НЕ пробрасывается в caller — best-effort: return False."""
+    import asyncio
+    from sreda.services.admin_alerts import alert_admin_async
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("cannot schedule new futures after shutdown")
+
+    monkeypatch.setattr(asyncio, "to_thread", _boom)
+    result = asyncio.run(alert_admin_async("m"))
+    assert result is False
+
+
+@pytest.mark.no_sync_thread
+def test_395_alert_admin_async_single_to_thread_no_split(_db_max, monkeypatch) -> None:
+    """#395 (R1/R2 sol,terra cancellation-инвариант): оба канала уходят ОДНИМ
+    asyncio.to_thread(_deliver_dual_sync) → отмена awaiter'а не может расщепить каналы
+    (поток доводит оба). Детерминированно фиксируем структуру (гвоздь против возврата к
+    двум последовательным to_thread); порядок TG→MAX внутри helper покрыт отдельно."""
+    import asyncio
+    from sreda.services.admin_alerts import alert_admin_async
+
+    to_thread_fns: list = []
+    real_to_thread = asyncio.to_thread
+
+    async def _spy(fn, *args, **kwargs):
+        to_thread_fns.append(fn)
+        return await real_to_thread(fn, *args, **kwargs)
+
+    monkeypatch.setattr(aa, "_post_telegram_sync", lambda *a: True)
+    monkeypatch.setattr(aa, "_post_max_sync", lambda *a: True)
+    monkeypatch.setattr(asyncio, "to_thread", _spy)
+
+    result = asyncio.run(alert_admin_async("m"))
+    assert result is True
+    # РОВНО один to_thread, и это общий дуал-helper (не два канальных вызова).
+    assert to_thread_fns == [aa._deliver_dual_sync]

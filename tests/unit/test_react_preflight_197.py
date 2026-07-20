@@ -224,8 +224,10 @@ def test_section_hint_reaches_model_on_task(install):
 
 
 def test_off_no_section_hint(install):
-    # #215 (code-review R1, все 3 ревьюера MAJOR): на OFF (eff=None) секц-подсказка НЕ добавляется —
-    # сохраняем byte-identical OFF (инвариант T3 #197), даже на слове-разделе «покажи дела».
+    # #215 (code-review R1, все 3 ревьюера MAJOR): на OFF (eff=None) хвостовая секц-ДИРЕКТИВА НЕ
+    # добавляется (инвариант T3 #197), даже на слове-разделе «покажи дела». #374: «byte-identical
+    # OFF» больше НЕ буквально — few-shot теперь в стабильном OFF-промпте; инвариант T3 = отсутствие
+    # именно преднастроенного ХВОСТА, что и проверяется ниже.
     spcap = []
     freddie = _Chat("freddie", classify="task", sp_capture=spcap,
                     responses=[AIMessage(content="ок")])
@@ -233,7 +235,10 @@ def test_off_no_section_hint(install):
     _turn(freddie, thread="off-nosec", text="покажи дела")
     assert spcap, "модель не получила промпт"
     assert _HINT_CHECKLIST not in spcap[-1]
-    assert "list_checklists" not in spcap[-1]
+    # #374: few-shot в СТАБИЛЬНОМ промпте легитимно содержит show_checklist/list_checklists
+    # (это примеры, НЕ хвостовая директива). Инвариант T3 — отсутствие именно ХВОСТОВОЙ
+    # секц-директивы (её характерный зачин), а не слова «list_checklists».
+    assert "ВАЖНО: пользователь спрашивает про СПИСКИ ДЕЛ" not in spcap[-1]
 
 
 # ───────────────────────── юнит: _bind_for ─────────────────────────
