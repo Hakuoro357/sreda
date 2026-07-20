@@ -178,6 +178,95 @@ def test_grounding_note_carries_names_393():
     assert "грабл" in note.lower() and "лопат" in note.lower() and "перчатк" in note.lower()
 
 
+# ─────────────────────────── контракт корректности (Codex terra R1) ───────────────────────────
+
+def test_collect_add_all_dup_no_false_success_393():
+    """terra R1 MAJOR-1: add с одними дублями (okv2 created=[]) → нет эффекта → НЕ заземляем
+    (иначе «добавила/обновила» = ложный успех, ничего не добавлено)."""
+    dup = ('okv2:added_with_dups:{"added_count":0,"duplicate_count":3,"checklist_id":"checklist_'
+           + "a" * 24 + '","created":[],"duplicates_existing":["грабли","лопату","перчатки"]}')
+    msgs = [HumanMessage(content="добавь в дача грабли"),
+            _ai_call("add_checklist_items", {"list_id_or_title": "Дача", "items": ["грабли"]}),
+            _tm(dup)]
+    assert collect_successful_writes(msgs) == ()
+
+
+def test_collect_create_checklist_excluded_393():
+    """terra R1 MAJOR-1: create_checklist возвращает СУЩЕСТВУЮЩИЙ список при дубле — исход не
+    отличить от создания → не заземляем (не врём «завела»)."""
+    msgs = [HumanMessage(content="создай список Дача"),
+            _ai_call("create_checklist", {"title": "Дача"}),
+            _tm("ok:created:checklist_" + "a" * 24 + ":Дача", name="create_checklist")]
+    assert collect_successful_writes(msgs) == ()
+
+
+def test_collect_generic_write_not_grounded_393():
+    """Незнакомый write (save_recipe и пр.) вне allowlist → не заземляем (без выдуманного глагола;
+    okv2 duplicate = no-op тем более)."""
+    msgs = [HumanMessage(content="сохрани рецепт борща"),
+            _ai_call("save_recipe", {"title": "Борщ"}),
+            _tm('okv2:duplicate:{"recipe_id":"rec_' + "a" * 24 + '","title":"Борщ"}',
+                name="save_recipe")]
+    assert collect_successful_writes(msgs) == ()
+
+
+def test_detector_word_boundary_no_false_match_393():
+    """terra R1 MAJOR-2: stem «дел» списка «Дела» НЕ должен матчить «Сделала» (подстрока → false-
+    grounded → филлер уехал бы юзеру). Токенный матч по границам слов чинит это."""
+    msgs = [HumanMessage(content="удали список Дела"),
+            _ai_call("archive_checklist", {"list_id_or_title": "Дела"}),
+            _tm("ok:archived:checklist_" + "a" * 24, name="archive_checklist")]
+    acts = collect_successful_writes(msgs)
+    assert len(acts) == 1 and acts[0].target == "Дела"
+    assert reply_grounds_result("Сделала, готово.", acts) is False  # не заземлён → подмена
+    assert reply_grounds_result("Убрала «Дела».", acts) is True     # назван → голос сохранён
+
+
+def test_sanitize_emdash_and_id_stripped_393():
+    """terra R1 MAJOR-3: длинное тире и id-токен в имени/пункте → вычищены из user-facing текста."""
+    created = 'okv2:added:{"added_count":1,"duplicate_count":0,"checklist_id":"checklist_' + \
+        "a" * 24 + '","created":["молоко checklist_' + "b" * 24 + '"]}'
+    msgs = [HumanMessage(content="добавь"),
+            _ai_call("add_checklist_items", {"list_id_or_title": "Дача — лето", "items": ["x"]}),
+            _tm(created)]
+    r = fallback_reply(collect_successful_writes(msgs))
+    assert "—" not in r and "checklist_" not in r.lower(), r
+    assert "Дача - лето" in r and "молоко" in r, r  # тире→дефис, id вычищен, имена целы
+
+
+def test_target_id_only_fail_closed_393():
+    """terra R1 MAJOR-3: target-действие с id-именем (не резолвится в человеческое имя) →
+    fail-closed, не заземляем (нельзя назвать «что» убрали)."""
+    msgs = [HumanMessage(content="удали"),
+            _ai_call("archive_checklist", {"list_id_or_title": "checklist_" + "a" * 24}),
+            _tm("ok:archived:checklist_" + "a" * 24, name="archive_checklist")]
+    assert collect_successful_writes(msgs) == ()
+
+
+def test_detector_add_partial_items_not_grounded_393():
+    """R1 sol+terra MAJOR-2: назван 1 из 3 добавленных пунктов = ЧАСТИЧНЫЙ отчёт → не заземлён
+    (полнота: add-акт требует ВСЕ пункты). Страховка добьёт полным списком."""
+    acts = collect_successful_writes(_add_msgs())
+    assert reply_grounds_result("Добавила грабли.", acts) is False
+    assert reply_grounds_result("Добавила грабли и лопату.", acts) is False
+    assert reply_grounds_result("Добавила грабли, лопату и перчатки.", acts) is True
+
+
+def test_detector_all_acts_required_393():
+    """R1 sol MAJOR-2: два успешных акта — реплика должна назвать РЕЗУЛЬТАТ КАЖДОГО (не только один)."""
+    msgs = [HumanMessage(content="добавь в дача грабли и удали список Поход"),
+            _ai_call("add_checklist_items",
+                     {"list_id_or_title": "Дача", "items": ["грабли"]}, cid="c1"),
+            _ai_call("archive_checklist", {"list_id_or_title": "Поход"}, cid="c2"),
+            _tm('okv2:added:{"added_count":1,"duplicate_count":0,"checklist_id":"checklist_'
+                + "a" * 24 + '","created":["грабли"]}', cid="c1"),
+            _tm("ok:archived:checklist_" + "b" * 24, name="archive_checklist", cid="c2")]
+    acts = collect_successful_writes(msgs)
+    assert len(acts) == 2
+    assert reply_grounds_result("Добавила грабли.", acts) is False          # Поход не назван
+    assert reply_grounds_result("Добавила грабли, убрала Поход.", acts) is True
+
+
 # ─────────────────────────── e2e через handle_turn (легаси-путь) ───────────────────────────
 
 class _StubLLM:

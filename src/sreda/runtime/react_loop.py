@@ -3718,14 +3718,18 @@ def _build_graph(llm: Any, all_tools: list, *,
                     _sp_local = f"{_sp_local}\n\n{_sec}"
                 if _recur:  # #333: легаси-ветка (#247 OFF) — симметрично _sec
                     _sp_local = f"{_sp_local}\n\n{_recur}"
-                if _ground393:  # #393: сводка результата — и в легаси-ветке (#247 OFF), симметрично _sec/_recur
-                    _sp_local = f"{_sp_local}\n\n{_ground393}"
                 # #194: компакция истории как prompt-view. OFF → [SystemMessage(sp), *messages] (как было).
                 # Канон state["messages"] не мутируется. #232: summary= durable-выжимка (потребление).
                 _m = build_model_input(_sp_local, state["messages"], enabled=_compact_enabled(),
                                        budget=_compact_budget(), summary=history_summary)
                 if time_tail_line:  # #298: дата+время эфемерным хвостом (легаси-режим #247)
                     _m = _append_time_tail(_m, time_tail_line)
+                # #393 (Codex sol R1 MAJOR): сводка результата несёт ДАННЫЕ юзера (имена) → НЕ в
+                # системный промпт (иначе рвётся кеш-префикс + инъекция user-данных в system-роль),
+                # а ОТДЕЛЬНЫМ trailing-user хвостом. Заземление живёт на пост-tool проходе, где хвост
+                # истории = ToolMessage → двойного user нет (пара свежий-write замыкает ход).
+                if _ground393:
+                    _m = [*_m, HumanMessage(content=_ground393)]
                 return _m
 
             _msgs = _assemble_msgs(_avail, sp)
