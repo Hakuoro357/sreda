@@ -617,6 +617,29 @@ def _task_confirm_verb(verb: str) -> str:
     return {"отменяю": "отменю", "удаляю": "удалю"}.get(verb, verb)
 
 
+# #405: единый ключ маркера «инструмент уже несёт СВОЁ подтверждение (interrupt) до мутации».
+# Ставят ТОЛЬКО _confirm_wrap (обёрточные деструктивы) и _mark_bespoke_confirm (inline-деструктивы);
+# читает ТОЛЬКО _apply_unified_policy (ярус б) — по маркеру второй generic-confirm НЕ добавляется.
+_BESPOKE_CONFIRM_KEY = "sreda_bespoke_confirm"
+# Деструктивы с ВСТРОЕННЫМ interrupt()-confirm в теле (НЕ через _confirm_wrap): cancel_reminder,
+# cancel_task, delete_task. Помечаются маркером при сборке bespoke, иначе ярус (б) единого пути
+# добавил бы им второй generic-confirm (прод-класс бага #405, ср. «очисти список покупок»).
+_INLINE_BESPOKE_CONFIRM = frozenset({"cancel_reminder", "cancel_task", "delete_task"})
+
+
+def _mark_bespoke_confirm(t: Any) -> Any:
+    """#405: пометить инструмент как уже несущий bespoke-подтверждение (interrupt внутри тела).
+    model_copy — НЕ мутируем общий объект. Сбой копии → как есть (регресс к generic-confirm =
+    двойное подтверждение, но НЕ тихая мутация: fail-safe в безопасную сторону)."""
+    try:
+        return t.model_copy(update={
+            "metadata": {**(getattr(t, "metadata", None) or {}), _BESPOKE_CONFIRM_KEY: True}})
+    except Exception:  # noqa: BLE001 — не валим сборку инструментов
+        logger.warning("react_loop: _mark_bespoke_confirm failed for %s",
+                       getattr(t, "name", "?"), exc_info=True)
+        return t
+
+
 def _confirm_wrap(inner: Any, phrase: str) -> Any:
     """Обернуть разрушающий инструмент подтверждением через interrupt(): мутация
     ТОЛЬКО после «да» (детерминированный guardrail, как у cancel_reminder). Сохраняет
@@ -644,7 +667,7 @@ def _confirm_wrap(inner: Any, phrase: str) -> Any:
         # деструктив как есть (не оборачивает вторым generic-confirm → без двойного подтверждения
         # «очисти список покупок»). Гейт на маркер, не на имя: незамаркированный деструктив всё
         # равно получит confirm (нет тихой мутации).
-        metadata={**(getattr(inner, "metadata", None) or {}), "sreda_bespoke_confirm": True},
+        metadata={**(getattr(inner, "metadata", None) or {}), _BESPOKE_CONFIRM_KEY: True},
     )
 
 
@@ -1911,11 +1934,13 @@ def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any,
                 out.append(t)
             elif tool_write_domains(name) <= aw and tool_read_domains(name) <= ar:
                 out.append(t)  # ярус (а): домены разрешены → прямой write без confirm
-            elif (getattr(t, "metadata", None) or {}).get("sreda_bespoke_confirm"):
-                # #405: деструктив уже несёт bespoke-confirm (_confirm_wrap, специфичный «уберу «X»») —
-                # НЕ оборачивать вторым generic-confirm (иначе ДВА подтверждения на один вызов, прод-баг
-                # «очисти список покупок»). Гейт на МАРКЕР фактической обёртки (не на имя): деструктив
-                # без маркера уйдёт в ветку ниже и всё равно получит confirm → тихой мутации нет.
+            elif (getattr(t, "metadata", None) or {}).get(_BESPOKE_CONFIRM_KEY) is True:
+                # #405: деструктив уже несёт СВОЙ confirm — обёрточный (_confirm_wrap, «уберу «X»») ИЛИ
+                # inline (cancel_reminder/cancel_task/delete_task, помечены _mark_bespoke_confirm). НЕ
+                # оборачивать вторым generic-confirm (иначе ДВА подтверждения на один вызов, прод-баг
+                # «очисти список покупок»). Гейт на МАРКЕР (не на имя) и строго `is True` (truthy-строка
+                # в metadata не должна обходить confirm): деструктив без маркера уйдёт в ветку ниже и всё
+                # равно получит confirm → тихой мутации нет.
                 out.append(t)  # ярус (б) для bespoke-подтверждённого: как есть → РОВНО один confirm
             else:
                 out.append(_generic_confirm_wrap(t))  # ярус (б): кандидат под generic confirm
@@ -3420,6 +3445,11 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         delete_my_account,  # #187 Фаза 4b-2: self-delete (owner-only, single-user, confirm)
         need_family,  # #165 Срез A: мета-инструмент добора семей (ядро, всегда в наборе)
     ]
+    # #405: cancel_reminder/cancel_task/delete_task несут СВОЙ inline interrupt()-confirm (не через
+    # _confirm_wrap) → пометить маркером, чтобы ярус (б) единого пути НЕ добавил второй generic-confirm
+    # (двойное подтверждение, прод-класс бага #405). Гейт по маркеру в _apply_unified_policy, не по имени.
+    # delete_my_account сюда НЕ входит: он вовсе не биндится на едином пути (_apply_unified_policy: continue).
+    bespoke = [_mark_bespoke_confirm(t) if t.name in _INLINE_BESPOKE_CONFIRM else t for t in bespoke]
 
     # #162 полный перенос — добираем остальные семьи из общего реестра
     # (покупки/меню/рецепты/чек-листы/семья/веб) + память. Напоминания/задачи
