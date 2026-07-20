@@ -851,3 +851,44 @@ def test_395_deliver_dual_sync_no_channel(monkeypatch) -> None:
     assert delivered is False
     assert via is None
     assert tg_called == [] and max_called == []
+
+
+@pytest.mark.no_sync_thread
+def test_395_alert_admin_async_to_thread_failure_swallowed(_db_max, monkeypatch) -> None:
+    """#395 (R2 sol MAJOR / terra): сбой САМОГО asyncio.to_thread (executor shutdown,
+    отказ создать поток) НЕ пробрасывается в caller — best-effort: return False."""
+    import asyncio
+    from sreda.services.admin_alerts import alert_admin_async
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("cannot schedule new futures after shutdown")
+
+    monkeypatch.setattr(asyncio, "to_thread", _boom)
+    result = asyncio.run(alert_admin_async("m"))
+    assert result is False
+
+
+@pytest.mark.no_sync_thread
+def test_395_alert_admin_async_single_to_thread_no_split(_db_max, monkeypatch) -> None:
+    """#395 (R1/R2 sol,terra cancellation-инвариант): оба канала уходят ОДНИМ
+    asyncio.to_thread(_deliver_dual_sync) → отмена awaiter'а не может расщепить каналы
+    (поток доводит оба). Детерминированно фиксируем структуру (гвоздь против возврата к
+    двум последовательным to_thread); порядок TG→MAX внутри helper покрыт отдельно."""
+    import asyncio
+    from sreda.services.admin_alerts import alert_admin_async
+
+    to_thread_fns: list = []
+    real_to_thread = asyncio.to_thread
+
+    async def _spy(fn, *args, **kwargs):
+        to_thread_fns.append(fn)
+        return await real_to_thread(fn, *args, **kwargs)
+
+    monkeypatch.setattr(aa, "_post_telegram_sync", lambda *a: True)
+    monkeypatch.setattr(aa, "_post_max_sync", lambda *a: True)
+    monkeypatch.setattr(asyncio, "to_thread", _spy)
+
+    result = asyncio.run(alert_admin_async("m"))
+    assert result is True
+    # РОВНО один to_thread, и это общий дуал-helper (не два канальных вызова).
+    assert to_thread_fns == [aa._deliver_dual_sync]

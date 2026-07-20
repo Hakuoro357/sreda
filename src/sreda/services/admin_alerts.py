@@ -151,11 +151,20 @@ async def alert_admin_async(text: str) -> bool:
 
     # #395 (R1 sol): дуал ОДНИМ to_thread через общий sync-helper — оба канала (TG→MAX)
     # в одном потоке; отмена корутины-awaiter'а не расщепляет каналы (поток доводит оба).
-    delivered, delivered_via = await asyncio.to_thread(
-        _deliver_dual_sync, text,
-        tg_bot_token=tg_bot_token, tg_chat_id=tg_chat_id,
-        max_bot_token=max_bot_token, max_chat_id=max_chat_id,
-    )
+    # #395 (R2 sol/terra): внешний guard — сбой САМОГО to_thread (executor shutdown /
+    # отказ создать поток) НЕ должен пробиться в caller (best-effort контракт «exceptions
+    # swallowed»); CancelledError пробрасываем (кооперативная отмена не глотается).
+    try:
+        delivered, delivered_via = await asyncio.to_thread(
+            _deliver_dual_sync, text,
+            tg_bot_token=tg_bot_token, tg_chat_id=tg_chat_id,
+            max_bot_token=max_bot_token, max_chat_id=max_chat_id,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — best-effort: не роняем caller
+        logger.warning("alert_admin: delivery dispatch failed: %s", type(exc).__name__)
+        return False
     if delivered:
         logger.info("alert_admin: delivered via %s", delivered_via)
     else:
