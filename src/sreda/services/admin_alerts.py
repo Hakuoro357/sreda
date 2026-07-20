@@ -123,9 +123,9 @@ async def alert_admin_async(text: str) -> bool:
     ``miniapp.py``/``max_subscription_health.py``/``outbox_delivery.py`` и #376-нотификация
     расхождения доменов (``react_loop._dis376_send_alert``).
 
-    Реализация: async wrapper'ит sync ``_post_telegram_sync`` / ``_post_max_sync`` через
-    ``asyncio.to_thread`` (5s timeout each). Каналы последовательны (TG→MAX), каждый в
-    своём try/except. Text обрезается до 4000 chars (MAX/TG limit).
+    Реализация: делегирует общему sync-хелперу ``_deliver_dual_sync`` через ОДИН
+    ``asyncio.to_thread`` (оба канала в одном потоке, TG→MAX) — отмена корутины-awaiter'а
+    не расщепляет каналы (поток доводит оба). Text обрезается до 4000 chars (MAX/TG limit).
     """
     import asyncio
 
@@ -149,34 +149,16 @@ async def alert_admin_async(text: str) -> bool:
     if len(text) > 4000:
         text = text[:3990] + "\n…[truncated]"
 
-    delivered = False
-
-    # Telegram — основной канал (#395): шлём ПЕРВЫМ.
-    if tg_ok:
-        try:
-            if await asyncio.to_thread(
-                _post_telegram_sync, tg_bot_token, tg_chat_id, text,
-            ):
-                logger.info("alert_admin: delivered via Telegram")
-                delivered = True
-        except Exception as exc:  # noqa: BLE001 — канал best-effort, второй не блокируем
-            logger.warning(
-                "alert_admin: Telegram exception (chat=%s): %s",
-                tg_chat_id, exc,
-            )
-
-    # MAX — дубль (#395): шлём ВТОРЫМ, независимо от исхода TG.
-    if max_ok:
-        try:
-            if await asyncio.to_thread(
-                _post_max_sync, max_bot_token, max_chat_id, text,
-            ):
-                logger.info("alert_admin: delivered via MAX")
-                delivered = True
-        except Exception as exc:  # noqa: BLE001 — канал best-effort
-            logger.warning("alert_admin: MAX exception: %s", exc)
-
-    if not delivered:
+    # #395 (R1 sol): дуал ОДНИМ to_thread через общий sync-helper — оба канала (TG→MAX)
+    # в одном потоке; отмена корутины-awaiter'а не расщепляет каналы (поток доводит оба).
+    delivered, delivered_via = await asyncio.to_thread(
+        _deliver_dual_sync, text,
+        tg_bot_token=tg_bot_token, tg_chat_id=tg_chat_id,
+        max_bot_token=max_bot_token, max_chat_id=max_chat_id,
+    )
+    if delivered:
+        logger.info("alert_admin: delivered via %s", delivered_via)
+    else:
         logger.warning("alert_admin: delivery failed across all channels")
     return delivered
 
@@ -363,6 +345,46 @@ def _post_max_sync(bot_token: str, chat_id: str, text: str) -> bool:
         return False
 
 
+def _deliver_dual_sync(
+    text: str,
+    *,
+    tg_bot_token: str | None,
+    tg_chat_id: str | None,
+    max_bot_token: str | None,
+    max_chat_id: str | None,
+) -> tuple[bool, str | None]:
+    """#395: доставка служебного алерта в ОБА канала — Telegram основной (ПЕРВЫМ) +
+    MAX дубль (ВТОРЫМ), best-effort. ЕДИНЫЙ источник дуал-логики для обоих входов
+    (``alert_admin_async`` и ``_deliver_in_thread``) — чтобы порядок/семантика не
+    расходились (R1 sol). Сконфигурен один канал → уходит только туда.
+
+    Каждый канал в своём try/except: ``_post_*_sync`` и так глотают исключения → bool,
+    это двойная страховка (если будущая реализация бросит — сбой одного канала НЕ
+    мешает другому).
+
+    Returns ``(delivered, delivered_via)``: delivered=True если долетело ≥1 канал;
+    delivered_via — какие каналы сработали ("telegram" / "max" / "telegram+max" / None).
+
+    Синхронный: вызывается напрямую из daemon-потока (``_deliver_in_thread``) и из
+    ``alert_admin_async`` ОДНИМ ``asyncio.to_thread`` — тогда отмена корутины-awaiter'а
+    не расщепляет каналы (поток доводит оба).
+    """
+    _tg = False
+    _max = False
+    if tg_bot_token and tg_chat_id:
+        try:
+            _tg = _post_telegram_sync(tg_bot_token, tg_chat_id, text)
+        except Exception as exc:  # noqa: BLE001 — best-effort, второй канал не блокируем
+            logger.warning("admin_alerts: Telegram exception: %s", type(exc).__name__)
+    if max_bot_token and max_chat_id:
+        try:
+            _max = _post_max_sync(max_bot_token, max_chat_id, text)
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning("admin_alerts: MAX exception: %s", type(exc).__name__)
+    delivered_via = "+".join(c for c, s in (("telegram", _tg), ("max", _max)) if s) or None
+    return (_tg or _max), delivered_via
+
+
 def _deliver_in_thread(
     *,
     dedupe_key: str,
@@ -447,25 +469,15 @@ def _deliver_in_thread(
     if len(text_payload) > 4000:
         text_payload = text_payload[:3950] + "\n\n…(truncated)"
 
-    # Phase 4: deliver — DUAL by default (#395): Telegram основной (ПЕРВЫМ) + MAX
-    # дубль (ВТОРЫМ). Каналы независимы, best-effort (_post_*_sync глотают исключения
-    # → bool, не бросают). ok=True если доставил ХОТЯ БЫ один; сконфигурен один канал →
-    # уходит только туда. mark_sent — один раз на alert (после ≥1 успеха), поэтому
-    # потеря одного канала не крутит ре-файр. delivered_via — diagnostic-лог (какие
-    # каналы реально сработали).
-    ok = False
-    delivered_via: str | None = None
+    # Phase 4: deliver — DUAL by default (#395) через общий _deliver_dual_sync (Telegram
+    # основной, MAX дубль; best-effort, ok если ≥1). mark_sent один раз на alert (после
+    # ≥1 успеха) → потеря одного канала не крутит ре-файр. delivered_via — diagnostic-лог.
     try:
-        _tg = False
-        _max = False
-        if tg_bot_token and tg_chat_id:
-            _tg = _post_telegram_sync(tg_bot_token, tg_chat_id, text_payload)
-        if max_bot_token and max_chat_id:
-            _max = _post_max_sync(max_bot_token, max_chat_id, text_payload)
-        if _tg or _max:
-            ok = True
-            delivered_via = "+".join(c for c, s in (("telegram", _tg), ("max", _max)) if s)
-
+        ok, delivered_via = _deliver_dual_sync(
+            text_payload,
+            tg_bot_token=tg_bot_token, tg_chat_id=tg_chat_id,
+            max_bot_token=max_bot_token, max_chat_id=max_chat_id,
+        )
         if ok:
             logger.info(
                 "admin_alerts: delivered via %s (key=%s severity=%s)",

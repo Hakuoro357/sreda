@@ -796,3 +796,58 @@ def test_395_alert_admin_async_tg_down_max_delivers(_db_max, monkeypatch) -> Non
     result = asyncio.run(alert_admin_async("m"))
     assert result is True
     assert calls == ["tg", "max"]
+
+
+# ── (10) #395 (R1 sol): общий sync-helper _deliver_dual_sync ─────────
+
+
+def test_395_deliver_dual_sync_order_and_best_effort(monkeypatch) -> None:
+    """#395 (R1 sol): единый sync-helper — TG первым, MAX вторым; исключение одного
+    канала проглочено (best-effort), второй доставляет; delivered/via корректны."""
+    order: list[str] = []
+
+    def _tg(_t, _c, _x):
+        order.append("tg")
+        raise RuntimeError("tg boom")
+
+    def _mx(_t, _c, _x):
+        order.append("max")
+        return True
+
+    monkeypatch.setattr(aa, "_post_telegram_sync", _tg)
+    monkeypatch.setattr(aa, "_post_max_sync", _mx)
+
+    delivered, via = aa._deliver_dual_sync(
+        "text", tg_bot_token="tk", tg_chat_id="tc",
+        max_bot_token="mk", max_chat_id="mc",
+    )
+    assert order == ["tg", "max"]  # TG первым несмотря на его падение
+    assert delivered is True       # MAX доставил → ≥1
+    assert via == "max"
+
+
+def test_395_deliver_dual_sync_both_ok_via_string(monkeypatch) -> None:
+    """#395: оба канала ok → via='telegram+max', delivered=True."""
+    monkeypatch.setattr(aa, "_post_telegram_sync", lambda *a: True)
+    monkeypatch.setattr(aa, "_post_max_sync", lambda *a: True)
+    delivered, via = aa._deliver_dual_sync(
+        "t", tg_bot_token="tk", tg_chat_id="tc",
+        max_bot_token="mk", max_chat_id="mc",
+    )
+    assert delivered is True
+    assert via == "telegram+max"
+
+
+def test_395_deliver_dual_sync_no_channel(monkeypatch) -> None:
+    """#395: ни один канал не сконфигурен → ничего не шлём, delivered=False, via=None."""
+    tg_called: list = []
+    max_called: list = []
+    monkeypatch.setattr(aa, "_post_telegram_sync", lambda *a: tg_called.append(a) or True)
+    monkeypatch.setattr(aa, "_post_max_sync", lambda *a: max_called.append(a) or True)
+    delivered, via = aa._deliver_dual_sync(
+        "t", tg_bot_token=None, tg_chat_id=None,
+        max_bot_token=None, max_chat_id=None,
+    )
+    assert delivered is False
+    assert via is None
+    assert tg_called == [] and max_called == []
