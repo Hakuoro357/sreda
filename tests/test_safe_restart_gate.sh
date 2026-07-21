@@ -330,6 +330,13 @@ OLD="$WS/safe_restart_old.sh"
 GOT_OLD=0
 if [ -n "${SR_OLD_SCRIPT:-}" ] && [ -f "$SR_OLD_SCRIPT" ]; then
     cp "$SR_OLD_SCRIPT" "$OLD" && GOT_OLD=1
+elif [ -f "$REPO_ROOT/tests/fixtures/safe_restart_prefix.sh" ]; then
+    # Фикстура в репозитории — основной источник. Раньше базлайн добывался через
+    # `git show`, и в реальной среде проекта (тест бежит под WSL, а рабочая копия —
+    # git-worktree с указателем на windows-путь) git оттуда недоступен: ОБЯЗАТЕЛЬНЫЙ
+    # тест-доказательство инцидента просто не запускался. Фикстура убирает зависимость
+    # и от git, и от резолва путей. Защита от тавтологии ниже проверяет её так же.
+    cp "$REPO_ROOT/tests/fixtures/safe_restart_prefix.sh" "$OLD" && GOT_OLD=1
 elif git -C "$REPO_ROOT" show "${SR_OLD_SHA:-74adbfbff62f88edfc53f31f340336a98af70ae6}:scripts/safe_restart.sh" > "$OLD" 2>/dev/null; then
     GOT_OLD=1
 fi
