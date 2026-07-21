@@ -349,7 +349,6 @@ async def _process_approved_turn_locked(
                 and not onboarding.is_new_user
                 and onboarding.tenant_id in get_settings().react_loop_enabled_tenants):
             from sreda.runtime import react_loop
-            from sreda.services.llm import get_chat_llm
             _cb_id = str(_cb.get("id") or "")
             if _cb_id:
                 try:
@@ -358,7 +357,11 @@ async def _process_approved_turn_locked(
                     pass
             _s2 = get_settings()
             _prov2 = react_loop.react_provider(onboarding.tenant_id)  # #184 «Оса» per-tenant
-            _llm2 = get_chat_llm(provider=_prov2, settings=_s2)
+            _fb2 = react_loop.react_fallback_llm(_prov2)  # #184 Оса-fallback (ПЕРВЫМ — гейт #401)
+            # #401: fail-fast primary ТОЛЬКО когда запас РЕАЛЬНО построен (R1 sol+terra MAJOR)
+            _llm2 = react_loop.react_primary_llm(_prov2, _s2, has_fallback=(_fb2 is not None))
+            from sreda.services.llm import get_chat_llm
+            _chat_fb2 = get_chat_llm(provider=_prov2, settings=_s2)  # #401 default-retry для chat/fact-фолбэка
             # resume_only + expected_confirm_id: тап возобновляет ТОЛЬКО ту confirm-паузу,
             # к которой кнопка была привязана (id из callback_data). Устаревший/повторный/
             # чужой тап → пустой ответ (no-op), свежий ход не стартуем (R3 Codex MAJOR A/B).
@@ -371,7 +374,8 @@ async def _process_approved_turn_locked(
                 resume_only=True,
                 expected_confirm_id=react_loop.confirm_callback_id(_cb_data),
                 provider_key=_prov2,  # #175 учёт расхода + #184 «Оса»
-                fallback_llm=react_loop.react_fallback_llm(_prov2))  # #184 Оса-fallback
+                fallback_llm=_fb2,  # #184 Оса-fallback
+                chat_fallback_llm=_chat_fb2)  # #401 default-retry Mercury для chat/fact-фолбэка
             trace.record("react_loop.resumed", chars=len(_reply2 or ""),
                          channel="telegram", noop=(not _reply2))
             if _reply2:  # непустой → пауза возобновлена (пустой = устаревший/чужой тап → no-op)
@@ -564,11 +568,14 @@ async def _process_approved_turn_locked(
                             )
                             return
                 from sreda.runtime import react_loop
-                from sreda.services.llm import get_chat_llm
 
                 _s = get_settings()
                 _prov = react_loop.react_provider(onboarding.tenant_id)  # #184 «Оса» per-tenant
-                _llm = get_chat_llm(provider=_prov, settings=_s)
+                _fb = react_loop.react_fallback_llm(_prov)  # #184 Оса-fallback (ПЕРВЫМ — гейт #401)
+                # #401: fail-fast primary ТОЛЬКО когда запас РЕАЛЬНО построен (R1 sol+terra MAJOR)
+                _llm = react_loop.react_primary_llm(_prov, _s, has_fallback=(_fb is not None))
+                from sreda.services.llm import get_chat_llm
+                _chat_fb = get_chat_llm(provider=_prov, settings=_s)  # #401 default-retry для chat/fact-фолбэка
                 # ack v3 + #252: «Минутку…» (для голоса уже послан до расшифровки —
                 # переиспользуем _early_ack_mid), правим его ПО ЭТАПАМ пока идёт ход
                 # (_drive_ack_progress), в конце редактируем в финальный ответ (одно
@@ -599,7 +606,8 @@ async def _process_approved_turn_locked(
                         inbound_message_id=inbound_message_id,
                         channel="telegram",
                         provider_key=_prov,  # #175 учёт расхода + #184 «Оса»
-                        fallback_llm=react_loop.react_fallback_llm(_prov),  # #184 Оса-fallback
+                        fallback_llm=_fb,  # #184 Оса-fallback
+                        chat_fallback_llm=_chat_fb,  # #401 default-retry Mercury для chat/fact-фолбэка
                     )
                 finally:
                     # #252: снимаем прогресс-драйвер ДО финальной правки ак (нет гонки

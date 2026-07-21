@@ -42,7 +42,9 @@ class ReactTurnTrace(Base):
     origin_user_text: Mapped[str | None] = mapped_column(EncryptedString(), nullable=True)
     reply_text: Mapped[str | None] = mapped_column(EncryptedString(), nullable=True)
     # наблюдательная структура (НЕ деньги — деньги в skill_ai_executions #175)
-    # llm_calls: [{phase, call_index, provider_key, model, latency_ms, retries, fallback_fired}]
+    # llm_calls: [{phase, call_index, provider_key, model, latency_ms, retries, fallback_fired,
+    #   primary_latency_ms?, fallback_latency_ms?}]  # #401: под-тайминги (опц.: попытка primary /
+    #   вызов резерва; latency_ms = ИТОГ; поля опускаются на OFF/happy-path без резерва)
     llm_calls_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     # tool_calls: [{name, args_hash(HMAC), ok, result_kind, error_type, latency_ms}]
     tool_calls_json: Mapped[str | None] = mapped_column(Text, nullable=True)
