@@ -425,6 +425,42 @@ def text_mentions_time(text: str) -> bool:
     return bool(_TIME_RE.search(_DURATION_STRIP_RE.sub(" ", text or "")))
 
 
+def checklist_read_intent(text: str) -> frozenset[str]:
+    """#399: детерминированный сигнал «человек просит ПОКАЗАТЬ чек-лист» → {checklists} | ∅.
+
+    ЗАЧЕМ. На «покажи список X» и route_domains, и LLM-классификатор верно дают `checklists`,
+    но в `allowed_read` раздел не попадал (замер на проде: 0 из 15 показов):
+      - read-кюс `\\bсписк` НЕ матчит «спис-О-к» — беглая гласная (номинатив/аккузатив ед.ч.);
+      - route-раздел в чтение НЕ проводится намеренно (защита own-data #285): «как дела»
+        роутится в `checklists` ТОЖЕ, и голая проводка открыла бы личные данные на болтовне.
+    Нужен отдельный сигнал «это правда запрос чтения». Переиспользуем УЖЕ КАЛИБРОВАННЫЙ
+    детерминированный детектор #213 — новых языковых паттернов не заводим (директива владельца
+    2026-07-20: не плодить русские регексы в роутере; языко-нейтральный вариант B доливается
+    через ШОВ `read_intent_domains` в compute_unified_policy, эту функцию не трогая).
+
+    ПОЧЕМУ ТОЛЬКО `confidence == "high"`. Бит «детектор вернул не-None» НЕ годится: на «как дела»
+    `classify_checklist_query` возвращает `items/LOW` (в его секц-регексе есть голое «дела»), и
+    мина открылась бы. `high` = детектор уверен, что ход — чек-листовый ЗАПРОС: kind
+    overview/search/mixed уверенны и БЕЗ имени, items — при распознанном имени списка. Формы без
+    имени («покажи мои списки») от этого не страдают: их поднимает read-кюс `списк\\w*`, а
+    политика берёт ОБЪЕДИНЕНИЕ источников. Остаточный класс (роутер дал checklists, сигнал
+    промолчал при явном read-маркере) МЕРИТСЯ на канарейке — `read_intent.residual_miss`
+    в `router_decision_json`, иначе фикс замаскировал бы хвост промахов.
+
+    Write-ходы детектор отсекает сам (None) — сигнал ЧТЕНИЯ на них не выдаётся; «список покупок»
+    → shopping, не чек-листы (лексика #221). Чистая, тотальная: любой сбой/мусор → ∅ (fail-open
+    в текущее поведение — web-only, как до фикса).
+    """
+    try:
+        from sreda.runtime.react_preflight import classify_checklist_query
+        cq = classify_checklist_query(text or "")
+    except Exception:  # noqa: BLE001 — сигнал на горячем пути не роняет ход
+        return frozenset()
+    if cq is not None and cq.confidence == "high":
+        return frozenset({"checklists"})
+    return frozenset()
+
+
 def read_cue_domains(text: str) -> frozenset[str]:
     """Щедрый кюс→bounded read-домены (пилляр 3). Голый «дела»/идиома → пусто (не own-data read).
     Пусто = baseline (web без own-data, решает B2). Возврат — объединение доменов совпавших кюсов."""

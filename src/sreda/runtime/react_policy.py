@@ -83,7 +83,8 @@ POLICY_VERSION_B2 = 2
 def compute_unified_policy(text, route, classified=None, *, base_web=True,
                            sticky_memory_write=False,
                            prev_open_domains=frozenset(),
-                           disambiguator=None):
+                           disambiguator=None,
+                           read_intent_domains=None):
     """Двухъярусная политика единого пути (execute). Чистая; поведение прода не трогает (проводка — B2b).
 
     text: текст хода. route: RouteResult из route_domains(text). classified: DomainClassResult|None
@@ -160,6 +161,27 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
     allowed_read |= read_cues
     allowed_read |= allowed_write  # что разрешено писать — разрешено и читать (найти объект правки)
 
+    # #399 ШОВ read-намерения. Проблема: read-кюсы — щедрый, но НЕ полный детектор запроса
+    # чтения («покажи спис-О-к кино» мимо `\bсписк` из-за беглой гласной) → ложный отказ
+    # «не могу показать» (0/15 на проде). Провести route-раздел напрямую НЕЛЬЗЯ: «как дела»
+    # роутится в checklists и открыло бы own-data на болтовне (мина #285).
+    #
+    # Поэтому read_allowed = read_cues ИЛИ read_intent_domains — ДИЗЪЮНКЦИЯ ИСТОЧНИКОВ, и
+    # параметр СПЕЦИАЛЬНО доменный (не «чек-листовый флаг»): сегодня его наполняет
+    # детерминированный детектор #213 (вариант A, русский, только checklists), завтра —
+    # read/write-бит от LLM (вариант B, языко-нейтральный, любой раздел) вливается в ТОТ ЖЕ
+    # аргумент объединением, без переписывания проводки. Это и есть шов под будущий B.
+    #
+    # ГРАНИЦА БЕЗОПАСНОСТИ (дисциплина subtract-only #376): сигнал только ПОДТВЕРЖДАЕТ раздел,
+    # уже поднятый ДЕТЕРМИНИРОВАННЫМ роутером — пересечение с route.all_domains. Ввести НОВЫЙ
+    # раздел он не может: иначе недоверенный источник (LLM на истории с инъекцией) авторизовал
+    # бы чтение чужого раздела. Write не трогается ни при каких условиях (чтение ≠ мутация).
+    # `None` = источник не подан (флаг OFF) → ветка мертва, форма политики и трейса
+    # байт-в-байт прежняя. Пустой frozenset = флаг ON, сигнал промолчал — это РАЗНЫЕ
+    # состояния: второе обязано быть видно в трейсе (замер остаточных промахов).
+    read_intent = set(read_intent_domains or ()) & set(route.all_domains)
+    allowed_read |= read_intent
+
     # #352: LLM-фолбэк домена (classify_domains, владелец 2026-07-11 «нахера выкидываешь результат
     # ллм») — ТОЛЬКО чтение/загрузка раздела, write не расширяет (мутация по LLM-домену = кандидат
     # под confirm, ярус б). Применяется лишь high (ровно один домен, строгий enum-парс); low
@@ -209,6 +231,10 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
         # (поля не добавляются) — флаг OFF не меняет ни политику, ни трейс.
         _signals["disambig_kind"] = disambig_kind    # #376: subtract | add | None
         _signals["disambig_domains"] = disambig_domains
+    if read_intent_domains is not None:
+        # #399: та же дисциплина — поле появляется ТОЛЬКО под своим флагом. Пишем
+        # ПРИМЕНЁННОЕ (после пересечения с route), т.е. что реально открылось.
+        _signals["read_intent"] = sorted(read_intent)
 
     return {
         "v": POLICY_VERSION_B2,

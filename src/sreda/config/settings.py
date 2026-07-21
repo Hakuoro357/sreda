@@ -720,6 +720,16 @@ class Settings(BaseSettings):
     domain_clf_disambig_tenants_raw: str | None = Field(
         default=None, validation_alias="SREDA_DOMAIN_CLF_DISAMBIG_TENANTS"
     )
+    # #399: read-намерение чек-листов проводит раздел в allowed_read («покажи список X»
+    # больше не отказывает). OFF (дефолт) → байт-в-байт текущее (сигнал не считается,
+    # параметр политики не подаётся, поля трейса нет); ON + тенант в списке → сигнал #213
+    # открывает checklists на чтение + замер остаточных промахов. Канарейка: тенант владельца.
+    checklist_read_intent_enabled: bool = Field(
+        default=False, validation_alias="SREDA_CHECKLIST_READ_INTENT"
+    )
+    checklist_read_intent_tenants_raw: str | None = Field(
+        default=None, validation_alias="SREDA_CHECKLIST_READ_INTENT_TENANTS"
+    )
     # #383: SGR-шаг планировщика (схемное принуждение) для домена чеклистов.
     # OFF (дефолт) → байт-в-байт текущий путь (react_sgr даже не импортируется);
     # ON + тенант в списке + «чисто чеклистовый» unified-ход → structured-вызов
@@ -1349,6 +1359,13 @@ class Settings(BaseSettings):
         domain_clf_disambig_enabled). Пусто (дефолт) → никому; ``*`` → все.
         Канарейка: сперва тенант владельца."""
         return _parse_tenant_gate(self.domain_clf_disambig_tenants_raw)
+
+    @property
+    def checklist_read_intent_tenants(self) -> frozenset[str]:
+        """#399: тенанты read-намерения чек-листов (при включённом
+        checklist_read_intent_enabled). Пусто (дефолт) → никому; ``*`` → все.
+        Канарейка: сперва тенант владельца."""
+        return _parse_tenant_gate(self.checklist_read_intent_tenants_raw)
 
     @property
     def sgr_planner_tenants(self) -> frozenset[str]:

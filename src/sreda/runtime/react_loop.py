@@ -2277,6 +2277,16 @@ def _domain_clf_disambig_for(tenant_id: str) -> bool:
     return bool(s.domain_clf_disambig_enabled) and (tenant_id in s.domain_clf_disambig_tenants)
 
 
+def _checklist_read_intent_for(tenant_id: str) -> bool:
+    """#399: read-намерение чек-листов проводит раздел в чтение для этого тенанта
+    (флаг + канареечный список, паттерн #285/#376/#383). OFF / не в списке → байт-в-байт
+    текущее: сигнал не считается, параметр политике не подаётся, поля трейса нет."""
+    from sreda.config.settings import get_settings
+    s = get_settings()
+    return bool(s.checklist_read_intent_enabled) and (
+        tenant_id in s.checklist_read_intent_tenants)
+
+
 def _sgr_planner_for(tenant_id: str) -> bool:
     """#383: SGR-шаг планировщика для этого тенанта (флаг + канареечный список, паттерн
     #285/#376). OFF / не в списке → байт-в-байт текущее (react_sgr не импортируется вовсе)."""
@@ -5462,6 +5472,9 @@ async def handle_turn(
                     from sreda.runtime.react_policy import compute_unified_policy
                     from sreda.runtime.react_preflight import classify_domains as _cd352
                     from sreda.runtime.react_preflight import route_domains as _rd285
+                    from sreda.runtime.react_signals import (
+                        checklist_read_intent as _checklist_read_intent,
+                    )
                     # #319 sticky-by-use: ПРОШЛЫЙ ход записал в память (renewal в run_tools) → серия
                     # продолжается без confirm. Consume из _pre_vals (снап ДО хода); _init выше сбросил
                     # канал — ход докажет запись заново. Граница по смыслу (факт записи), не по времени.
@@ -5471,10 +5484,21 @@ async def handle_turn(
                     _pod = frozenset(_prev_open_domains(_pre_vals.get("messages")))
                     _route285 = _rd285(user_text)
                     _sticky285 = bool(_pre_vals.get("sticky_memory_write"))
+                    # #399: read-намерение чек-листов. Детерминированный сигнал #213 говорит
+                    # «это ЗАПРОС ПОКАЗАТЬ» → раздел проводится в allowed_read (иначе «покажи
+                    # спис-О-к кино» мимо read-кюса `\bсписк` → web-only → ложный отказ, 0/15
+                    # на проде). Мину «как дела» (route→checklists) сигнал не открывает: там
+                    # детектор даёт items/LOW. `None` при OFF = ветка мертва (байт-в-байт).
+                    # ВАЖНО: подаётся во ВСЕ пересчёты политики ниже (#376 subtract / #352
+                    # континуация) — иначе на тенанте с #376 фикс молча терялся бы вместе с
+                    # перезаписью _upol.
+                    _ri399_on = _checklist_read_intent_for(tenant_id)
+                    _ri399 = _checklist_read_intent(user_text) if _ri399_on else None
                     _upol = compute_unified_policy(
                         user_text, _route285,
                         sticky_memory_write=_sticky285,
-                        prev_open_domains=_pod)
+                        prev_open_domains=_pod,
+                        read_intent_domains=_ri399)
                     # #376: every-turn дизамбигуация неоднозначной read-кюс-группы умным
                     # классификатором (спецификация владельца 2026-07-15: звать на каждом свежем
                     # ходе, вся разница — владельцу, классификатор = правда ДЛЯ ДИЗАМБИГУАЦИИ).
@@ -5502,7 +5526,8 @@ async def handle_turn(
                                 user_text, _route285,
                                 sticky_memory_write=_sticky285,
                                 prev_open_domains=_pod,
-                                disambiguator=_cls376)
+                                disambiguator=_cls376,
+                                read_intent_domains=_ri399)  # #399: не терять при subtract
                             _kind376 = _upol376["signals"].get("disambig_kind")
                             _changed376 = (_upol376["allowed_read"] != _upol["allowed_read"])
                             _dis376 = {"ran": True,
@@ -5558,7 +5583,8 @@ async def handle_turn(
                                 _upol = compute_unified_policy(
                                     user_text, _route285, _cls352,
                                     sticky_memory_write=_sticky285,
-                                    prev_open_domains=_pod)
+                                    prev_open_domains=_pod,
+                                    read_intent_domains=_ri399)  # #399: не терять при континуации
                     # #376 слой-2: детерминированное сужение items-vs-overview внутри чек-листов.
                     # classify_checklist_query (regex, #213) сказал «конкретный список по имени» +
                     # имя резолвится в РЕАЛЬНЫЙ чек-лист (exact|unique_fuzzy) + домен checklists
@@ -5600,6 +5626,42 @@ async def handle_turn(
                             logger.warning(
                                 "react_loop: #376 pre-exec failed type=%s at=%s → штатный путь",
                                 _safe_tn(_e376n), _safe_tb(_e376n))
+                    # #399 ЗАМЕР ОСТАТОЧНЫХ ПРОМАХОВ (обязательная часть поставки, не «потом»).
+                    # Без него фикс МАСКИРУЕТ проблему: явный баг закроется, а фразы, которые
+                    # детектор не поймал, останутся НЕВИДИМЫМ хвостом ложных отказов.
+                    # Класс: роутер поднял checklists + в тексте явный read-маркер + нет
+                    # отрицания, а чтение так и НЕ открылось. Болтовня сюда не попадает —
+                    # у «как дела» read-маркера нет (её отсечение проверяется тестом).
+                    # Считается по ИТОГОВОЙ политике (после #376/#352), только под своим флагом.
+                    # В трейс/лог идут ТОЛЬКО вердикт детектора и разделы — без текста юзера (ПД).
+                    _ri399_meta: dict = {}
+                    if _ri399_on:
+                        from sreda.runtime.react_preflight import (
+                            classify_checklist_query as _cq399f,
+                        )
+                        _lc399 = (user_text or "").lower()
+                        _ri399_opened = "checklists" in _upol["allowed_read"]
+                        _ri399_residual = bool(
+                            "checklists" in _route285.all_domains
+                            and not _ri399_opened
+                            and _re376_read_marker.search(_lc399)
+                            and not _re376_negation.search(_lc399))
+                        _cq399 = _cq399f(user_text)
+                        _ri399_meta = {
+                            "signal": sorted(_ri399 or ()),
+                            "opened": _ri399_opened,
+                            "residual_miss": _ri399_residual,
+                            "cq_kind": _cq399.kind if _cq399 else None,
+                            "cq_conf": _cq399.confidence if _cq399 else None,
+                        }
+                        if _ri399_residual:
+                            # ЛОВИТСЯ ГРЕПОМ: react_read_intent #399 residual_miss
+                            logger.info(
+                                "react_read_intent #399 residual_miss: tenant=%s cq=%s/%s "
+                                "route=%s cues=%s read=%s",
+                                tenant_id, _ri399_meta["cq_kind"], _ri399_meta["cq_conf"],
+                                sorted(_route285.all_domains),
+                                _upol["signals"]["read_cues"], _upol["allowed_read"])
                     _uar, _uaw = list(_upol["allowed_read"]), list(_upol["allowed_write"])
                     _init["intent"] = "task"  # единый = полный путь (не web-only chat/fact split)
                     _init["intent_meta"] = {"source": "unified", "must_task": False, "classifier_raw": ""}
@@ -5611,6 +5673,8 @@ async def handle_turn(
                     # флаг OFF / не-allowlist → трейс байт-в-байт прежний.
                     _rdj = {"mode": "unified-execute", "allowed_read": _uar, "allowed_write": _uaw,
                             "signals": _upol["signals"], "llm_fallback": _lf352}
+                    if _ri399_on:
+                        _rdj["read_intent"] = _ri399_meta  # #399: сигнал/открыто/остаточный промах
                     if _dis376_on:
                         _rdj["disambig"] = _dis376  # #376: статик/классификатор/вид/применено (без ПД)
                         # слой-2: сужение (без имени списка — ПД; только факт+статус резолвера)
