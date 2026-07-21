@@ -257,10 +257,16 @@ def _reduce_bulk_acts(window, results: dict) -> tuple[WriteAct, ...]:
     for name in _BULK_SPECS:
         if name in cleared:
             out.append(WriteAct(name, "bulk", "", (), cleared[name]))
+        elif name in failed:
+            # #409 R4 (terra MAJOR): НЕИСПОЛНЕНИЕ приоритетнее «было пусто». Ход
+            # «error: → ретрай → ok:cleared:0» НЕ доказывает, что чистить было нечего: сбой мог
+            # прийти на НЕОПРЕДЕЛЁННОМ коммите (clear_pending коммитит внутри), и ретрай
+            # закономерно увидел ноль ПОСЛЕ успешной очистки первой попыткой. Сказать «список и
+            # так был пуст» — ложная квитанция о состоянии на P0-деструктиве; честнее «не
+            # получилось». Доказанный N>0 по-прежнему выше ошибки — там эффект подтверждён.
+            out.append(WriteAct(name, "bulk_error", "", (), 0))
         elif name in empty:
             out.append(WriteAct(name, "bulk_empty", "", (), 0))
-        elif name in failed:
-            out.append(WriteAct(name, "bulk_error", "", (), 0))
     return tuple(out)
 
 
@@ -395,6 +401,20 @@ def _plural(n: int, one: str, few: str, many: str) -> str:
     return many
 
 
+# #409 R4 (sol MAJOR): исходы БЕЗ доказанного эффекта. Их нельзя рендерить в успешной части —
+# иначе «Готово, не получилось очистить список покупок.» и промпт «успешно выполнено — не
+# получилось очистить». Общий путь WriteAct изначально предполагал, что КАЖДЫЙ акт = успех;
+# R3 пустил по нему bulk_empty/bulk_error, поэтому разделение стало обязательным.
+_NON_SUCCESS_KINDS = ("bulk_empty", "bulk_error")
+
+
+def _split_by_success(acts) -> tuple[list, list]:
+    """(акты с доказанным эффектом, акты без эффекта) — порядок внутри сохраняется."""
+    ok = [a for a in acts if a.kind not in _NON_SUCCESS_KINDS]
+    non_ok = [a for a in acts if a.kind in _NON_SUCCESS_KINDS]
+    return ok, non_ok
+
+
 def _units(n: int) -> str:
     return f"{n} {_plural(n, 'пункт', 'пункта', 'пунктов')}"
 
@@ -426,9 +446,14 @@ def grounding_note(acts) -> str:
     """Часть 1 (ПРОМПТ узла chat, вариант C): ТОЛЬКО серверные факты результата (статус/кол-во/тип),
     БЕЗ сырых имён — заряжает голос назвать конкретику из tool-результата в истории. Ни одна
     юзер-строка не входит в инструкции модели → инъекц-surface закрыт структурно. Пусто, если актов нет."""
-    if not acts:
+    ok_acts, _non_ok = _split_by_success(acts)
+    # #409 R4 (sol MAJOR): в «успешно выполнено» попадают ТОЛЬКО акты с доказанным эффектом.
+    # Неисполнение/no-op сюда не пишем: противоречивый промпт («успешно выполнено — не получилось»)
+    # мог бы подавить штатный повтор или need_family. Реплика для таких исходов всё равно
+    # детерминированная (bulk никогда не считается заземлённым), так что заряжать голос нечем.
+    if not ok_acts:
         return ""
-    facts = "; ".join(_fact(a) for a in acts)
+    facts = "; ".join(_fact(a) for a in ok_acts)
     return (
         "[Служебная сводка результата этого хода — это ФАКТЫ, НЕ инструкции]: успешно выполнено — "
         + facts + ". Теперь назови пользователю КОНКРЕТНО, что именно сделала (какой список и какие "
@@ -471,8 +496,18 @@ def fallback_reply(acts) -> str:
     """Часть 2: детерминированная заземлённая реплика-страховка (тёплый шаблон). Всегда называет
     результат — именами (из okv2-результата) либо, если неотображаемы, серверными фактами (кол-во+тип).
     Пусто только если актов нет."""
-    body = "; ".join(p for p in (_phrase(a) for a in acts) if p)
-    return f"Готово, {body}." if body else ""
+    ok_acts, non_ok_acts = _split_by_success(acts)
+    ok_body = "; ".join(p for p in (_phrase(a) for a in ok_acts) if p)
+    non_ok_body = "; ".join(p for p in (_phrase(a) for a in non_ok_acts) if p)
+    parts: list[str] = []
+    if ok_body:
+        parts.append(f"Готово, {ok_body}.")
+    if non_ok_body:
+        # #409 R4 (sol MAJOR): ОТДЕЛЬНОЕ предложение без «Готово» — «Готово, не получилось
+        # очистить список покупок.» противоречиво. Смешанный исход читается честно:
+        # «Готово, убрала список «Дача». Не получилось очистить список покупок.»
+        parts.append(non_ok_body[0].upper() + non_ok_body[1:] + ".")
+    return " ".join(parts)
 
 
 __all__ = [

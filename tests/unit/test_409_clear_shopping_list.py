@@ -425,16 +425,21 @@ def test_bulk_reply_is_never_judged_by_free_text_409(reply) -> None:
         f"свободный текст зачтён как отчёт об очистке: {reply!r}"
 
 
-def _msgs_multi(*outcomes):
-    """Ход с НЕСКОЛЬКИМИ вызовами инструментов: [(tool, content, result_kind), ...]."""
+def _msgs_multi_args(*outcomes):
+    """Ход с НЕСКОЛЬКИМИ вызовами: [(tool, args, content, result_kind), ...]."""
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
     msgs = [HumanMessage(content="очисти список покупок")]
-    for i, (tool, content, kind) in enumerate(outcomes):
+    for i, (tool, args, content, kind) in enumerate(outcomes):
         cid = f"call_{i}"
-        msgs.append(AIMessage(content="", tool_calls=[{"name": tool, "args": {}, "id": cid}]))
+        msgs.append(AIMessage(content="", tool_calls=[{"name": tool, "args": args, "id": cid}]))
         msgs.append(ToolMessage(content=content, tool_call_id=cid, artifact={"result_kind": kind}))
     return msgs
+
+
+def _msgs_multi(*outcomes):
+    """То же, но без аргументов: [(tool, content, result_kind), ...]."""
+    return _msgs_multi_args(*((t, {}, c, k) for t, c, k in outcomes))
 
 
 def test_empty_outcome_gets_honest_deterministic_reply_409() -> None:
@@ -509,6 +514,54 @@ def test_repeat_after_success_does_not_add_false_empty_409() -> None:
         ("clear_shopping_list", "ok:cleared:5", "ok"),
         ("clear_shopping_list", "ok:cleared:0", "ok")))
     assert len(acts) == 1 and acts[0].kind == "bulk" and acts[0].count == 5
+    assert "пуст" not in fallback_reply(acts).lower()
+
+
+def test_non_success_outcome_is_not_dressed_as_success_409() -> None:
+    """R4 (sol MAJOR): общий путь WriteAct изначально считал КАЖДЫЙ акт успехом, и R3 пустил по
+    нему bulk_error → выходило «Готово, не получилось очистить список покупок.», а промпт
+    сообщал модели «успешно выполнено — не получилось очистить». Противоречивая квитанция на
+    P0-деструктиве (и противоречивый промпт мог подавить штатный повтор)."""
+    from sreda.runtime.react_result_report import (
+        collect_successful_writes,
+        fallback_reply,
+        grounding_note,
+    )
+
+    for raw, kind in (("Инструмент недоступен", "domain_blocked"), ("error: internal", "error"),
+                      ("ok:cleared:0", "ok")):
+        acts = collect_successful_writes(_messages(raw, result_kind=kind))
+        reply = fallback_reply(acts)
+        assert not reply.startswith("Готово"), f"исход без эффекта подан как успех: {reply!r}"
+        assert grounding_note(acts) == "", "промпт заявляет «успешно выполнено» о неуспехе"
+
+
+def test_mixed_success_and_failure_read_honestly_409() -> None:
+    """Смешанный исход: успех другого инструмента и неудача очистки — ОТДЕЛЬНЫМИ предложениями,
+    без «Готово, не получилось»."""
+    from sreda.runtime.react_result_report import collect_successful_writes, fallback_reply
+
+    acts = collect_successful_writes(_msgs_multi_args(
+        ("archive_checklist", {"list_id_or_title": "Дача"}, "ok:archived:cl_1", "ok"),
+        ("clear_shopping_list", {}, "error: internal", "error")))
+    reply = fallback_reply(acts)
+    assert reply.startswith("Готово,"), "успех другого инструмента обязан остаться"
+    assert "Дача" in reply
+    assert "Не получилось очистить список покупок." in reply, f"неудача не названа честно: {reply!r}"
+    assert "Готово, не получилось" not in reply
+
+
+def test_error_then_zero_is_reported_as_failure_not_empty_409() -> None:
+    """R4 (terra MAJOR): ход «error: → ретрай → ok:cleared:0» НЕ доказывает, что чистить было
+    нечего — сбой мог прийти на НЕОПРЕДЕЛЁННОМ коммите (clear_pending коммитит внутри), и ретрай
+    увидел ноль ПОСЛЕ успешной очистки первой попыткой. «Список и так был пуст» здесь — ложная
+    квитанция о состоянии. Приоритет схлопывания: доказанный N>0 > неисполнение > пусто."""
+    from sreda.runtime.react_result_report import collect_successful_writes, fallback_reply
+
+    acts = collect_successful_writes(_msgs_multi(
+        ("clear_shopping_list", "error: internal", "error"),
+        ("clear_shopping_list", "ok:cleared:0", "ok")))
+    assert [a.kind for a in acts] == ["bulk_error"], "неисполнение подменено ложным «было пусто»"
     assert "пуст" not in fallback_reply(acts).lower()
 
 
