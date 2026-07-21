@@ -34,6 +34,7 @@ from sreda.workers.domain_divergence_digest import (
 )
 
 NOW = datetime(2026, 7, 21, 3, 0, tzinfo=timezone.utc)  # понедельник, ISO-неделя 30
+TENANT = "tenant_max_40921122"
 
 
 @pytest.fixture()
@@ -47,11 +48,20 @@ def session():
         sess.close()
 
 
+@pytest.fixture(autouse=True)
+def _allow_previews(monkeypatch):
+    """По умолчанию в тестах тенант-канарейка В privacy-allowlist — иначе формулировок
+    не будет вовсе (CR R1: показывать тексты можно только явно разрешённым тенантам).
+    Тесты про запрет переопределяют фикстуру своим monkeypatch."""
+    monkeypatch.setattr(dd, "_preview_tenants", lambda: frozenset({TENANT}))
+    monkeypatch.setattr(dd, "_disambig_tenant_filter", lambda: [])
+
+
 _seq = iter(range(100000))
 
 
 def _trace(sess, *, disambig: dict | None, days_ago: float = 1.0,
-           text: str | None = None, tenant: str = "tenant_max_40921122"):
+           text: str | None = None, tenant: str = TENANT):
     """Строка react_turn_trace с блоком routing_decision_json.disambig — ровно той формы,
     что пишет react_loop (`_rdj["disambig"] = _dis376`, react_loop.py:5615)."""
     n = next(_seq)
@@ -245,8 +255,109 @@ def test_examples_in_report_are_scrubbed(session):
 
     assert "89161234560" not in text
     assert len(counts.cases[0].examples) <= dd.EXAMPLES_PER_CASE
-    for ex in counts.cases[0].examples:
-        assert not any(ch.isdigit() for ch in ex)
+    for phrase, _n in counts.cases[0].examples:
+        assert not any(ch.isdigit() for ch in phrase)
+
+
+def test_examples_only_for_privacy_allowlisted_tenants(session, monkeypatch):
+    """CR R1 (sol MAJOR / terra CRITICAL): скраббер не есть анонимизация — имена и
+    адреса регуляркой не вычистить. Поэтому текст показывается ТОЛЬКО для тенантов из
+    admin_alert_preview_tenants; по умолчанию список пуст → формулировок нет ни у кого,
+    и расширение канарейки #376 на всех НЕ начинает лить чужие тексты владельцу."""
+    monkeypatch.setattr(dd, "_preview_tenants", frozenset)  # пустой allowlist
+    for _ in range(3):
+        _trace(session, disambig=_add_not_applied(), text="Иванов Пётр, Ленина 5 кв 3")
+    session.commit()
+
+    counts = gather_week_counts(session, now=NOW)
+    text = format_report(counts, now=NOW)
+
+    assert counts.divergences == 3, "числа считаются по-прежнему"
+    assert counts.cases[0].examples == (), "а тексты не показываются"
+    assert "Иванов" not in text and "Ленина" not in text
+    assert counts.examples_suppressed is True
+    assert "privacy-allowlist" in text
+
+
+def test_foreign_tenant_text_never_shown(session, monkeypatch):
+    """Тенант вне allowlist не отдаёт формулировки, даже когда свой — отдаёт."""
+    monkeypatch.setattr(dd, "_preview_tenants", lambda: frozenset({TENANT}))
+    _trace(session, disambig=_add_not_applied(), text="своя фраза")
+    _trace(session, disambig=_add_not_applied(), text="ЧУЖАЯ ТАЙНА", tenant="tenant_tg_777")
+    session.commit()
+
+    text = format_report(gather_week_counts(session, now=NOW), now=NOW)
+
+    assert "своя фраза" in text
+    assert "ЧУЖАЯ ТАЙНА" not in text and "тайна" not in text.lower()
+
+
+def test_top_phrasings_ranked_by_frequency(session):
+    """CR R1 sol MAJOR: «топ формулировок» — лидеры ЧАСТОТЫ, а не первые по времени.
+    Редкие ранние фразы не должны вытеснять ту, что повторилась десятки раз."""
+    for i in range(8):
+        _trace(session, disambig=_add_not_applied(), days_ago=6.0,
+               text=f"редкая фраза номер {i}")
+    for _ in range(30):
+        _trace(session, disambig=_add_not_applied(), days_ago=1.0,
+               text="частая фраза про покупки")
+    session.commit()
+
+    counts = gather_week_counts(session, now=NOW)
+
+    assert counts.cases[0].examples[0] == ("частая фраза про покупки", 30)
+    assert "x30" in format_report(counts, now=NOW)
+
+
+def test_malformed_disambig_block_is_skipped_not_counted(session):
+    """CR R1 sol MAJOR: битая форма блока не должна засчитываться как расхождение."""
+    _trace(session, disambig={"ran": True, "kind": "bogus", "applied": True,
+                              "static_domains": ["a"], "freddie_domains": ["b"]})
+    _trace(session, disambig={"ran": True, "kind": "add", "applied": "да",
+                              "static_domains": ["a"], "freddie_domains": ["b"]})
+    _trace(session, disambig=_sub_applied(), text="что в списке кино")
+    session.commit()
+
+    c = gather_week_counts(session, now=NOW)
+
+    assert c.turns_with_disambig == 3
+    assert c.divergences == 1, "битые строки не считаются расхождениями"
+    assert c.malformed == 2
+    assert "не той формы" in format_report(c, now=NOW)
+
+
+def test_unhashable_domains_do_not_crash_report(session):
+    """CR R1 sol MAJOR: объект внутри static_domains раньше давал TypeError при сборке
+    ключа и ронял ВЕСЬ недельный отчёт из-за одной строки."""
+    _trace(session, disambig={"ran": True, "kind": "add", "applied": False,
+                              "static_domains": [{"oops": 1}], "freddie_domains": ["b"]})
+    _trace(session, disambig=_add_not_applied(), text="покажи покупки")
+    session.commit()
+
+    c = gather_week_counts(session, now=NOW)
+
+    assert c.divergences == 1 and c.malformed == 1
+    assert format_report(c, now=NOW).strip()
+
+
+def test_scan_narrowed_to_disambig_tenants(session, monkeypatch):
+    """CR R1 terra MAJOR: при явном allowlist #376 недельный запрос сужается по тенанту,
+    а не сканирует весь трейс окна по всем тенантам."""
+    monkeypatch.setattr(dd, "_disambig_tenant_filter", lambda: [TENANT])
+    _trace(session, disambig=_add_not_applied(), text="своя")
+    _trace(session, disambig=_add_not_applied(), text="чужая", tenant="tenant_tg_777")
+    session.commit()
+
+    c = gather_week_counts(session, now=NOW)
+
+    assert c.divergences == 1, "чужой тенант вне выборки"
+
+
+def test_scrub_normalises_em_dash():
+    """CR R1 terra MINOR: длинное тире не должно уезжать в исходящий текст."""
+    out = scrub_phrase("купи хлеб — и молоко")
+    assert "—" not in out and "–" not in out
+    assert "-" in out
 
 
 def test_example_fetch_failure_degrades_not_crashes(session, monkeypatch):

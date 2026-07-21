@@ -60,10 +60,10 @@ FALLBACK_STATE_FILE = "/tmp/sreda-domain-divergence-state-fallback.json"
 REPORT_WINDOW = timedelta(days=7)
 FAILURE_BACKOFF = timedelta(minutes=30)
 ALERT_AFTER_CONSECUTIVE_FAILURES = 3
-# сколько обезличенных формулировок показываем на случай расхождения
+# сколько формулировок-лидеров показываем на случай расхождения
 EXAMPLES_PER_CASE = 2
-# кандидатов в примеры держим с запасом: скраббер схлопывает похожие в одну строку
-_EXAMPLE_CANDIDATES_PER_CASE = EXAMPLES_PER_CASE * 4
+# потолок строк, чей текст вообще расшифровывается ради частотной статистики
+MAX_EXAMPLE_ROWS = 2000
 # Отчёт идёт ДВУМЯ секциями с раздельными потолками. Общий топ-N не годится: живой
 # прогон 2026-07-21 (214 ходов, 92 расхождения) дал 19 неприменённых, размазанных по
 # 8 подписям, и 73 применённых всего в 2 подписи — единый список из 8 строк выдавил
@@ -84,12 +84,19 @@ _RE_WS = re.compile(r"\s+")
 
 
 def scrub_phrase(text: str | None, *, max_len: int = MAX_PHRASE_LEN) -> str:
-    """Обезличить формулировку для служебного отчёта.
+    """Снизить чувствительность формулировки для служебного отчёта.
 
     Порядок важен: ссылки и почта вычищаются ДО @-хэндлов и цифр (иначе от почты
     остаётся хвост домена). Цифры схлопываются в «#» — телефоны/адреса/суммы/даты
     не должны утекать даже в служебный канал; для калибровки роутера важна форма
-    фразы, а не числа в ней.
+    фразы, а не числа в ней. Длинные тире → дефисы (проектное ограничение на
+    исходящие тексты; CR R1 terra MINOR).
+
+    ⚠️ Это НЕ анонимизация (CR R1 sol MAJOR / terra CRITICAL): имена, адреса и
+    прочий свободный чувствительный текст регулярками не вычищаются в принципе.
+    Поэтому формулировки вообще попадают в отчёт ТОЛЬКО для тенантов из
+    privacy-allowlist ``admin_alert_preview_tenants`` (пусто по умолчанию → ни
+    для кого). Скраббер — второй рубеж, а не единственный.
     """
     if not text:
         return ""
@@ -97,10 +104,27 @@ def scrub_phrase(text: str | None, *, max_len: int = MAX_PHRASE_LEN) -> str:
     s = _RE_EMAIL.sub("<почта>", s)
     s = _RE_HANDLE.sub("<имя>", s)
     s = _RE_DIGITS.sub("#", s)
+    s = s.replace("—", "-").replace("–", "-")
     s = _RE_WS.sub(" ", s).strip()
     if len(s) > max_len:
         s = s[:max_len].rstrip() + "…"
     return s
+
+
+def _domains_tuple(raw: object) -> tuple[str, ...] | None:
+    """Список доменов из трейса → кортеж строк; всё непохожее → None (битая строка).
+    CR R1 sol MAJOR: без этого объект внутри ``static_domains`` даёт
+    ``TypeError: unhashable type`` при сборке ключа и роняет ВЕСЬ недельный отчёт."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        return None
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            return None
+        out.append(item)
+    return tuple(out)
 
 
 @dataclass(frozen=True)
@@ -112,7 +136,8 @@ class DivergenceCase:
     freddie_domains: tuple[str, ...]
     applied: bool
     count: int
-    examples: tuple[str, ...] = ()
+    # (формулировка, сколько раз встретилась) — лидеры частоты, не «первые попавшиеся»
+    examples: tuple[tuple[str, int], ...] = ()
 
     @property
     def signature(self) -> str:
@@ -129,6 +154,9 @@ class WeekCounts:
     disambig_errors: int        # сбой самого механизма (fail-open, исход хода это прячет)
     cases: tuple[DivergenceCase, ...] = ()
     truncated: bool = False     # уперлись в MAX_ROWS — отчёт по части недели
+    malformed: int = 0          # блок disambig не той формы (схема разъехалась)
+    # расхождения есть, но ни одна строка не из privacy-allowlist → формулировок нет
+    examples_suppressed: bool = False
     _debug: dict = field(default_factory=dict, compare=False, repr=False)
 
 
@@ -154,22 +182,47 @@ def _fetch_example_texts(session: Session, ids: list[str]) -> dict[str, str]:
     return out
 
 
+def _preview_tenants() -> frozenset[str]:
+    """Privacy-allowlist #149 M5: чьи тексты вообще можно показывать в служебном
+    сообщении владельцу. Строгий список без «*», пусто по умолчанию."""
+    from sreda.config.settings import get_settings
+    return get_settings().admin_alert_preview_tenants
+
+
+def _disambig_tenant_filter() -> list[str]:
+    """Тенанты, у которых #376 вообще может писать блок disambig. CR R1 terra MAJOR:
+    без сужения недельный запрос сканирует ВЕСЬ трейс окна по всем тенантам, а
+    ``MAX_ROWS`` ограничивает только результат, не скан. Явный allowlist (прод сегодня:
+    канарейка владельца) → сужаем. Режим «всем» и «никому» дают пустую итерацию
+    (см. ``_ReactTenantGate``) → сужать нечем/нечего, окно+LIMIT остаются защитой."""
+    from sreda.config.settings import get_settings
+    try:
+        return sorted(get_settings().domain_clf_disambig_tenants)
+    except Exception:  # noqa: BLE001 — конфиг не должен ронять отчёт
+        return []
+
+
 def gather_week_counts(session: Session, *, now: datetime,
                        window: timedelta = REPORT_WINDOW) -> WeekCounts:
     """Свести расхождения доменов за окно по durable-трейсу ходов."""
     since = now - window
     # LIKE сужает выборку на стороне БД (портируется и на SQLite, и на Postgres —
     # JSON-операторы у них разные), окончательный разбор — в Python по JSON.
-    rows = session.execute(
-        select(ReactTurnTrace.id, ReactTurnTrace.routing_decision_json)
-        .where(and_(
-            ReactTurnTrace.created_at >= since,
-            ReactTurnTrace.created_at < now,
-            ReactTurnTrace.routing_decision_json.is_not(None),
-            ReactTurnTrace.routing_decision_json.like('%"disambig"%'),
-        ))
-        .order_by(ReactTurnTrace.created_at)
-        .limit(MAX_ROWS + 1)).all()
+    # ORDER BY снят (CR R1 terra MAJOR): сортировка по created_at без подходящего
+    # глобального индекса гонялась по всему окну, а порядок строк отчёту не нужен —
+    # примеры теперь ранжируются по ЧАСТОТЕ, а не по «кто раньше».
+    stmt = (select(ReactTurnTrace.id, ReactTurnTrace.tenant_id,
+                   ReactTurnTrace.routing_decision_json)
+            .where(and_(
+                ReactTurnTrace.created_at >= since,
+                ReactTurnTrace.created_at < now,
+                ReactTurnTrace.routing_decision_json.is_not(None),
+                ReactTurnTrace.routing_decision_json.like('%"disambig"%'),
+            )))
+    _tenants = _disambig_tenant_filter()
+    if _tenants:
+        stmt = stmt.where(ReactTurnTrace.tenant_id.in_(_tenants))
+    rows = session.execute(stmt.limit(MAX_ROWS + 1)).all()
     truncated = len(rows) > MAX_ROWS
     if truncated:
         rows = rows[:MAX_ROWS]
@@ -177,12 +230,16 @@ def gather_week_counts(session: Session, *, now: datetime,
 
     turns = 0
     errors = 0
+    malformed = 0
     sub_applied = 0
     add_not_applied = 0
-    # подпись случая → [счётчик, ids-кандидаты в примеры]
+    preview = _preview_tenants()
+    # подпись случая → [счётчик, id строк-кандидатов на текст]
     buckets: dict[tuple, list] = {}
+    example_rows = 0
+    any_divergence_outside_preview = False
 
-    for rid, raw in rows:
+    for rid, tenant_id, raw in rows:
         try:
             rdj = json.loads(raw or "{}")
         except (TypeError, ValueError):
@@ -194,47 +251,64 @@ def gather_week_counts(session: Session, *, now: datetime,
         if dis.get("error"):
             errors += 1
             continue
+        # CR R1 sol MAJOR: форму блока проверяем ЯВНО. Иначе `kind="bogus", applied=true`
+        # молча уезжает в «применённое вычитание», а нестроковый домен роняет отчёт.
         kind = dis.get("kind")
-        applied = bool(dis.get("applied"))
+        applied_raw = dis.get("applied")
+        static_d = _domains_tuple(dis.get("static_domains"))
+        freddie_d = _domains_tuple(dis.get("freddie_domains"))
+        if (kind not in (None, "subtract", "add")
+                or not isinstance(applied_raw, (bool, type(None)))
+                or static_d is None or freddie_d is None):
+            malformed += 1
+            continue
+        applied = bool(applied_raw)
         # предикат ровно как у погашенного per-turn алерта (react_loop.py:5520):
         # применённое вычитание ИЛИ неприменённое добавление. Согласие (вердикт
         # совпал, политика не менялась) расхождением НЕ считается.
-        if not (kind == "add" or applied):
+        if not (kind == "add" or (kind == "subtract" and applied)):
             continue
         if kind == "add":
             add_not_applied += 1
         else:
             sub_applied += 1
-        key = (str(kind), tuple(dis.get("static_domains") or ()),
-               tuple(dis.get("freddie_domains") or ()), applied)
+        key = (str(kind), static_d, freddie_d, applied)
         slot = buckets.setdefault(key, [0, []])
         slot[0] += 1
-        if len(slot[1]) < _EXAMPLE_CANDIDATES_PER_CASE:
-            slot[1].append(str(rid))
+        # текст берём ТОЛЬКО у тенантов из privacy-allowlist (CR R1 sol/terra):
+        # скраббер не есть анонимизация, поэтому по умолчанию формулировок нет ни у кого
+        if str(tenant_id) in preview:
+            if example_rows < MAX_EXAMPLE_ROWS:
+                slot[1].append(str(rid))
+                example_rows += 1
+        else:
+            any_divergence_outside_preview = True
 
-    # примеры — вторым проходом и только по отобранным id (ограниченный контакт с ПД).
-    # Сбой чтения/расшифровки не должен съедать весь отчёт: деградируем до «без примеров».
+    # тексты — вторым проходом и только по отобранным строкам. Сбой чтения/расшифровки
+    # не должен съедать весь отчёт: деградируем до «без формулировок».
     example_ids = [rid for _cnt, ids in buckets.values() for rid in ids]
     texts: dict[str, str] = {}
     if example_ids:
         try:
             texts = _fetch_example_texts(session, example_ids)
         except Exception:  # noqa: BLE001 — отчёт важнее примеров
-            logger.warning("domain_divergence: примеры формулировок недоступны", exc_info=True)
+            logger.warning("domain_divergence: формулировки недоступны", exc_info=True)
             texts = {}
 
     cases: list[DivergenceCase] = []
     for (kind, static_d, freddie_d, applied), (cnt, ids) in buckets.items():
-        seen: list[str] = []
+        # CR R1 sol MAJOR: «топ формулировок» = лидеры ЧАСТОТЫ по всем строкам случая,
+        # а не первые попавшиеся — иначе редкая старая фраза вытесняет ту, что
+        # повторилась сто раз, и рабочая очередь врёт о приоритетах.
+        freq: dict[str, int] = {}
         for rid in ids:
             phrase = scrub_phrase(texts.get(rid))
-            if phrase and phrase not in seen:
-                seen.append(phrase)
-            if len(seen) >= EXAMPLES_PER_CASE:
-                break
+            if phrase:
+                freq[phrase] = freq.get(phrase, 0) + 1
+        top = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:EXAMPLES_PER_CASE]
         cases.append(DivergenceCase(
             kind=kind, static_domains=static_d, freddie_domains=freddie_d,
-            applied=applied, count=cnt, examples=tuple(seen)))
+            applied=applied, count=cnt, examples=tuple(top)))
     cases.sort(key=_rank_key)
 
     return WeekCounts(
@@ -245,6 +319,8 @@ def gather_week_counts(session: Session, *, now: datetime,
         disambig_errors=errors,
         cases=tuple(cases),
         truncated=truncated,
+        malformed=malformed,
+        examples_suppressed=any_divergence_outside_preview,
     )
 
 
@@ -280,8 +356,13 @@ def format_report(counts: WeekCounts, *, now: datetime,
                  f"добавление вне статика (не применено): {counts.add_not_applied}")
     if counts.disambig_errors:
         lines.append(f"сбоев дизамбигуации: {counts.disambig_errors}")
+    if counts.malformed:
+        lines.append(f"строк трейса не той формы (пропущены): {counts.malformed}")
     if counts.truncated:
         lines.append(f"(скан упёрся в потолок {MAX_ROWS} ходов - неделя показана частично)")
+    if counts.examples_suppressed:
+        lines.append("формулировки части тенантов скрыты: их нет в privacy-allowlist "
+                     "SREDA_ADMIN_ALERT_PREVIEW_TENANTS")
 
     unapplied = [c for c in counts.cases if not c.applied]
     applied = [c for c in counts.cases if c.applied]
@@ -301,7 +382,8 @@ def _section(lines: list[str], title: str, cases: list[DivergenceCase], top: int
     for i, case in enumerate(cases[:top], start=1):
         lines.append(f"{i}. {case.signature} · ходов: {case.count}")
         if case.examples:
-            lines.append("   формулировки: " + "; ".join(f"«{e}»" for e in case.examples))
+            lines.append("   частые формулировки: "
+                         + "; ".join(f"«{p}» x{n}" for p, n in case.examples))
     hidden = len(cases) - top
     if hidden > 0:
         lines.append(f"   ещё видов в этой группе: {hidden} (реже)")
