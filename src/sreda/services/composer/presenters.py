@@ -274,6 +274,9 @@ _CONFIRM_PHRASES: dict[tuple[str, str], Any] = {
         f"Убрала купленные позиции: {o.get('cleared_count')}."
         if o.get("cleared_count") else "Купленных позиций не было."
     ),
+    # #409 clear_shopping_list: фразы здесь НЕТ намеренно — инструмент ReAct-only,
+    # презентеры обслуживают мёртвый plan-execute путь (composer/compose.py). Показ
+    # результата на живом пути делает заземление #393 (react_result_report).
     ("clear_menu", "cleared"): lambda o: (
         f"Очистила меню ({o.get('cleared_count')})."
         if o.get("cleared_count") else "Меню уже было пустым."

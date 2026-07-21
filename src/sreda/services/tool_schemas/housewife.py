@@ -1274,6 +1274,13 @@ def parse_clear_bought_shopping(
     )
 
 
+# #409 clear_shopping_list: Output-модели и парсера НЕТ НАМЕРЕННО — инструмент
+# ReAct-only (families.REACT_ONLY_TOOLS, канон #210, прецедент #262b). Формат
+# возврата тот же `ok:cleared:N`, но обвязка мёртвого plan-execute пути не строится:
+# она раздувает prod-like префикс планировщика за headroom-гейт. Заземление ответа
+# (#393) читает исход напрямую из ToolMessage — см. react_result_report._BULK_SPECS.
+
+
 # ---------------------------------------------------------------------------
 # 11. update_reminder           `ok:updated:rem_<id>:<iso>` | `:none`
 #                               | error: reminder 'X' not found

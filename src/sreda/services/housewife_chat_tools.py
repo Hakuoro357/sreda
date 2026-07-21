@@ -1263,6 +1263,36 @@ def build_housewife_tools(
             return "error: internal"
         return f"ok:cleared:{n}"
 
+    @_write_lc_tool
+    def clear_shopping_list() -> str:
+        """Clear the ENTIRE shopping list at once — cancel every
+        currently-pending item. This is the ONLY way to clear the whole
+        list; it takes no arguments and needs no ids, so do NOT call
+        ``list_shopping`` first to collect them.
+
+        Use for «очисти список покупок», «удали все покупки», «очисти
+        весь список», «убери всё из покупок».
+
+        Scope (#409, decided with the owner): ``pending`` only. Bought
+        items are history and stay untouched — clearing them is a
+        separate tool (``clear_bought_shopping``). Removing one or two
+        specific items is ``remove_shopping_items`` by id.
+
+        Returns ``ok:cleared:N`` — N is how many items were actually
+        cleared. ``ok:cleared:0`` means the list was already empty; it
+        is an honest success, NOT an error.
+        """
+        if not user_id:
+            return "error: no user_id context"
+        try:
+            n = shopping_service.clear_pending(
+                tenant_id=tenant_id, user_id=user_id
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("clear_shopping_list failed")
+            return "error: internal"
+        return f"ok:cleared:{n}"
+
     # ----------------------------------------------------------------
     # Recipe-book tools (v1.1). Four tools: save, search, get, delete.
     # No explicit "update" — edits = delete + save (keeps the schema
@@ -3444,6 +3474,7 @@ def build_housewife_tools(
         update_shopping_items_category,
         list_shopping,
         clear_bought_shopping,
+        clear_shopping_list,  # #409: очистка ВСЕГО списка одним действием
         save_recipe,
         save_recipes_batch,
         search_recipes,

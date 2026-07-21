@@ -115,6 +115,7 @@ HOUSEWIFE_MUTATING_TOOL_NAMES: frozenset[str] = frozenset({
     "add_shopping_items", "mark_shopping_bought", "remove_shopping_items",
     "update_shopping_item", "update_shopping_items_category",
     "clear_bought_shopping",
+    "clear_shopping_list",  # #409: очистка ВСЕГО списка (pending → cancelled)
     # recipes
     "save_recipe", "save_recipes_batch", "delete_recipe",
     "update_recipe",  # #210: правка рецепта на месте

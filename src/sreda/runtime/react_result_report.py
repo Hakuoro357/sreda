@@ -109,10 +109,12 @@ def _clean_name(value: str) -> str:
 class WriteAct:
     """Успешный мутирующий акт текущего хода с ДОКАЗАННЫМ эффектом.
 
-    ``kind`` — "add" (добавление пунктов) или "target" (действие над одной целью). ``target`` —
-    ОТОБРАЖАЕМОЕ имя цели («» если неотображаемо/неявно — тогда деградация к типу). ``items`` —
-    ОТОБРАЖАЕМЫЕ добавленные имена (подмножество; из okv2 `created`). ``count`` — серверное КОЛИЧЕСТВО
-    затронутого (для add — сколько реально добавлено; для target — 1); из результата, не из args."""
+    ``kind`` — "add" (добавление пунктов), "target" (действие над одной целью) или "bulk"
+    (#409: массовое действие БЕЗ имени цели — «очисти весь список покупок»). ``target`` —
+    ОТОБРАЖАЕМОЕ имя цели («» если неотображаемо/неявно — тогда деградация к типу; у bulk всегда «»).
+    ``items`` — ОТОБРАЖАЕМЫЕ добавленные имена (подмножество; из okv2 `created`). ``count`` —
+    серверное КОЛИЧЕСТВО затронутого (для add — сколько реально добавлено; для target — 1; для
+    bulk — сколько строк реально затронуто); из результата, не из args."""
 
     tool: str
     kind: str
@@ -135,6 +137,18 @@ _ADD_WHERE: dict[str, str] = {
 _TARGET_SPECS: dict[str, tuple[str, str, str, str]] = {
     "archive_checklist": ("убрала список", "ok:archived", "list_id_or_title", "заархивирован чек-лист"),
     "schedule_reminder": ("поставила напоминание", "ok:scheduled", "title", "поставлено напоминание"),
+}
+# #409 bulk-действия: массовая мутация БЕЗ имени цели (у «очисти весь список покупок» имени нет by
+# design — инструмент без аргументов). Формат: (глагол для вывода, success-префикс с КОЛИЧЕСТВОМ
+# после него, тип-фраза для промпта, единицы). Отдельный kind, а не _TARGET_SPECS, потому что:
+#   * count у target захардкожен в 1 — здесь количество и есть суть результата («убрала N позиций»);
+#   * заземлённость у target проверяется по ИМЕНИ цели, а у bulk имени нет — проверяем по числу
+#     (иначе `not act.target` всегда давал бы «не заземлено» → живой голос подменялся бы ВСЕГДА).
+_BULK_SPECS: dict[str, tuple[str, str, str, tuple[str, str, str]]] = {
+    "clear_shopping_list": (
+        "убрала весь список покупок", "ok:cleared:", "очищен список покупок",
+        ("позиция", "позиции", "позиций"),
+    ),
 }
 
 
@@ -205,6 +219,20 @@ def collect_successful_writes(messages) -> tuple[WriteAct, ...]:
                 if not content.startswith(prefix):  # нет эффекта (не тот исход)
                     continue
                 acts.append(WriteAct(name, "target", _target_name(field, args), (), 1))
+            elif name in _BULK_SPECS:
+                # #409: эффект ДОКАЗАН количеством из результата. N=0 («список уже был пуст») —
+                # no-op: НЕ заземляем, иначе страховка отрапортовала бы ложный успех («убрала
+                # весь список покупок») там, где ничего не убрано. Битый хвост → тоже не заземляем.
+                _verb, prefix, _type, _units_ = _BULK_SPECS[name]
+                if not content.startswith(prefix):
+                    continue
+                try:
+                    n = int(content[len(prefix):].strip())
+                except ValueError:
+                    continue
+                if n <= 0:
+                    continue
+                acts.append(WriteAct(name, "bulk", "", (), n))
             # прочие write-инструменты не заземляем (консервативно; голос как есть)
     return tuple(acts)
 
@@ -264,6 +292,13 @@ def reply_grounds_result(reply: str, acts) -> bool:
             if act.tool != "add_shopping_items" and not (
                     act.target and _name_mentioned(reply_tokens, act.target)):
                 return False
+        elif act.kind == "bulk":
+            # #409: у bulk-акта имени цели нет by design — верифицируем по КОЛИЧЕСТВУ (объективно,
+            # без языковых паттернов: число либо названо, либо нет). «Готово.» / «приняла к
+            # сведению» числа не несут → подмена страховкой, ровно тот класс #393, что чиним.
+            # Голос, назвавший N, сохраняется как есть (правило #121).
+            if str(act.count) not in reply_tokens:
+                return False
         elif not (act.target and _name_mentioned(reply_tokens, act.target)):
             return False
     return True
@@ -287,10 +322,21 @@ def _units(n: int) -> str:
     return f"{n} {_plural(n, 'пункт', 'пункта', 'пунктов')}"
 
 
+def _bulk_units(act: WriteAct) -> str:
+    """#409: «N позиций» в единицах bulk-действия (у покупок — позиции, не пункты)."""
+    spec = _BULK_SPECS.get(act.tool)
+    one, few, many = spec[3] if spec else ("пункт", "пункта", "пунктов")
+    return f"{act.count} {_plural(act.count, one, few, many)}"
+
+
 def _fact(act: WriteAct) -> str:
     """СЕРВЕРНЫЙ факт результата для grounding_note (промпт): статус+количество+тип, БЕЗ имён."""
     if act.kind == "add":
         return f"добавлено {_units(act.count)} в {_ADD_WHERE.get(act.tool, 'список')}"
+    if act.kind == "bulk":
+        bulk = _BULK_SPECS.get(act.tool)
+        # количество — сама суть bulk-результата, потому входит в факт (а не только тип действия)
+        return f"{bulk[2]}: {_bulk_units(act)}" if bulk else "выполнено действие"
     spec = _TARGET_SPECS.get(act.tool)
     return spec[3] if spec else "выполнено действие"
 
@@ -325,6 +371,10 @@ def _phrase(act: WriteAct) -> str:
         if complete:  # имя списка неотображаемо, но все пункты — назовём пункты
             return f"добавила пункты: {items}"
         return f"добавила {_units(act.count)} в {_ADD_WHERE.get(act.tool, 'чек-лист')}"
+    if act.kind == "bulk":
+        # #409: «убрала весь список покупок - 5 позиций». Дефис, НЕ длинное тире (правило юзеру).
+        bulk = _BULK_SPECS.get(act.tool)
+        return f"{bulk[0]} - {_bulk_units(act)}" if bulk else ""
     spec = _TARGET_SPECS.get(act.tool)
     if not spec:
         return ""

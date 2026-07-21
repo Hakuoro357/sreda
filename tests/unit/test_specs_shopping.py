@@ -19,7 +19,7 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from sreda.services.tool_schemas.base import ToolOutputContractViolation
-from sreda.services.tool_schemas.families import TOOL_FAMILY_MANIFEST
+from sreda.services.tool_schemas.families import REACT_ONLY_TOOLS, TOOL_FAMILY_MANIFEST
 from sreda.services.tool_schemas.housewife import (
     AddShoppingItemsAdded,
     ClearBoughtShoppingOk,
@@ -66,6 +66,8 @@ REM_A = "rem_dddddddddddddddddddddddd"
 
 
 def test_shopping_specs_count_is_seven() -> None:
+    # #409 clear_shopping_list СЮДА НЕ ВХОДИТ: ReAct-only (канон #210) — спека для
+    # замороженного plan-execute не строится. Остаётся 7.
     assert len(SHOPPING_SPECS) == 7
 
 
@@ -92,9 +94,13 @@ def test_shopping_specs_match_tool_family_manifest() -> None:
         if family == "shopping"
     }
     spec_names = {s.name for s in SHOPPING_SPECS}
-    assert spec_names == manifest_shopping, (
-        f"Mismatch.\nIn manifest only: {manifest_shopping - spec_names}\n"
-        f"In specs only: {spec_names - manifest_shopping}"
+    # #409: clear_shopping_list — ReAct-only (в манифесте для фильтра ReAct-набора, без
+    # plan-execute ToolSpec, т.к. старый планировщик заморожен). Тот же приём, что у
+    # recipes/update_recipe (#210) — см. test_recipes_specs_match_tool_family_manifest.
+    manifest_shopping_specced = manifest_shopping - REACT_ONLY_TOOLS
+    assert spec_names == manifest_shopping_specced, (
+        f"Mismatch.\nIn manifest only: {manifest_shopping_specced - spec_names}\n"
+        f"In specs only: {spec_names - manifest_shopping_specced}"
     )
     # Cross-check: every spec's family field equals manifest's mapping.
     for spec in SHOPPING_SPECS:

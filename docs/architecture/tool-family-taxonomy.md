@@ -24,7 +24,7 @@ relying on the model to infer it from descriptions.
 
 | Family value | Russian display | Tools | Anti-pattern targets |
 |---|---|---|---|
-| `shopping` | ПОКУПКИ | 7 | ДЕНЕЖНЫЕ ОПЕРАЦИИ, ПАМЯТЬ, ЗАДАЧИ, ВНЕШНИЙ КАНАЛ |
+| `shopping` | ПОКУПКИ | 8 | ДЕНЕЖНЫЕ ОПЕРАЦИИ, ПАМЯТЬ, ЗАДАЧИ, ВНЕШНИЙ КАНАЛ |
 | `reminders` | НАПОМИНАНИЯ | 4 | ЗАДАЧИ, ЧЕК-ЛИСТЫ, ПОКУПКИ |
 | `recipes` | РЕЦЕПТЫ | 6 | МЕНЮ, ПОКУПКИ, СЕМЬЯ |
 | `menu` | МЕНЮ | 5 | РЕЦЕПТЫ, НАПОМИНАНИЯ, ПОКУПКИ |
@@ -37,10 +37,19 @@ relying on the model to infer it from descriptions.
 | `utility` | СЛУЖЕБНОЕ | 1 | СБОРЩИК ОТВЕТА, АВТОМАТИЧЕСКИЙ АУДИТ, ИНТЕРФЕЙС |
 | `web` | ВЕБ | 3 | РЕЦЕПТЫ, КАЛЕНДАРЬ ЮЗЕРА, ДЕНЕЖНЫЕ ОПЕРАЦИИ |
 
-Total: 55 implemented tools. The future `get_recipe_any_source`
-(architecture-plan TODO-2) will bump this to 56 when the runtime
+Total: 61 manifest entries (`len(TOOL_FAMILY_MANIFEST)`, пин-тест
+`test_manifest_total_size_is_59`). The future `get_recipe_any_source`
+(architecture-plan TODO-2) will bump this when the runtime
 function ships — currently NOT in `TOOL_FAMILY_MANIFEST` per Codex
 Sub-A4 recipes R1 MAJOR #6.
+
+Часть записей манифеста — **ReAct-only** (в манифесте ради фильтра
+ReAct-набора, но БЕЗ `ToolSpec` для замороженного plan-execute; канон
+#210, список — `families.REACT_ONLY_TOOLS`): `update_recipe`,
+`update_checklist_item`, `get_checklist`, `create_memory_category`,
+`clear_shopping_list` (#409). Полный комплект спека+парсер+презентер
+для мёртвого пути раздувает prod-like префикс планировщика за
+headroom-гейт #128 — потому его намеренно не строят.
 
 The taxonomy is **closed** — adding a 13th family requires:
 1. Adding the literal value to `Family` in `families.py`.

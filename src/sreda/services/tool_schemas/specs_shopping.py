@@ -189,6 +189,14 @@ class ClearBoughtShoppingInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+# #409 clear_shopping_list: Input-модели и спеки НЕТ НАМЕРЕННО — инструмент ReAct-only
+# (families.REACT_ONLY_TOOLS, канон #210, прецедент #262b create_memory_category). Старый
+# plan-execute путь заморожен, spec-обвязка для него не строится: полный комплект спек+парсер
+# раздувает prod-like префикс планировщика ЗА headroom-гейт (замерено: 71116 > 70500 при
+# добавлении спеки) и требует презентер для мёртвого пути. Описание, которое реально видит
+# Фредди, живёт в react_loop._REACT_TOOL_DESC.
+
+
 # ---------------------------------------------------------------------------
 # ToolSpec instances — passes assert_production_registry_quality.
 # ---------------------------------------------------------------------------
@@ -405,7 +413,12 @@ CLEAR_BOUGHT_SHOPPING_SPEC = ToolSpec(
     ],
     mutex_notes=[
         "ТОЛЬКО для bought-строк (история). Отмена pending (текущий список) — remove_shopping_items.",
-        "На «очисти весь список» сначала уточни — риск удалить непрочитанные pending.",
+        # #409: было «На "очисти весь список" сначала уточни — риск удалить непрочитанные pending».
+        # Инструкция ПЕРЕСПРАШИВАТЬ вместо действия снята: очистка всего списка теперь отдельный
+        # инструмент. Формулировка ИНТЕНТ-УРОВНЯ, без имени: clear_shopping_list — ReAct-only, и
+        # назвать его здесь значило бы увести планировщик к недоступному ему типизированному
+        # инструменту (гейт registry_quality ловит это явно).
+        "«Очисти весь список» — про текущие покупки (pending), не сюда.",
     ],
     timeout_seconds=10,
     side_effect_class="transactional_write",
@@ -421,9 +434,11 @@ SHOPPING_SPECS: list[ToolSpec] = [
     LIST_SHOPPING_SPEC,
     CLEAR_BOUGHT_SHOPPING_SPEC,
 ]
-"""All 7 shopping ToolSpec instances in stable order. Sub-A4 CI tests
-construct this list and call ``assert_production_registry_quality``
-on it to enforce the production-policy gate."""
+"""All 7 shopping ToolSpec instances in stable order. #409
+``clear_shopping_list`` СЮДА НЕ ВХОДИТ намеренно — ReAct-only (см. комментарий
+выше). Sub-A4 CI tests construct this list and call
+``assert_production_registry_quality`` on it to enforce the
+production-policy gate."""
 
 
 __all__ = [

@@ -309,7 +309,7 @@ def test_manifest_assigns_expected_shopping_count() -> None:
     # Counts from the plan should match the manifest. If we add a tool
     # and forget to update this test, it'll surface in CI.
     shopping_tools = [t for t, f in TOOL_FAMILY_MANIFEST.items() if f == "shopping"]
-    assert len(shopping_tools) == 7
+    assert len(shopping_tools) == 8  # #409: +clear_shopping_list (7 → 8)
 
 
 def test_manifest_assigns_expected_reminders_count() -> None:
@@ -600,6 +600,7 @@ _EXPECTED_BY_FAMILY: dict[Family, frozenset[str]] = {
         "add_shopping_items", "list_shopping", "mark_shopping_bought",
         "remove_shopping_items", "update_shopping_item",
         "update_shopping_items_category", "clear_bought_shopping",
+        "clear_shopping_list",  # #409: очистка ВСЕГО списка одним действием
     }),
     "reminders": frozenset({
         "schedule_reminder", "list_reminders", "update_reminder",
@@ -666,12 +667,13 @@ def test_manifest_exact_tool_set_per_family(
 
 
 def test_manifest_total_size_is_59() -> None:
-    # 7+4+6+5+4+11+11+3+1+4+1+3 = 60. #143 Phase B добавил
+    # 8+4+6+5+4+11+11+3+1+4+1+3 = 61. #143 Phase B добавил
     # list_checklist_items (checklists 8→9, итог 55→56). #210 добавил
     # update_recipe (recipes 5→6) и update_checklist_item (checklists 9→10),
     # оба ReAct-only — итог 56→58. #262b create_memory_category (memory 3→4) → 59.
     # #213 Срез A: get_checklist (checklists 10→11, ReAct-only) → 60.
-    assert len(TOOL_FAMILY_MANIFEST) == 60
+    # #409: clear_shopping_list (shopping 7→8) → 61.
+    assert len(TOOL_FAMILY_MANIFEST) == 61
 
 
 def test_react_only_tools_are_in_manifest() -> None:

@@ -421,7 +421,7 @@ that the planner might mistake for a family name.
 
 
 TOOL_FAMILY_MANIFEST: Final[Mapping[str, Family]] = MappingProxyType({
-    # ---- shopping (7) -----------------------------------------------------
+    # ---- shopping (8) -----------------------------------------------------
     "add_shopping_items": "shopping",
     "list_shopping": "shopping",
     "mark_shopping_bought": "shopping",
@@ -429,6 +429,10 @@ TOOL_FAMILY_MANIFEST: Final[Mapping[str, Family]] = MappingProxyType({
     "update_shopping_item": "shopping",
     "update_shopping_items_category": "shopping",
     "clear_bought_shopping": "shopping",
+    # #409: очистка ВСЕГО списка одним действием (pending → cancelled). До него «очисти список
+    # покупок» требовала двух шагов (list_shopping → id → remove_shopping_items) и на проде
+    # срывалась в 2 прогонах из 5.
+    "clear_shopping_list": "shopping",
     # ---- reminders (4) ----------------------------------------------------
     "schedule_reminder": "reminders",
     "list_reminders": "reminders",
@@ -532,6 +536,10 @@ REACT_ONLY_TOOLS: Final[frozenset[str]] = frozenset({
     # комплект для мёртвого пути раздувал prod-like префикс планировщика
     # (headroom-гейт) и требовал презентер. ReAct-only по канону #210.
     "create_memory_category",
+    # #409: очистка всего списка покупок. Живёт только на ReAct-пути (Фредди);
+    # спека/парсер/презентер для замороженного plan-execute не строятся — они
+    # раздували prod-like префикс планировщика за headroom-гейт (#128).
+    "clear_shopping_list",
 })
 
 
@@ -548,6 +556,7 @@ TOOL_OP_CLASS: Final[Mapping[str, str]] = MappingProxyType({
     "add_shopping_items": "write", "list_shopping": "read_pure", "mark_shopping_bought": "write",
     "remove_shopping_items": "write", "update_shopping_item": "write",
     "update_shopping_items_category": "write", "clear_bought_shopping": "write",
+    "clear_shopping_list": "write",  # #409: деструктив — всегда через подтверждение, НЕ в autoexec
     "schedule_reminder": "write", "list_reminders": "read_pure", "update_reminder": "write",
     "cancel_reminder": "write",
     "save_recipe": "write", "save_recipes_batch": "write", "search_recipes": "read_pure",
