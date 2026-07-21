@@ -124,6 +124,20 @@ def _clean_name(value: str) -> str:
     return s
 
 
+# #363: дневник еды модель пишет с ISO-датой в начале контента («2026-07-11: ужин — котлета…»).
+# ISO-даты юзеру показывать НЕЛЬЗЯ (правило «никаких технических данных/ISO-дат»). Срезаем ведущий
+# ISO-префикс (± время, ± разделитель) ПЕРЕД показом — сам факт (еду/лекарство) называем. Узко: только
+# для имён memory-актов (имена чек-листов/напоминаний ISO-дату в начале не носят — их не трогаем).
+_LEADING_ISO_DATE_RE = re.compile(
+    r"^\s*\d{4}-\d{2}-\d{2}"
+    r"(?:[ tT]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:[zZ]|[+-]\d{2}:?\d{2})?)?"
+    r"\s*[:\-—–]?\s*")
+
+
+def _strip_leading_date(value: str) -> str:
+    return _LEADING_ISO_DATE_RE.sub("", value or "", count=1)
+
+
 # ─────────────────────────── аллоулист заземляемых действий ───────────────────────────
 
 @dataclass(frozen=True)
@@ -160,7 +174,17 @@ _ADD_WHERE: dict[str, str] = {
 _TARGET_SPECS: dict[str, tuple[str, str, str, str]] = {
     "archive_checklist": ("удалила список", "ok:archived", "list_id_or_title", "удалён список"),
     "schedule_reminder": ("поставила напоминание", "ok:scheduled", "title", "поставлено напоминание"),
+    # #363: дневник здоровья (#361) пишется через память. Без заземления служебный хвост
+    # («буду отвечать, опираясь на результаты…») ЭХОм подменял подтверждение записи, хотя запись
+    # реально проходила (прод: assistant_memories полны; скан 516 ходов — 0 истинных потерь). Успех —
+    # success-префикс результата (saved_core:/saved_episode:{id}); error:/in-flight/коллизия его НЕ
+    # несут → не заземляются (без ложного успеха). Имя цели = текст факта из args (content/summary),
+    # только в ВЫВОД юзеру (вариант C: имена в промпт не идут), с срезкой ведущей ISO-даты (ниже).
+    "save_core_fact": ("записала", "saved_core:", "content", "записала в память"),
+    "save_episode": ("записала", "saved_episode:", "summary", "записала в память"),
 }
+# #363: имена memory-актов показываем со срезкой ведущей ISO-даты (см. _strip_leading_date).
+_MEMORY_TARGET_TOOLS: frozenset[str] = frozenset({"save_core_fact", "save_episode"})
 
 
 def _okv2_created(content: str) -> tuple[str, ...]:
@@ -229,7 +253,12 @@ def collect_successful_writes(messages) -> tuple[WriteAct, ...]:
                 _verb, prefix, field, _type = _TARGET_SPECS[name]
                 if not content.startswith(prefix):  # нет эффекта (не тот исход)
                     continue
-                acts.append(WriteAct(name, "target", _target_name(field, args), (), 1))
+                if name in _MEMORY_TARGET_TOOLS:  # #363: имя факта из args, ISO-дату срезаем для показа
+                    _raw = args.get(field)
+                    _tgt = _clean_name(_strip_leading_date(_raw)) if isinstance(_raw, str) else ""
+                else:
+                    _tgt = _target_name(field, args)
+                acts.append(WriteAct(name, "target", _tgt, (), 1))
             # прочие write-инструменты не заземляем (консервативно; голос как есть)
     return tuple(acts)
 

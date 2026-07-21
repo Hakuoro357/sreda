@@ -450,11 +450,17 @@ def classify_confirm_reply(text: str) -> str:
     affirm — ТОЛЬКО строгий аффирматив (ТОЧНОЕ совпадение, БЕЗ командных глаголов): иначе «удали Y»
     прочлось бы как «да» → удаление НЕ ТОГО (CRITICAL). negate — отмена. Всё прочее (вкл. «удали…»,
     новое намерение) → redirect (Фаза B авто-переключит раздел; A0 безопасно трактует redirect как отказ).
-    Зовётся в handle_turn ДО Command(resume) — в граф идёт только канон «да»/«нет»."""
+    Зовётся в handle_turn ДО Command(resume) — в граф идёт только канон «да»/«нет».
+    #362 R4/R5 (оба Codex MAJOR): точный `_NEGATE` дополнен `confirm_decline_signal` — распространённые формы
+    отказа («не удали»/«не удаляй»/«не согласна»/«ну нет, 16»/«не-а»/«нее») → negate, чтобы получить честную
+    детерминированную «Отменила» (#321) и НЕ врать в confirm-телеметрии. R5 leak-proof: ЛЮБОЕ слово в хвосте
+    отказа («нет, сахар 16»/«нет, по задаче 5»/«нет, отмени задачу 5») → детектор НЕ считает чистым отказом →
+    остаётся redirect (dual-intent/команда/показатель не теряется)."""
+    from sreda.runtime.react_signals import confirm_decline_signal
     t = (text or "").strip().lower().rstrip("!.?")
     if t in _YES:
         return "affirm"
-    if t in _NEGATE:
+    if t in _NEGATE or confirm_decline_signal(text):
         return "negate"
     return "redirect"
 
@@ -500,24 +506,68 @@ def react_provider(tenant_id: str) -> str:
 _FALLBACK_PROVIDER_KEY = "groq-gpt-oss-120b"  # #184: Оса @ Groq — запас Фредди в ReAct
 
 
+def _react_fallback_available(primary_provider: str = "", settings: Any = None) -> bool:
+    """#401/#184: доступен ли запас (Оса) для данного primary — ЕДИНЫЙ гейт для двух решений,
+    чтобы они НЕ разъехались: (1) `react_fallback_llm` — строить ли Осу; (2) `react_primary_llm`
+    — включать ли fail-fast primary на 5xx (max_retries=0). True ⇔ флаг SREDA_REACT_OSA_FALLBACK
+    ВКЛ И primary НЕ сам Groq/Оса (incl. `-low`) — иначе Groq+Groq = повтор того же сбоя + двойной
+    расход. Читает settings (снимок хода или свежий). Наружу исключения НЕ гасит (вызывающий сам
+    решает fail-soft): react_fallback_llm → None, react_primary_llm → дефолтный retry."""
+    from sreda.config.settings import get_settings
+    from sreda.services.llm import _GROQ_MODEL_BY_PROVIDER
+    s = settings or get_settings()
+    if not s.react_osa_fallback:
+        return False
+    return primary_provider not in _GROQ_MODEL_BY_PROVIDER
+
+
+def react_primary_llm(provider: str = "", settings: Any = None,
+                      *, has_fallback: bool | None = None) -> Any:
+    """#401: основной ReAct-LLM (Фредди/Mercury) с fail-fast на серверную ошибку.
+
+    Инцидент 20.07: openai-клиент primary по умолчанию ретраит серверную ошибку (`max_retries=2`,
+    эксп. бэкофф) ВНУТРИ одного `invoke` → на медленно-500-ящем Mercury накопилось ~40с ПОД
+    wall-clock 60с перед фолбэком на Осу (которая сама отвечает 3-5с). Когда запас РЕАЛЬНО построен,
+    строим primary с `max_retries=0`: ошибка primary НЕ ретраит сама себя, а СРАЗУ поднимает
+    исключение → ручной try/except в chat-узле уводит ход в фолбэк немедленно.
+
+    NB (осознанный компромисс — decision-log): `max_retries=0` снимает клиентский retry для ВСЕХ
+    классов (5xx И 429/сетевой блип), т.к. openai-клиент не умеет per-status. Для 429/блипа Mercury
+    ход уходит на Осу сразу (best-effort; у Осы свой per-provider breaker #343, своя корзина).
+
+    `has_fallback` (R1 sol+terra MAJOR; Opus MINOR): ФАКТ реально построенного резерва от
+    вызывающего — `react_fallback_llm(...) is not None`. **ОБЯЗАТЕЛЕН для fail-fast** — max_retries=0
+    ставим ТОЛЬКО при `has_fallback=True`. `None` (вызывающий не передал факт) → БЕЗОПАСНЫЙ ДЕФОЛТ С
+    РЕТРАЕМ (max_retries НЕ трогаем) + WARNING. Авто-гейт по флагу УБРАН (механизм, не дисциплина
+    вызова #180): флаг osa ВКЛ БЕЗ реально построенной Осы дал бы max_retries=0 при НЕДОСТИЖИМОМ
+    резерве (transient 5xx → safe-reply без ретраев) — ровно дефект, ради которого has_fallback введён.
+    Все прод-call-site передают `has_fallback=(react_fallback_llm(prov) is not None)` явно."""
+    from sreda.services.llm import get_chat_llm
+    _kw: dict = {}
+    if has_fallback is None:
+        # Безопасный дефолт: без ЯВНОГО факта построенного резерва fail-fast НЕ включаем (иначе можно
+        # молча оставить primary без достижимого фолбэка). Прод-вызовы передают has_fallback всегда.
+        logger.warning("react_loop: react_primary_llm без явного has_fallback → дефолт с ретраем "
+                       "(fail-fast требует has_fallback=True)")
+    elif has_fallback:
+        _kw["max_retries"] = 0  # #401: ошибку primary не ретраим — сразу фолбэк (запас построен)
+    return get_chat_llm(provider=provider, settings=settings, **_kw)
+
+
 def react_fallback_llm(primary_provider: str = "") -> Any:
     """#184: запасной LLM для ReAct — Оса (gpt-oss-120b @ Groq) при сбое primary (Фредди/Mercury).
     Включён флагом SREDA_REACT_OSA_FALLBACK. None → без запаса.
 
     Защиты:
     - R1: если effective primary УЖЕ Оса (SREDA_REACT_OSA_TENANTS) — само-fallback не нужен
-      (Groq+Groq = повтор того же сбоя + двойной расход) → None;
-    - R3 (MiMo MAJOR): ВЕСЬ body guarded (импорт + membership + build) — функция зовётся как
-      АРГУМENT до входа в handle_turn-guard, поэтому НИКОГДА не должна поднимать исключение;
-      любой сбой (импорт/мисконфиг Groq) → None (ReAct идёт без запаса, не падает)."""
+      (Groq+Groq = повтор того же сбоя + двойной расход) → None. Гейт (флаг + not-Groq) вынесен
+      в `_react_fallback_available` — общий с #401 `react_primary_llm`, чтобы решения не разошлись;
+    - R3 (MiMo MAJOR): ВЕСЬ body guarded (импорт + гейт + build) — функция зовётся как АРГУМЕНТ
+      до входа в handle_turn-guard, поэтому НИКОГДА не должна поднимать исключение; любой сбой
+      (импорт/мисконфиг Groq/чтение флага) → None (ReAct идёт без запаса, не падает)."""
     try:
-        from sreda.config.settings import get_settings
-        from sreda.services.llm import _GROQ_MODEL_BY_PROVIDER, get_chat_llm
-        if not get_settings().react_osa_fallback:
-            return None
-        # R2 MINOR (Codex high): любой Groq/Оса primary (incl. groq-gpt-oss-120b-low) → запас не
-        # нужен (Groq+Groq = повтор сбоя + двойной расход). Членство в groq-карте.
-        if primary_provider in _GROQ_MODEL_BY_PROVIDER:
+        from sreda.services.llm import get_chat_llm
+        if not _react_fallback_available(primary_provider):
             return None
         return get_chat_llm(provider=_FALLBACK_PROVIDER_KEY)
     except Exception:  # noqa: BLE001 — fallback недоступен (импорт/мисконфиг) → без запаса
@@ -569,6 +619,29 @@ def _task_confirm_verb(verb: str) -> str:
     return {"отменяю": "отменю", "удаляю": "удалю"}.get(verb, verb)
 
 
+# #405: единый ключ маркера «инструмент уже несёт СВОЁ подтверждение (interrupt) до мутации».
+# Ставят ТОЛЬКО _confirm_wrap (обёрточные деструктивы) и _mark_bespoke_confirm (inline-деструктивы);
+# читает ТОЛЬКО _apply_unified_policy (ярус б) — по маркеру второй generic-confirm НЕ добавляется.
+_BESPOKE_CONFIRM_KEY = "sreda_bespoke_confirm"
+# Деструктивы с ВСТРОЕННЫМ interrupt()-confirm в теле (НЕ через _confirm_wrap): cancel_reminder,
+# cancel_task, delete_task. Помечаются маркером при сборке bespoke, иначе ярус (б) единого пути
+# добавил бы им второй generic-confirm (прод-класс бага #405, ср. «очисти список покупок»).
+_INLINE_BESPOKE_CONFIRM = frozenset({"cancel_reminder", "cancel_task", "delete_task"})
+
+
+def _mark_bespoke_confirm(t: Any) -> Any:
+    """#405: пометить инструмент как уже несущий bespoke-подтверждение (interrupt внутри тела).
+    model_copy — НЕ мутируем общий объект. Сбой копии → как есть (регресс к generic-confirm =
+    двойное подтверждение, но НЕ тихая мутация: fail-safe в безопасную сторону)."""
+    try:
+        return t.model_copy(update={
+            "metadata": {**(getattr(t, "metadata", None) or {}), _BESPOKE_CONFIRM_KEY: True}})
+    except Exception:  # noqa: BLE001 — не валим сборку инструментов
+        logger.warning("react_loop: _mark_bespoke_confirm failed for %s",
+                       getattr(t, "name", "?"), exc_info=True)
+        return t
+
+
 def _confirm_wrap(inner: Any, phrase: str) -> Any:
     """Обернуть разрушающий инструмент подтверждением через interrupt(): мутация
     ТОЛЬКО после «да» (детерминированный guardrail, как у cancel_reminder). Сохраняет
@@ -592,6 +665,11 @@ def _confirm_wrap(inner: Any, phrase: str) -> Any:
     return StructuredTool.from_function(
         func=_wrapped, name=inner.name, description=inner.description,
         args_schema=inner.args_schema,
+        # #405: маркер ФАКТИЧЕСКОЙ bespoke-обёртки. Ярус (б) единого пути по нему пропускает
+        # деструктив как есть (не оборачивает вторым generic-confirm → без двойного подтверждения
+        # «очисти список покупок»). Гейт на маркер, не на имя: незамаркированный деструктив всё
+        # равно получит confirm (нет тихой мутации).
+        metadata={**(getattr(inner, "metadata", None) or {}), _BESPOKE_CONFIRM_KEY: True},
     )
 
 
@@ -1884,8 +1962,16 @@ def _apply_unified_policy(tools: list, allowed_read: Any, allowed_write: Any,
                 out.append(t)
             elif tool_write_domains(name) <= aw and tool_read_domains(name) <= ar:
                 out.append(t)  # ярус (а): домены разрешены → прямой write без confirm
+            elif (getattr(t, "metadata", None) or {}).get(_BESPOKE_CONFIRM_KEY) is True:
+                # #405: деструктив уже несёт СВОЙ confirm — обёрточный (_confirm_wrap, «уберу «X»») ИЛИ
+                # inline (cancel_reminder/cancel_task/delete_task, помечены _mark_bespoke_confirm). НЕ
+                # оборачивать вторым generic-confirm (иначе ДВА подтверждения на один вызов, прод-баг
+                # «очисти список покупок»). Гейт на МАРКЕР (не на имя) и строго `is True` (truthy-строка
+                # в metadata не должна обходить confirm): деструктив без маркера уйдёт в ветку ниже и всё
+                # равно получит confirm → тихой мутации нет.
+                out.append(t)  # ярус (б) для bespoke-подтверждённого: как есть → РОВНО один confirm
             else:
-                out.append(_generic_confirm_wrap(t))  # ярус (б): кандидат под confirm
+                out.append(_generic_confirm_wrap(t))  # ярус (б): кандидат под generic confirm
         elif tool_read_domains(name) <= ar:
             # #376 слой-2: внутридоменное сужение ЧТЕНИЯ — детерминированный детектор
             # (items+имя резолвится) вырезает конкурента (list_checklists) из read-набора,
@@ -2400,7 +2486,9 @@ def _sgr_structured_step(*, bound: list, allowed_read: Any, allowed_write: Any,
     (WIRE_SHAPE_BY_PROVIDER[...], в т.ч. на фолбэке — Opus Ф1 MINOR#3)."""
     out: dict = {"resp": None, "sgr": None, "latency_ms": 0,
                  "provider": None, "model": None, "usage_recorded": False,
-                 "fallback_fired": False, "primary_error": ""}
+                 "fallback_fired": False, "primary_error": "",
+                 # #401: под-тайминги structured-шага (раздельно primary / фолбэк)
+                 "primary_latency_ms": None, "fallback_latency_ms": None}
     stage = "slice_error"
     try:
         reason = _sgr_gate_reason(
@@ -2436,26 +2524,38 @@ def _sgr_structured_step(*, bound: list, allowed_read: Any, allowed_write: Any,
         used_provider, used_model = provider_key, model_name
         _t0 = _time.perf_counter()
         try:
-            raw = invoke_with_per_call_timeout(
-                llm.bind(response_format=_rf), sgr_msgs,
-                timeout_seconds=timeout_s, provider=provider_key)
-        except Exception as _pe:  # noqa: BLE001 — сетевой сбой/таймаут primary → structured-Оса (§5)
-            fb_shape = _sgr.WIRE_SHAPE_BY_PROVIDER.get(fallback_provider_key or "")
-            if fallback_llm is None or not fb_shape:
-                raise
-            logger.warning("react_sgr: primary structured сбой → structured-фолбэк %s",
-                           fallback_provider_key, exc_info=True)
-            # CR R1 sol MINOR: телеметрия попытки primary (PII-free: только тип ошибки) —
-            # llm_calls не должен скрывать сбой Mercury и повторную попытку.
-            out["fallback_fired"], out["primary_error"] = True, type(_pe).__name__
-            _rf_fb = {"type": "json_schema",
-                      "json_schema": {"name": "sgr_step", "strict": True,
-                                      "schema": _sgr.build_wire_schema(sgr_tools, fb_shape)}}
-            raw = invoke_with_per_call_timeout(
-                fallback_llm.bind(response_format=_rf_fb), sgr_msgs,
-                timeout_seconds=timeout_s, provider=fallback_provider_key)
-            used_provider, used_model = fallback_provider_key, fallback_model_name
-        out["latency_ms"] = int((_time.perf_counter() - _t0) * 1000)
+            try:
+                raw = invoke_with_per_call_timeout(
+                    llm.bind(response_format=_rf), sgr_msgs,
+                    timeout_seconds=timeout_s, provider=provider_key)
+                out["primary_latency_ms"] = int((_time.perf_counter() - _t0) * 1000)  # #401
+            except Exception as _pe:  # noqa: BLE001 — сетевой сбой/таймаут primary → structured-Оса (§5)
+                out["primary_latency_ms"] = int((_time.perf_counter() - _t0) * 1000)  # #401: попытка primary до сбоя
+                fb_shape = _sgr.WIRE_SHAPE_BY_PROVIDER.get(fallback_provider_key or "")
+                if fallback_llm is None or not fb_shape:
+                    raise
+                logger.warning("react_sgr: primary structured сбой → structured-фолбэк %s",
+                               fallback_provider_key, exc_info=True)
+                # CR R1 sol MINOR: телеметрия попытки primary (PII-free: только тип ошибки) —
+                # llm_calls не должен скрывать сбой Mercury и повторную попытку.
+                out["fallback_fired"], out["primary_error"] = True, type(_pe).__name__
+                _rf_fb = {"type": "json_schema",
+                          "json_schema": {"name": "sgr_step", "strict": True,
+                                          "schema": _sgr.build_wire_schema(sgr_tools, fb_shape)}}
+                _tfb = _time.perf_counter()  # #401: вызов structured-резерва — отдельным таймингом
+                try:
+                    raw = invoke_with_per_call_timeout(
+                        fallback_llm.bind(response_format=_rf_fb), sgr_msgs,
+                        timeout_seconds=timeout_s, provider=fallback_provider_key)
+                finally:
+                    # #401 (R2 sol+terra MINOR): под-тайминг фолбэка — даже если фолбэк САМ упал
+                    # (двойной SGR-сбой → легаси): иначе trace показывал fallback_fired без длительности.
+                    out["fallback_latency_ms"] = int((_time.perf_counter() - _tfb) * 1000)
+                used_provider, used_model = fallback_provider_key, fallback_model_name
+        finally:
+            # #401 (R2 sol+terra MINOR): итог SGR-попытки ВСЕГДА (в т.ч. двойной сбой → outer except →
+            # легаси): иначе latency_ms=0 и легаси-аккумуляция теряла SGR-ожидание.
+            out["latency_ms"] = int((_time.perf_counter() - _t0) * 1000)
         # per-attempt учёт завершённой structured-попытки (guarded — учёт не валит ход)
         try:
             _p, _c = _extract_usage(raw)
@@ -2645,9 +2745,12 @@ def _unified_availability_directive(bound) -> str:
     return (
         "Главное: ответь человеку ПО СУЩЕСТВУ его запроса, ОПИРАЯСЬ на результаты инструментов этого "
         "хода — что инструмент реально сделал или нашёл, то и скажи; действий, которых в результатах "
-        "нет, себе не приписывай. Если инструмент вернул отмену или «не делаю» — так и сообщи "
-        "(«отменила, ничего не делаю»), и ОСТАНОВИСЬ: НЕ переспрашивай и не предлагай сделать это "
-        "снова. Не отвечай мимо запроса и не переспрашивай «что записать», если человек спросил о "
+        "нет, себе не приписывай. Если инструмент ТЕКУЩЕГО действия вернул реальную отмену или «не "
+        "делаю» — так и сообщи («отменила, ничего не делаю»), и ОСТАНОВИСЬ: НЕ переспрашивай и не "
+        "предлагай сделать это снова. НО служебная пометка о СНЯТИИ прошлого незавершённого вызова "
+        "(«вызов инструмента отменён … не считать выполненным») — это НЕ отмена текущего запроса: НЕ "
+        "сообщай о ней как об отмене, просто обработай текущий запрос по существу. "  # #362 R5 (оба Codex MAJOR)
+        "Не отвечай мимо запроса и не переспрашивай «что записать», если человек спросил о "
         "другом. Эту служебную заметку НЕ пересказывай в ответе. "
         + _have +
         "Это про текущий ход, других инструментов здесь не зови; но способность к напоминаниям, "
@@ -2698,31 +2801,56 @@ def _is_new_request_on_pause(text: str) -> bool:
 
 def _should_redirect_on_pause(user_text: str, is_confirm_pause: bool) -> bool:
     """#316 R5 (субагент R4 MINOR — спец-дрейф #74): ЕДИНАЯ функция решения «новый запрос на живой паузе
-    → свежий ход». Извлечена из handle_turn, чтобы юнит-тест бил РЕАЛЬНЫЙ путь (а не реимплементацию —
-    иначе дроп конъюнкта не поймался бы тестом). confirm-пауза: положительный сигнал И НЕ голое эхо-
-    подтверждение «удали»/«ок удали» (иначе → A0 «нет», #267 fail-closed удаления); classify-конъюнкт
-    оставлен защитно (при is_new он всегда "redirect"). ask_human: просто сигнал нового запроса — у
-    открытого вопроса нет да/нет-действия, которое можно «переэхнуть», поэтому эхо-гейта нет."""
-    from sreda.runtime.react_signals import bare_command_echo
+    → свежий ход». Извлечена из handle_turn, чтобы юнит-тест бил РЕАЛЬНЫЙ путь (а не реимплементацию).
+    confirm-пауза (#362 R2, sol+terra MINOR — синхронизировано с кодом): у неё валидны ТОЛЬКО «да»/«нет»,
+    поэтому редиректим ЛЮБОЙ содержательный ответ, КРОМЕ (1) affirm/negate (`classify_confirm_reply !=
+    "redirect"` → resume: штатное «да» / честная детерминированная «Отменила» #321) и (2) эхо/filler
+    (`confirm_reply_is_noise` → resume → fail-closed «нет», #316/#267). `_is_new_request_on_pause` для
+    confirm-ветки НЕ используется. ask_human: просто сигнал нового запроса (`_is_new_request_on_pause`) —
+    у открытого вопроса нет да/нет-действия, которое можно «переэхнуть», поэтому эхо-гейта нет."""
+    from sreda.runtime.react_signals import confirm_reply_is_noise
     is_new = _is_new_request_on_pause(user_text)
     if is_confirm_pause:
-        return (is_new and not bare_command_echo(user_text)
-                and classify_confirm_reply(user_text) == "redirect")
+        # #362 R3 (Codex sol+terra, конвергентно R1→R2): у confirm-паузы валидны ТОЛЬКО «да»/«нет» —
+        # свободных СЛОТ-ответов нет, поэтому редиректим ЛЮБОЙ СОДЕРЖАТЕЛЬНЫЙ не-да/нет ответ (запись
+        # показателя любой формы — цифрой/словом/качественная «температура высокая»; новый запрос;
+        # отказ+запись «нет, сахар 16»), КРОМЕ эхо-подтверждения/filler/чистого отказа
+        # (`confirm_reply_is_noise`). Иначе такая реплика проваливалась в resume→ложная «Отменила» +
+        # ПОТЕРЯ (регрессия честной-отмены #321 на НЕ-отменяющем сообщении). Два исключения ведут в resume:
+        # (1) classify != "redirect" — точные «да»/«нет» И явный отказ («нет»/«нет, 16»/«не-а»/«нее» →
+        #     confirm_decline_signal → "negate") → resume → детерминированная честная «Отменила» (#321);
+        # (2) confirm_reply_is_noise — эхо «удали»/«удаляй»/filler → resume → fail-closed «нет» (#316/#267).
+        return (classify_confirm_reply(user_text) == "redirect"
+                and not confirm_reply_is_noise(user_text))
     return is_new
 
 
-def _withdrawal_messages(last_msg) -> list:
+def _withdrawal_messages(last_msg, redirect_new: bool = False) -> list:
     """#316 R2/R3: withdrawal-ToolMessage на КАЖДЫЙ повисший tool_call последнего AIMessage.
 
     Сброс живой паузы на redirect снимает interrupt-write, но закоммиченный AIMessage(tool_calls)
     остаётся БЕЗ пары ToolMessage (узел прервался до коммита результата) → провайдер отвергает «сироту».
     Дописав по одному withdrawal на вызов, закрываем пару → история валидна. `artifact.result_kind=
     "withdrawn"` (Codex high/medium R2 MAJOR): без него дефолт «ok» → отменённый delete_task считался бы
-    ИСПОЛНЕННЫМ в shadow-метрике (ok/observed). Не-AIMessage / без tool_calls → пусто (сироты нет)."""
+    ИСПОЛНЕННЫМ в shadow-метрике (ok/observed). Не-AIMessage / без tool_calls → пусто (сироты нет).
+
+    #362 R4 (Codex sol MAJOR — новый концерн R3): формулировка КОНТЕКСТНА. На РЕДИРЕКТЕ (redirect_new) —
+    анти-репорт-клауза «НЕ сообщать об отмене, обработай новый запрос» ЖИВЁТ в сообщении (переживает все
+    проходы; availability-хвост иначе провоцирует паррот). На STALE (не redirect) — НЕЙТРАЛЬНОЕ закрытие
+    сироты БЕЗ утверждения «сменил запрос»: на протухшем ask_human пользователь МОГ поздно ответить на
+    старый вопрос — решение «поздний ответ vs новый запрос» оставлено stale-директиве (_stale_pause_note),
+    иначе withdrawal затирал бы её. Обе формы держат заблокированные тестами подстроки («вызов инструмента
+    отменён» + «не считать выполненным»)."""
     if not (isinstance(last_msg, AIMessage) and getattr(last_msg, "tool_calls", None)):
         return []
+    content = (
+        ("(вызов инструмента отменён: пользователь сменил запрос; не считать выполненным и НЕ сообщать "
+         "об этом как об отмене — служебное закрытие прошлого действия, обработай новый запрос)")
+        if redirect_new else
+        ("(вызов инструмента отменён: не считать выполненным — служебное закрытие незавершённого "
+         "действия)"))
     return [ToolMessage(
-        content="(вызов инструмента отменён: пользователь сменил запрос; не считать выполненным)",
+        content=content,
         name=tc.get("name") or "tool", tool_call_id=tc.get("id") or "",
         artifact={"result_kind": "withdrawn"})
         for tc in last_msg.tool_calls if tc.get("id")]
@@ -3426,6 +3554,11 @@ def build_slice_tools(session: Any, tenant_id: str, user_id: str) -> list:
         delete_my_account,  # #187 Фаза 4b-2: self-delete (owner-only, single-user, confirm)
         need_family,  # #165 Срез A: мета-инструмент добора семей (ядро, всегда в наборе)
     ]
+    # #405: cancel_reminder/cancel_task/delete_task несут СВОЙ inline interrupt()-confirm (не через
+    # _confirm_wrap) → пометить маркером, чтобы ярус (б) единого пути НЕ добавил второй generic-confirm
+    # (двойное подтверждение, прод-класс бага #405). Гейт по маркеру в _apply_unified_policy, не по имени.
+    # delete_my_account сюда НЕ входит: он вовсе не биндится на едином пути (_apply_unified_policy: continue).
+    bespoke = [_mark_bespoke_confirm(t) if t.name in _INLINE_BESPOKE_CONFIRM else t for t in bespoke]
 
     # #162 полный перенос — добираем остальные семьи из общего реестра
     # (покупки/меню/рецепты/чек-листы/семья/веб) + память. Напоминания/задачи
@@ -3561,6 +3694,11 @@ def _build_graph(llm: Any, all_tools: list, *,
                  tenant_id: str, user_id: str, today_str: str,
                  session: Any = None, provider_key: str = "",
                  fallback_llm: Any = None,  # #184: запасной LLM (Оса) при сбое primary
+                 # #401 (R1 sol MAJOR): Mercury-клиент с ДЕФОЛТНЫМ retry для позиции chat/fact-фолбэка
+                 # (последний рубеж после deepseek — нет тира за ним, retry сохранять). None → `llm`
+                 # (back-compat: тесты инжектят один llm). `llm` может быть fail-fast (task/SGR-primary,
+                 # за ним Оса) — его нельзя ставить последним рубежом в chat/fact без ретраев.
+                 chat_fallback_llm: Any = None,
                  # #197: state-driven селектор — граф строится ОДИН раз с ОБЕИМИ моделями; chat-узел
                  # выбирает по effective_intent. deepseek_llm=None (OFF/мисконфиг) → chat/fact на Фредди+web-only.
                  deepseek_llm: Any = None, chat_prompt: str = "",
@@ -3637,6 +3775,15 @@ def _build_graph(llm: Any, all_tools: list, *,
         # поток отброшен обёрткой). Идентичность+ошибку primary кладём в наблюдательный трейс (#192),
         # чтобы дашборд стоимости НЕ выглядел так, будто primary не вызывался/был бесплатным.
         _primary_provider, _primary_model, _primary_error = "", "", ""
+        # #401: под-тайминги вызова — раздельно попытка primary / вызов резерва (наблюдаемость
+        # под #396; один агрегат latency_ms не давал разложить инцидент 20.07 «primary-ретраи vs
+        # фолбэк»). Инициализация ДО развилок: финальный llm_calls-дикт читает их на всех ветках
+        # (chat/fact, task, SGR). primary_latency_ms ставится ВСЕГДА (реальный invoke был);
+        # fallback_latency_ms — ТОЛЬКО когда сработал резерв (иначе опускается: happy-path/OFF-трейс).
+        _primary_latency_ms, _fallback_latency_ms = None, None
+        # #401 (R1 sol MINOR): длительность SGR-попытки, если она была и упала в легаси — легаси-ветка
+        # аккумулирует её в итоговый latency_ms (иначе итог не отражает SGR+легаси). 0 без SGR.
+        _sgr_elapsed_ms = 0
         # #383 Ф2: состояние SGR-шага этого прохода (инициализация ДО интент-развилки —
         # финальный учёт/трейс читают их на обеих ветках; chat/fact SGR не касается).
         _sgr_field, _sgr_done, _sgr_usage_done = None, False, False
@@ -3656,7 +3803,14 @@ def _build_graph(llm: Any, all_tools: list, *,
                                       budget=_compact_budget(), summary=history_summary)
             if time_tail_line:  # #298: дата+время эфемерным хвостом (prompt-view, заморожено на ход)
                 _msgs = _append_time_tail(_msgs, time_tail_line)
-            _primary = deepseek_llm if deepseek_llm is not None else llm  # мисконфиг → Фредди+web-only
+            # #401 (R2 terra MAJOR): у chat/fact НЕТ Оса-тира — Оса (fallback_llm) это фолбэк ТОЛЬКО
+            # task/SGR-ветки (#197 дизайн). Значит Mercury тут — ПОСЛЕДНИЙ рубеж И как primary (когда
+            # deepseek не построился), И как фолбэк после deepseek → берём Mercury с ДЕФОЛТНЫМ retry
+            # (chat_fallback_llm), а НЕ fail-fast `llm`: fail-fast `llm` жив ТОЛЬКО в task/SGR, где за
+            # ним реально стоит Оса. Иначе fail-fast Mercury тут упал бы без достижимого резерва (5xx →
+            # safe-reply без ретраев). None → `llm` (back-compat: тесты инжектят один клиент).
+            _chat_fb_client = chat_fallback_llm if chat_fallback_llm is not None else llm
+            _primary = deepseek_llm if deepseek_llm is not None else _chat_fb_client  # мисконфиг → Фредди+web-only
             _used_provider = deepseek_provider_key if deepseek_llm is not None else provider_key
             _used_model = _deepseek_model_name if deepseek_llm is not None else _model_name
             _t0 = _time.perf_counter()
@@ -3664,13 +3818,17 @@ def _build_graph(llm: Any, all_tools: list, *,
                 resp = invoke_with_per_call_timeout(
                     _primary.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s,
                     provider=_used_provider)  # #343: per-provider breaker keying
+                _primary_latency_ms = int((_time.perf_counter() - _t0) * 1000)  # #401
             except Exception as _e:  # noqa: BLE001 — сбой/таймаут deepseek → fallback Фредди web-only
+                _primary_latency_ms = int((_time.perf_counter() - _t0) * 1000)  # #401: попытка primary до сбоя
                 logger.warning("react_loop: chat/fact primary (%s) сбой → fallback Фредди web-only",
                                type(_e).__name__, exc_info=True)
                 _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
+                _tfb = _time.perf_counter()  # #401: вызов резерва — отдельным таймингом
                 resp = invoke_with_per_call_timeout(  # тот же web-only bound, НЕ task; #256: тоже короткий
-                    llm.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s,
+                    _chat_fb_client.bind_tools(bound), _msgs, timeout_seconds=_chat_timeout_s,
                     provider=provider_key)  # #343: fallback Фредди → СВОЙ breaker-bucket, не primary
+                _fallback_latency_ms = int((_time.perf_counter() - _tfb) * 1000)  # #401
                 _used_provider, _used_model, _fallback_fired = provider_key, _model_name, True
             _latency_ms = int((_time.perf_counter() - _t0) * 1000)
         else:
@@ -3862,6 +4020,9 @@ def _build_graph(llm: Any, all_tools: list, *,
                     run_id=state.get("turn_key") or "",
                     user_text=_last_human_text(state["messages"]))
                 _sgr_field = _sgr_out["sgr"]
+                # #401 (R1 sol MINOR): длительность SGR-попытки — для аккумуляции в итог, если
+                # SGR упал в легаси (иначе latency_ms отразит только легаси, не SGR+легаси).
+                _sgr_elapsed_ms = _sgr_out.get("latency_ms") or 0
                 if _sgr_out["fallback_fired"]:
                     # CR R1 sol MINOR + R2 оба (не терять на «оба structured упали → легаси»):
                     # телеметрия structured-фолбэка — В ОБЩИЕ trace-поля БЕЗУСЛОВНО, как
@@ -3871,9 +4032,17 @@ def _build_graph(llm: Any, all_tools: list, *,
                     _fallback_fired = True
                     _primary_provider, _primary_model = provider_key, _model_name
                     _primary_error = _sgr_out["primary_error"]
+                    # #401 (R1 sol MINOR): под-тайминг фолбэка SGR нести БЕЗУСЛОВНО — иначе на
+                    # «SGR-фолбэк-успех → parse-fail → легаси» (resp=None) fallback_latency терялся,
+                    # а трейс показывал fallback_fired без времени. Легаси-фолбэк ниже перепишет.
+                    _primary_latency_ms = _sgr_out.get("primary_latency_ms")
+                    _fallback_latency_ms = _sgr_out.get("fallback_latency_ms")
                 if _sgr_out["resp"] is not None:
                     resp = _sgr_out["resp"]
                     _latency_ms = _sgr_out["latency_ms"]
+                    # #401: SGR-шаг несёт свои под-тайминги primary/fallback (тот же паттерн)
+                    _primary_latency_ms = _sgr_out.get("primary_latency_ms")
+                    _fallback_latency_ms = _sgr_out.get("fallback_latency_ms")
                     _used_provider, _used_model = _sgr_out["provider"], _sgr_out["model"]
                     _sgr_done, _sgr_usage_done = True, bool(_sgr_out["usage_recorded"])
             # #184: Оса (fallback_llm) как запас Фредди. ЯВНЫЙ try/except (а не .with_fallbacks):
@@ -3897,13 +4066,19 @@ def _build_graph(llm: Any, all_tools: list, *,
                         resp = invoke_with_per_call_timeout(
                             _bound_primary, _msgs, timeout_seconds=_react_timeout_s,
                             provider=_used_provider)  # #343: per-provider breaker keying
+                        _primary_latency_ms = int((_time.perf_counter() - _t0) * 1000)  # #401
                     except Exception as _e:  # noqa: BLE001 — INVOKE primary упал/завис (сеть/5xx/таймаут) → запас
+                        # #401: попытка primary до сбоя — отдельным таймингом (на 5xx с fail-fast
+                        # клиентом это ~время одного round-trip, а не ~40с ретраев, как в инциденте 20.07).
+                        _primary_latency_ms = int((_time.perf_counter() - _t0) * 1000)
                         logger.warning("react_loop: primary LLM invoke сбой (%s) → fallback Оса",
                                        type(_e).__name__, exc_info=True)
                         _primary_provider, _primary_model, _primary_error = _used_provider, _used_model, type(_e).__name__
+                        _tfb = _time.perf_counter()  # #401: вызов резерва — отдельным таймингом
                         resp = invoke_with_per_call_timeout(
                             fallback_llm.bind_tools(bound), _msgs, timeout_seconds=_react_timeout_s,
                             provider=_FALLBACK_PROVIDER_KEY)  # #343: Оса → СВОЙ breaker-bucket
+                        _fallback_latency_ms = int((_time.perf_counter() - _tfb) * 1000)  # #401
                         _used_provider, _used_model = _FALLBACK_PROVIDER_KEY, _fallback_model_name
                         _fallback_fired = True
                 else:
@@ -3912,7 +4087,11 @@ def _build_graph(llm: Any, all_tools: list, *,
                     resp = invoke_with_per_call_timeout(
                         _bound_primary, _msgs, timeout_seconds=_react_timeout_s,
                         provider=_used_provider)  # #343: per-provider breaker keying
-                _latency_ms = int((_time.perf_counter() - _t0) * 1000)
+                    _primary_latency_ms = int((_time.perf_counter() - _t0) * 1000)  # #401
+                # #401 (R1 sol MINOR): итог включает SGR-попытку, если она была и упала в легаси
+                # (0 без SGR → байт-в-байт прежнее). Легаси-инвок выше уже переписал primary_latency
+                # на свою попытку; итоговый latency_ms — сумма (SGR + легаси).
+                _latency_ms = _sgr_elapsed_ms + int((_time.perf_counter() - _t0) * 1000)
         # #175: учёт расхода LLM (деньги/#150) — по КАЖДОМУ вызову узла. Полностью guarded
         # (извлечение+запись): любой сбой учёта НЕ должен ронять ход пользователя.
         # #383 Ф2: SGR-успех уже учтён per-attempt в _sgr_structured_step (синтетический
@@ -3942,6 +4121,11 @@ def _build_graph(llm: Any, all_tools: list, *,
                 "provider_key": _used_provider, "model": _used_model,
                 "latency_ms": _latency_ms, "retries": (1 if _fallback_fired else 0),
                 "fallback_fired": _fallback_fired,
+                # #401: под-тайминги — раздельно попытка primary / вызов резерва (#396). latency_ms
+                # остаётся ИТОГОМ (back-compat). primary_latency_ms присутствует ВСЕГДА (реальный
+                # вызов); fallback_latency_ms опускается на happy-path (резерв не сработал) и на OFF.
+                **({"primary_latency_ms": _primary_latency_ms} if _primary_latency_ms is not None else {}),
+                **({"fallback_latency_ms": _fallback_latency_ms} if _fallback_latency_ms is not None else {}),
                 "cache_read": _extract_cache_read(resp),  # #230 Срез 0a: наблюдаемость prompt-кеша (не деньги)
                 # #197 Слой 4: наблюдаемость роутинга — для отладки мисклассификации на проде.
                 "intent": eff or "task",
@@ -4993,6 +5177,7 @@ async def handle_turn(
     llm: Any, user_text: str, inbound_message_id: str = "", channel: str = "react",
     resume_only: bool = False, expected_confirm_id: str = "",
     provider_key: str = "", fallback_llm: Any = None,  # #184: Оса как fallback Фредди
+    chat_fallback_llm: Any = None,  # #401: default-retry Mercury для позиции chat/fact-фолбэка
 ) -> "_Reply":
     """ВХОД нового цикла на одно входящее сообщение. Источник правды о паузе — сам
     checkpoint (_has_pause: interrupts + snap.created_at). turn_key минтится РАЗ на свежий ход из
@@ -5071,6 +5256,7 @@ async def handle_turn(
             tenant_id=tenant_id, user_id=user_id, today_str=today_str,
             session=session, provider_key=provider_key,  # #175: учёт расхода в chat-узле
             fallback_llm=fallback_llm,  # #184: Оса-fallback
+            chat_fallback_llm=chat_fallback_llm,  # #401: default-retry Mercury для chat/fact-фолбэка
             deepseek_llm=_deepseek_llm, chat_prompt=_chat_prompt,  # #197 state-driven селектор
             deepseek_provider_key=_deepseek_pk, preflight_enabled=_preflight,
             persona_overlay=_persona_overlay,  # #250: тот же overlay, что у chat-промта (1 чтение/ход)
@@ -5179,7 +5365,9 @@ async def handle_turn(
                         # откат единого пути возвращает и старое поведение legacy-stale (байт-идентично).
                         if _redirect_new or _unified_execute_for(tenant_id):
                             _pmsgs = _pre_vals.get("messages") or []
-                            _redirect_close_msgs = _withdrawal_messages(_pmsgs[-1] if _pmsgs else None)
+                            # #362 R4: redirect → анти-паррот-клауза; stale → нейтральное закрытие сироты
+                            _redirect_close_msgs = _withdrawal_messages(
+                                _pmsgs[-1] if _pmsgs else None, redirect_new=_redirect_new)
                     except Exception:  # noqa: BLE001 — гашение не валит ход
                         logger.warning("react_loop: clear_pending failed", exc_info=True)
                         _redirect_close_msgs = []  # сбой гашения → без withdrawals (пре-существующее поведение)
@@ -5193,6 +5381,10 @@ async def handle_turn(
                 # (snap.next есть, а payload не читается → не трактуем как ask_human). Читается ТОЛЬКО на
                 # preflight (unified_execute — read-gate в chat — ставится под _preflight; вне него — dead work).
                 _stale_q, _stale_is_confirm, _ = _pending(snap)
+                # #362 R3: анти-паррот отмены на редиректе перенесён В САМ withdrawal-ToolMessage
+                # (_withdrawal_messages: persists ВСЕ проходы + не конфликтует top-level с availability —
+                # Codex sol/terra R2). Здесь — только прежняя STALE-директива (гейты внутри _stale_pause_note;
+                # на redirect она возвращает "").
                 _stale_note = _stale_pause_note(
                     bool(_stale_q), _redirect_new, tenant_id, _stale_is_confirm,
                     _persist_enabled(), _interrupt_age_seconds(snap.created_at))
