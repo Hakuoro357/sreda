@@ -404,7 +404,7 @@ STUB
     # нечитаемый env после подмены путей) проглатывалась бы как «инцидент».
     [ "$RC" -eq 129 ]         && ok "дофиксовая версия: умерла именно от SIGHUP (RC=129)"         || bad "дофиксовая версия: RC=129" "получили RC=$RC — базлайн умер не от сигнала"
 else
-    bad "дофиксовая версия недоступна" "передай SR_OLD_SCRIPT=<путь> (git show origin/main:scripts/safe_restart.sh)"
+    bad "дофиксовая версия недоступна" "нет tests/fixtures/safe_restart_prefix.sh и не задан SR_OLD_SCRIPT=<путь>"
 fi
 teardown_ws
 
