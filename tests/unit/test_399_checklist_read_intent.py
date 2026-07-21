@@ -48,6 +48,13 @@ NOT_A_REQUEST_CASES = [
     "он написал «покажи список кино»",          # цитата
     "покажи список кино, сказал он",            # атрибуция ПОСЛЕ
     "что значит фраза покажи список кино",      # мета-вопрос
+    # CR R2 sol MAJOR: прямая речь оформляется ТИРЕ, не только запятой
+    "покажи список кино — сказал он",
+    "покажи список кино, — сказал он",
+    # CR R2 terra MAJOR: голый WH — вопрос ПРО список, не просьба показать
+    "что такое список кино",
+    "что значит список кино",
+    "что за список кино",
 ]
 # ── route-мина: route_domains даёт checklists, но это НЕ запрос чтения ──
 MINE_CASES = [
@@ -165,6 +172,19 @@ class TestPolicySeam:
         pol_future_llm = compute_unified_policy(
             text, route, read_intent_domains=frozenset({"checklists"}))
         assert pol_detector["allowed_read"] == pol_future_llm["allowed_read"]
+
+    @pytest.mark.parametrize("text", [
+        # CR R2: WH-формы авторизует НЕ #399 — их и так поднимает read-кюс. Тест
+        # фиксирует, что сужение до императива ничего не сломало: раздел открыт,
+        # хотя сигнал #399 молчит. Покраснеет, если кто-то тронет read-кюсы.
+        "что в списке кино", "какие у меня списки", "что там в списке кино",
+    ])
+    def test_wh_forms_stay_open_via_existing_read_cues(self, text):
+        pol = compute_unified_policy(
+            text, route_domains(text), read_intent_domains=checklist_read_intent(text))
+        assert "checklists" in pol["allowed_read"], pol
+        assert checklist_read_intent(text) == frozenset(), (
+            "авторизует кюс, а не #399 — сигнал обязан молчать на голом WH")
 
     def test_read_intent_does_not_grant_write(self):
         """Сигнал ЧТЕНИЯ не даёт записи ни при каких обстоятельствах."""
