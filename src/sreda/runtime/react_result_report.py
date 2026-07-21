@@ -492,6 +492,32 @@ def _phrase(act: WriteAct) -> str:
     return f"{spec[0]} «{act.target}»" if act.target else spec[0]
 
 
+# #409 R6-b (sol MAJOR): успех write-инструмента НЕ сводится к префиксам `ok:`/`okv2:` — реальные
+# контракты шире (`saved_core:`, `saved_episode:`, `created:`), а часть `ok:`-ответов, наоборот,
+# NO-OP (ничего не записано). Детектор КОНСЕРВАТИВЕН: не уверены → не успех → реплика ПОДМЕНЯЕТСЯ
+# (безопасная сторона: теряем отчёт, но не даём ложного). Полное структурное покрытие остальных
+# write-инструментов — отдельная задача (расширение аллоулиста #393), см. decision-log.
+_PROVEN_SUCCESS_PREFIXES = ("ok:", "okv2:", "saved_core:", "saved_episode:", "created:")
+# `ok:`-ответы БЕЗ эффекта: ничего не создано/не изменено.
+_NOOP_SUCCESS_BODIES = (
+    "ok:added:0", "ok:cleared_or_not_found", "ok:not_linked", "ok:plan_no_recipes",
+    "ok:generated:0", "ok:cleared:0", "ok:bought:0", "ok:removed:0", "ok:updated:0",
+)
+
+
+def _is_proven_write_success(content: str) -> bool:
+    """Тело tool-результата доказывает СОСТОЯВШУЮСЯ запись?"""
+    body = (content or "").strip()
+    if not body.startswith(_PROVEN_SUCCESS_PREFIXES):
+        return False
+    if body.startswith(_NOOP_SUCCESS_BODIES):
+        return False
+    if is_okv2(body):
+        # okv2 несёт список фактически созданного; пусто (all-duplicate) → эффекта нет
+        return bool(_okv2_created(body))
+    return True
+
+
 def turn_has_non_bulk_success(messages) -> bool:
     """#409 R6: были ли в ходе УСПЕШНЫЕ записи, КРОМЕ bulk-инструмента?
 
@@ -532,14 +558,20 @@ def turn_has_non_bulk_success(messages) -> bool:
             if not (isinstance(art, dict) and art.get("result_kind") == "ok"):
                 continue
             content = str(getattr(tm, "content", "") or "")
-            if content.startswith("ok:") or content.startswith("okv2:"):
+            if _is_proven_write_success(content):
                 return True
     return False
 
 
 def acts_are_only_bulk(acts) -> bool:
-    """Все собранные акты — bulk (то есть об остальных записях хода структурных данных нет)."""
-    return bool(acts) and all(a.kind in _BULK_KINDS for a in acts)
+    """Все собранные акты — bulk С ДОКАЗАННЫМ ЭФФЕКТОМ (`kind == "bulk"`, N>0).
+
+    #409 R6-b (sol+terra MAJOR, независимо оба): раньше сюда попадали и `bulk_empty`/`bulk_error`,
+    из-за чего append-ветка СОХРАНЯЛА непроверенную реплику модели, обходя `reply_grounds_result`.
+    Итог был противоречив и допускал ЛОЖНЫЙ отчёт о P0-деструктиве: «список очистила. Не получилось
+    очистить список покупок.» / «список очистила. Список покупок и так был пуст.» Для исходов БЕЗ
+    доказанного эффекта дописка запрещена — там реплика ПОДМЕНЯЕТСЯ честной квитанцией (как в R5)."""
+    return bool(acts) and all(a.kind == "bulk" for a in acts)
 
 
 def bulk_receipt_sentence(acts) -> str:

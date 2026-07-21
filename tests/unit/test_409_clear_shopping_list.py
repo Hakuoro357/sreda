@@ -632,6 +632,53 @@ def test_bulk_alone_still_replaces_reply_409() -> None:
     assert _final_reply("Убрала всё из покупок.", msgs).startswith("Готово, убрала весь список")
 
 
+@pytest.mark.parametrize("raw,kind", [("error: internal", "error"), ("ok:cleared:0", "ok")])
+def test_append_forbidden_for_unproven_bulk_outcome_409(raw, kind) -> None:
+    """R6-b (Codex sol+terra MAJOR, независимо оба): дописка НЕ должна включаться для исходов БЕЗ
+    доказанного эффекта. Иначе append сохранял непроверенную реплику, обходя `reply_grounds_result`,
+    и юзер получал ЛОЖНЫЙ отчёт о P0-деструктиве: «список очистила. Не получилось очистить список.»
+    Для bulk_empty/bulk_error реплика ПОДМЕНЯЕТСЯ честной квитанцией (как в R5)."""
+    msgs = _msgs_multi_args(
+        ("complete_task", {"task_ref": "t1"}, "ok:completed:t1", "ok"),
+        ("clear_shopping_list", {}, raw, kind))
+    out = _final_reply("Готово, отметила задачу и очистила список покупок.", msgs)
+    assert "очистила список" not in out, f"ложное утверждение об очистке уцелело: {out!r}"
+    assert out in ("Не получилось очистить список покупок.", "Список покупок и так был пуст.")
+
+
+@pytest.mark.parametrize("content", [
+    "saved_core:mem_1",        # save_core_fact
+    "saved_episode:mem_2",     # save_episode
+    "created:cat_1:Дом",       # create_memory_category
+])
+def test_other_write_success_contracts_recognised_409(content) -> None:
+    """R6-b (sol MAJOR): успех write-инструмента не сводится к `ok:`/`okv2:` — реальные контракты
+    шире. Иначе append не включался, и корректная реплика всё равно затиралась."""
+    from sreda.runtime.react_result_report import turn_has_non_bulk_success
+
+    msgs = _msgs_multi_args(
+        ("save_core_fact", {}, content, "ok"),
+        ("clear_shopping_list", {}, "ok:cleared:5", "ok"))
+    assert turn_has_non_bulk_success(msgs) is True, f"{content!r} не распознан как успешная запись"
+
+
+@pytest.mark.parametrize("content", [
+    'okv2:save_recipe:{"created":[]}',  # sol: duplicate — новой строки НЕ создано
+    "ok:added:0",                        # ничего не добавлено
+    "ok:cleared_or_not_found",
+    "ok:not_linked:task_1",
+])
+def test_noop_write_is_not_counted_as_success_409(content) -> None:
+    """Обратная сторона: NO-OP-ответы успехом НЕ считаются — иначе append включался бы там, где
+    отчитываться не о чем, и сохранял бы непроверенную реплику."""
+    from sreda.runtime.react_result_report import turn_has_non_bulk_success
+
+    msgs = _msgs_multi_args(
+        ("add_shopping_items", {}, content, "ok"),
+        ("clear_shopping_list", {}, "ok:cleared:5", "ok"))
+    assert turn_has_non_bulk_success(msgs) is False, f"{content!r} зачтён как состоявшаяся запись"
+
+
 def test_tracked_act_still_replaces_not_appends_409() -> None:
     """Пробел, найденный МУТАЦИОННОЙ пробой (`acts_are_only_bulk` → `bool(acts)` выживала):
     append-режим включается ТОЛЬКО когда все собранные акты — bulk. Если в ходе есть ТРАКУЕМЫЙ
