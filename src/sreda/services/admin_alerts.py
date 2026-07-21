@@ -120,8 +120,9 @@ async def alert_admin_async(text: str) -> bool:
     R-28 (2026-05-15: MAX-primary → TG-fallback) — решение владельца #395.
 
     Этот legacy async helper используют callers в ``main.py``/``embeddings.py``/
-    ``miniapp.py``/``max_subscription_health.py``/``outbox_delivery.py`` и #376-нотификация
-    расхождения доменов (``react_loop._dis376_send_alert``).
+    ``miniapp.py``/``max_subscription_health.py``/``outbox_delivery.py``. (#410: per-turn
+    нотификация расхождения доменов #376 отсюда УБРАНА — расхождения копятся в трейсе и
+    уходят недельным разбором через sync-вход ``send_admin_alert``.)
 
     Реализация: делегирует общему sync-хелперу ``_deliver_dual_sync`` через ОДИН
     ``asyncio.to_thread`` (оба канала в одном потоке, TG→MAX) — отмена корутины-awaiter'а

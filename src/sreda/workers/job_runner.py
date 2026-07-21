@@ -10,6 +10,7 @@ from sreda.db.session import get_session_factory
 from sreda.features.app_registry import get_feature_registry
 from sreda.integrations.max import MaxClient
 from sreda.runtime.executor import ActionRuntimeService
+from sreda.workers.domain_divergence_digest import DomainDivergenceDigestWorker
 from sreda.workers.housewife_onboarding_worker import (
     HousewifeOnboardingKickoffWorker,
 )
@@ -95,6 +96,10 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         # каденс-паттерн (state-файл, раз в сутки, откат после провала)
         # #138 Ф2: сам открывает privileged_session("monitor") на KPI-COUNT.
         reliability = ReliabilityReportWorker()
+        # #410: недельный разбор расхождений доменов (#376) вместо per-turn алертов.
+        # Тот же каденс-паттерн (state-файл, раз в ISO-неделю, откат после провала);
+        # сам открывает privileged_session("monitor") на срез трасс.
+        divergence_digest = DomainDivergenceDigestWorker()
 
         # Order matters: proactive & housewife workers fill outbox →
         # delivery drains it within the same tick. The message queue
@@ -120,6 +125,7 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
         delivery_processed = await delivery.process_pending_messages(limit=limit)
         retention_processed = await retention.process_pending()
         reliability_processed = await reliability.process_pending()
+        divergence_processed = await divergence_digest.process_pending()
         return (
             message_queue_processed
             + runtime_processed
@@ -131,6 +137,7 @@ async def process_pending_jobs_once(*, limit: int = 20) -> int:
             + delivery_processed
             + retention_processed
             + reliability_processed
+            + divergence_processed
         )
     finally:
         session.close()

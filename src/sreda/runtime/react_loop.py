@@ -2474,12 +2474,11 @@ def _sgr_structured_step(*, bound: list, allowed_read: Any, allowed_write: Any,
         return out
 
 
-# #376: in-process dedup diff-нотификаций владельцу — ОДИНАКОВОЕ расхождение (тот же кортеж
-# доменов/вида) повторно в течение TTL не шлём; РАЗНЫЕ проходят все («вся разница» соблюдена).
-# Лёгкий dict, НЕ durable: канал best-effort по решению владельца 2026-07-15 («не строить
-# инфраструктуру») — потеря калибровочного сообщения не критична.
-_DIS376_SEEN: dict[tuple, float] = {}
-_DIS376_TTL_S = 3600.0
+# #410 (владелец 2026-07-21): per-turn нотификация расхождения доменов ПОГАШЕНА —
+# «не глушить, а превратить в рабочую очередь». Расхождение копится в durable-трейсе
+# (`router_decision_json.disambig`, ниже) и уходит недельным разбором
+# (`workers/domain_divergence_digest.py`). Предикат расхождения там воспроизведён
+# ОДИН-В-ОДИН: kind == "add" ИЛИ applied — при правке условия ниже правь и дайджест.
 # #376 слой-2: одноклаузный гард сужения — вторая клауза может нести обзор-намерение,
 # которое классификатор видит не всегда. L2-R2 (sol/terra MAJOR): + противительные/
 # разделительные союзы (а|но|или) и ВНУТРЕННЯЯ пунктуация («кино. Какие ещё есть?»,
@@ -2563,50 +2562,6 @@ def _one_clause_376(text: str) -> bool:
     _t = (text or "").strip().rstrip(" .!?…")
     return (not _re376_inner_punct.search(_t)
             and not _re376_connectors.search(_t.lower()))
-# CR R1 субагент: event loop держит task слабой ссылкой — без сильной ссылки таск может
-# быть собран GC до завершения (классическая ловушка create_task). Храним до done.
-_DIS376_TASKS: set = set()
-
-
-async def _dis376_send_alert(text: str) -> None:
-    """#376: доставка diff-алерта; исключения глотаются — нотификация НИКОГДА не роняет ход."""
-    try:
-        from sreda.services.admin_alerts import alert_admin_async
-        await alert_admin_async(text)
-    except Exception:  # noqa: BLE001 — best-effort канал
-        logger.warning("react_loop: #376 divergence alert send failed")
-
-
-def _notify_domain_divergence(tenant_id: str, dis: dict) -> None:
-    """#376: разница статик-vs-Фредди → владельцу (ops-канал). Fire-and-forget
-    (create_task, ход НЕ ждёт и НЕ падает). Payload БЕЗ ПД: только имена доменов,
-    вид расхождения, применено ли (текст пользователя НЕ включается — полный контекст
-    доступен по трейсу turn_key, origin_user_text там зашифрован)."""
-    try:
-        key = (tenant_id, tuple(dis.get("static_domains") or ()),
-               tuple(dis.get("freddie_domains") or ()), dis.get("kind"))
-        now = _time.monotonic()
-        for _k, _ts in list(_DIS376_SEEN.items()):  # протухшее — вон (дешёвая уборка)
-            if now - _ts > _DIS376_TTL_S:
-                _DIS376_SEEN.pop(_k, None)
-        if key in _DIS376_SEEN:
-            return
-        _DIS376_SEEN[key] = now
-        text = ("#376 расхождение доменов: статик="
-                + (",".join(dis.get("static_domains") or []) or "-")
-                + " | классификатор=" + (",".join(dis.get("freddie_domains") or []) or "-")
-                + f" | вид={dis.get('kind')} | применено={'да' if dis.get('applied') else 'нет'}"
-                + f" | tenant={tenant_id}")
-        _coro = _dis376_send_alert(text)
-        try:
-            _t = asyncio.create_task(_coro)
-        except RuntimeError:  # нет running loop (тесты/нестандартный контекст) — закрыть корутину
-            _coro.close()
-            raise
-        _DIS376_TASKS.add(_t)
-        _t.add_done_callback(_DIS376_TASKS.discard)
-    except Exception:  # noqa: BLE001 — нотификация никогда не роняет ход
-        logger.warning("react_loop: #376 divergence notify skipped")
 
 
 def _tail_directives_enabled() -> bool:
@@ -5516,9 +5471,10 @@ async def handle_turn(
                                        "applied": bool(_kind376 == "subtract" and _changed376)}
                             if _kind376 == "subtract":
                                 _upol = _upol376  # вердикт применён (вычтены лишние члены группы)
-                            # вся разница — владельцу: применённое вычитание ИЛИ неприменённый add
-                            if _kind376 == "add" or (_kind376 == "subtract" and _changed376):
-                                _notify_domain_divergence(tenant_id, _dis376)
+                            # #410: вся разница по-прежнему фиксируется — но НЕ сообщением на
+                            # каждом ходе, а в трейсе ниже (_rdj["disambig"]); разбор копится и
+                            # уходит недельным дайджестом (workers/domain_divergence_digest.py).
+                            # Предикат расхождения там: kind == "add" ИЛИ applied.
                         except Exception as _e376:  # noqa: BLE001 — дизамбигуация не роняет ход
                             _dis376 = {"ran": True, "error": True}
                             logger.warning(

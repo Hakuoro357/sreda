@@ -142,55 +142,10 @@ def test_gate_tenants_without_flag_376(monkeypatch):
     assert _domain_clf_disambig_for("tenant_max_40921122") is False
 
 
-def test_notify_dedup_same_key_once_376(monkeypatch):
-    """Одинаковое расхождение (тот же кортеж) в TTL-окне → ОДИН алерт; другое → проходит."""
-    import asyncio as _a
-    from sreda.runtime import react_loop as rl
-    sent: list = []
-
-    async def main():
-        rl._DIS376_SEEN.clear()
-        real_create = _a.create_task
-
-        def _capture(coro, **kw):
-            sent.append(coro)
-            return real_create(_noop())
-        monkeypatch.setattr(rl.asyncio, "create_task", _capture)
-        dis1 = {"static_domains": ["checklists", "shopping"], "freddie_domains": ["checklists"],
-                "kind": "subtract", "applied": True}
-        rl._notify_domain_divergence("tenant_x", dis1)
-        rl._notify_domain_divergence("tenant_x", dis1)          # дубль → не шлём
-        dis2 = {**dis1, "kind": "add", "applied": False}         # другой вид → шлём
-        rl._notify_domain_divergence("tenant_x", dis2)
-
-    async def _noop():
-        return None
-
-    _a.run(main())
-    for c in sent:  # закрыть неисполненные корутины (анти-warning)
-        c.close()
-    assert len(sent) == 2, f"ожидали 2 алерта (уникальные ключи), получили {len(sent)}"
-
-
-def test_notify_never_raises_376(monkeypatch):
-    """Сбой доставки/окружения НИКОГДА не роняет ход (fire-and-forget, глотаем)."""
-    from sreda.runtime import react_loop as rl
-    rl._DIS376_SEEN.clear()
-    # вне event loop create_task кинет RuntimeError → общий except должен проглотить
-    rl._notify_domain_divergence("tenant_x", {"static_domains": ["a"], "freddie_domains": ["b"],
-                                              "kind": "add", "applied": False})  # не должно raise
-
-
-def test_send_alert_swallows_376(monkeypatch):
-    """_dis376_send_alert глотает исключение доставки."""
-    import asyncio as _a
-    from sreda.runtime import react_loop as rl
-
-    async def _boom(text):
-        raise RuntimeError("down")
-    import sreda.services.admin_alerts as aa
-    monkeypatch.setattr(aa, "alert_admin_async", _boom)
-    _a.run(rl._dis376_send_alert("test"))  # не должно raise
+# #410 (2026-07-21): тесты per-turn нотификации расхождения (dedup / не-роняет-ход /
+# глотание сбоя доставки) УДАЛЕНЫ вместе с самим механизмом — расхождения больше не
+# шлются на каждом ходе, а копятся в трейсе и уходят недельным разбором. Поведение
+# «нотификатора больше нет» и агрегация разбора — tests/unit/test_410_domain_divergence_digest.py.
 
 
 # ─────────────────── слой-2 (#376): сужение items-vs-overview внутри чек-листов ───────────────────
