@@ -11,7 +11,24 @@
 #        - проверка heartbeat по каждому каналу telegram:<bot_key>
 #        - НИКОГДА не setWebhook (setWebhook блокирует getUpdates 409 Conflict)
 #   4. MAX webhook reset (когда подключим)
-#   5. Smoke-test
+#   5. Verify + ГЕЙТ по времени старта служб (#408)
+#   6. Smoke-test
+#
+# ГАРАНТИЯ #408: «успех» = дошли до строки `DONE: safe_restart завершён успешно`
+# И все службы стартовали позже начала прогона. Любой обрыв (в т.ч. SIGHUP при
+# разрыве SSH-сессии деплоя) = ненулевой код возврата + алерт админу.
+# Вызывающая сторона ОБЯЗАНА проверять код возврата, а не `systemctl is-active`.
+#
+# Коды возврата:
+#   0 — успех (дошли до DONE, гейт пройден)
+#   1 — env-файл не читается / нет токена основного бота
+#   2 — uvicorn не поднялся
+#   3 — поллер не стартанул
+#   4 — webhook URL не пуст (будет 409 Conflict)
+#   5 — поллер не активен после рестарта
+#   7 — ГЕЙТ не пройден: служба работает на СТАРОМ коде (деплой не доехал)
+#  90 — прогон оборван до DONE (сеть/сигнал/убитая сессия)
+# 129/143/130 — оборван сигналом HUP/TERM/INT
 #
 # Webhook-режим УДАЛЁН. После инцидента 2026-04-30 прод работает ТОЛЬКО
 # через long-poll. Функция restore_webhook.py требует явного
@@ -26,12 +43,110 @@
 
 set -euo pipefail
 
-ENV_FILE=/etc/sreda/.env
-LOG=/var/log/sreda/safe_restart.log
+# Пути прод-дефолтами. Переопределяются только через окружение — нужно тестам
+# (tests/test_safe_restart_gate.sh гоняет скрипт со stub-ами systemctl/curl).
+# Прод-безопасно: скрипт и так запускается под root, а sudo по умолчанию чистит
+# окружение (env_reset) — снаружи эти переменные не подставить.
+ENV_FILE="${SAFE_RESTART_ENV_FILE:-/etc/sreda/.env}"
+LOG="${SAFE_RESTART_LOG:-/var/log/sreda/safe_restart.log}"
+VENV_PYTHON="${SAFE_RESTART_VENV_PYTHON:-/opt/sreda/.venv/bin/python}"
 SREDA_PORT=8000
 
 ts() { date -u +'%Y-%m-%d %H:%M:%S UTC'; }
 log() { echo "$(ts) $*" | tee -a "$LOG"; }
+
+# ============ #408: анти-«молчаливый недокат» ============
+# Инцидент 2026-07-20 (vex-assistant#408). Phase 3a (deleteWebhook) вызывала curl
+# БЕЗ таймаута, а api.telegram.org с этого бокса периодически залипает на connect
+# (в логах поллера — ConnectTimeout/ReadTimeout). Скрипт блокировался на curl;
+# SSH-сессию деплоя убивал клиентский таймаут (~140s) → SIGHUP → скрипт умирал
+# ДО phase 3b, и поллеры оставались на СТАРОМ коде. При этом `systemctl is-active`
+# = active, а `git rev-parse HEAD` на диске верный — обе привычные проверки
+# ЗЕЛЁНЫЕ. Итог: фиксы #401/#405 не жили у пользователей ~15 часов.
+#
+# Три меры (по порядку важности):
+#   1. ГЕЙТ ПО ВРЕМЕНИ СТАРТА (phase 5b) — главный. Каждый юнит, который прогон
+#      обязан был перезапустить, ОБЯЗАН иметь время старта позже старта прогона.
+#      Ловит ровно этот класс: «служба active, но процесс старый».
+#   2. Внешние curl — с таймаутом и НЕ фатальные. Long-poll reset вспомогателен:
+#      сеть до TG не должна блокировать рестарт поллеров.
+#   3. Нет финального DONE = ненулевой код + громкий алерт админу (trap на EXIT),
+#      включая обрыв по SIGHUP/SIGTERM.
+
+# Таймауты внешних вызовов. Сумма держится заметно ниже клиентского таймаута
+# деплой-сессии (~120s), чтобы скрипт успевал доработать и отчитаться САМ.
+TG_CONNECT_TIMEOUT="${SAFE_RESTART_TG_CONNECT_TIMEOUT:-5}"
+TG_MAX_TIME="${SAFE_RESTART_TG_MAX_TIME:-15}"
+
+# Точка отсчёта гейта. Монотоника (мкс от загрузки) — тот же клок, что у
+# systemd *TimestampMonotonic: сравнение целых, без парсинга локале-зависимых
+# строк и без чувствительности к прыжкам NTP. Усечение (не округление) — чтобы
+# отсечка не оказалась «позже» реального старта прогона.
+GATE_START_MONOTONIC_US=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
+GATE_START_HUMAN=$(ts)
+
+SAFE_RESTART_COMPLETED=0
+
+# Алерт админу через СУЩЕСТВУЮЩИЙ дуал-канал (#395: Telegram основной + MAX дубль).
+# Best-effort: сам никогда не роняет скрипт (мы уже на аварийном пути) и ограничен
+# по времени. Текст идёт через stdin, не через argv (argv виден в process list).
+alert_admin() {
+    local text="$1"
+    local py="$VENV_PYTHON"
+    if [ ! -x "$py" ]; then
+        log "  (алерт пропущен: $py не найден)"
+        return 0
+    fi
+    if printf '%s' "$text" | timeout 30 sudo -u sreda "$py" -c '
+import sys, os, asyncio
+from pathlib import Path
+text = sys.stdin.read()
+env_file = "/etc/sreda/.env"
+if Path(env_file).exists() and not os.environ.get("SREDA_DATABASE_URL"):
+    from dotenv import load_dotenv
+    load_dotenv(env_file)
+from sreda.services.admin_alerts import alert_admin_async
+sys.exit(0 if asyncio.run(alert_admin_async(text)) else 1)
+' >/dev/null 2>&1; then
+        log "  → алерт админу доставлен"
+    else
+        log "  → алерт админу НЕ доставлен (best-effort, см. канал вручную)"
+    fi
+    return 0
+}
+
+# Единый выход: всё, что НЕ дошло до финального DONE, — провал деплоя.
+# Ловит set -e, явный exit, а также SIGHUP (обрыв SSH-сессии деплоя — механизм
+# инцидента #408) и SIGTERM. SIGKILL не перехватывается — там спасает только
+# внешняя проверка гейта.
+on_exit() {
+    local rc=$?
+    set +e
+    trap - EXIT
+    if [ "$SAFE_RESTART_COMPLETED" = "1" ]; then
+        exit "$rc"
+    fi
+    # Оборвались молча и с нулевым кодом — это НЕ успех.
+    [ "$rc" -eq 0 ] && rc=90
+    log "FAILED: safe_restart ОБОРВАН до DONE (код ${rc}) — ДЕПЛОЙ НЕ ЗАСЧИТАН."
+    log "        Службы могли остаться на СТАРОМ коде (uvicorn/job-runner/поллеры)."
+    log "        Проверь время старта служб и перезапусти вручную."
+    alert_admin "🔴 P0 Среда: safe_restart ОБОРВАН — деплой не доехал
+
+Прогон стартовал: ${GATE_START_HUMAN}
+Код возврата: ${rc}
+Хост: $(hostname)
+
+Скрипт не дошёл до финального DONE: часть служб могла остаться на СТАРОМ коде,
+при этом systemctl is-active показывает active. Проверь:
+  systemctl show -p ActiveEnterTimestamp --value sreda-telegram-poller@sreda
+Лог: ${LOG}"
+    exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 # Прочитать env (mode 0640, sreda group, root readable)
 if [ ! -r "$ENV_FILE" ]; then
@@ -134,8 +249,22 @@ for bot_key in $BOT_KEYS; do
     fi
 
     log "  phase 3a [${bot_key}]: deleteWebhook (long-poll mode)"
-    del_resp=$(curl -sS -X POST "https://api.telegram.org/bot${bot_token}/deleteWebhook" 2>&1 | head -c 200)
-    log "    → $del_resp"
+    # #408: таймаут + НЕ фатально. Этот шаг вспомогательный (сброс long-poll
+    # состояния на стороне TG) — его сбой НЕ должен мешать phase 3b поднять
+    # поллеры на новом коде. Без `|| del_rc=$?` ненулевой curl под
+    # `set -euo pipefail` убил бы скрипт МОЛЧА: код подстановки наследуется
+    # присваиванием (проверено). Обрезку вынесли из пайпа с curl — иначе
+    # SIGPIPE от `head` на длинном ответе даёт 141 и тот же молчаливый выход.
+    del_rc=0
+    del_resp=$(curl -sS --connect-timeout "$TG_CONNECT_TIMEOUT" --max-time "$TG_MAX_TIME" \
+                    -X POST "https://api.telegram.org/bot${bot_token}/deleteWebhook" 2>&1) || del_rc=$?
+    del_resp=$(printf '%s' "$del_resp" | head -c 200) || true
+    if [ "$del_rc" -eq 0 ]; then
+        log "    → $del_resp"
+    else
+        log "    ⚠ deleteWebhook не удался (curl rc=${del_rc}) — ПРОДОЛЖАЕМ к рестарту поллеров"
+        log "      (детали: ${del_resp})"
+    fi
 done
 
 sleep 2  # дать TG обработать deleteWebhook для всех ботов
@@ -256,7 +385,23 @@ for bot_key in $BOT_KEYS; do
     if [ -z "$bot_token" ]; then
         continue
     fi
-    info=$(curl -sS "https://api.telegram.org/bot${bot_token}/getWebhookInfo" 2>&1 | head -c 400)
+    # #408: таймаут + не фатально по СЕТИ (прогон 2026-07-20 13:26 умер молча
+    # именно здесь — тот же untimed curl).
+    info_rc=0
+    info=$(curl -sS --connect-timeout "$TG_CONNECT_TIMEOUT" --max-time "$TG_MAX_TIME" \
+                "https://api.telegram.org/bot${bot_token}/getWebhookInfo" 2>&1) || info_rc=$?
+    info=$(printf '%s' "$info" | head -c 400) || true
+
+    if [ "$info_rc" -ne 0 ]; then
+        # Сеть до TG недоступна — проверить нечего, но это НЕ повод валить деплой:
+        # реальную гарантию дают проверка активности поллеров ниже и гейт 5b.
+        # Непустой webhook всё равно был бы пойман: поллер словил бы 409 и выпал
+        # из active (exit 3), а это ловит проверка ниже.
+        log "  ⚠ [${bot_key}] getWebhookInfo недоступен (curl rc=${info_rc}) — проверку webhook пропускаем"
+        log "    (детали: ${info})"
+        continue
+    fi
+
     log "  [${bot_key}] getWebhookInfo: $info"
 
     # В long-poll режиме webhook URL ДОЛЖЕН быть пустым
@@ -297,6 +442,66 @@ for bot_key in $BOT_KEYS; do
     exit 5
 done
 
+# ============ Phase 5b: ГЕЙТ по времени старта служб (#408) ============
+# ГЛАВНАЯ проверка недоката, ради неё вся правка. `systemctl is-active` = active
+# и верный `git rev-parse HEAD` на диске НЕ доказывают, что процесс перезапустился:
+# 2026-07-20 поллеры остались на коде от 18:02, а деплои 19:17 и 21:32 были
+# отрапортованы успешными именно по этим двум зелёным признакам.
+#
+# Инвариант: КАЖДЫЙ юнит, который прогон обязан был перезапустить, стартовал
+# ПОЗЖЕ старта прогона. Старт раньше = работает старый процесс = деплой провален.
+#
+# Гейт стоит ДО phase 6: на старом коде смоук бы прошёл (PASS) и добавил ложной
+# уверенности — сначала доказываем, что код вообще активирован.
+log "phase 5b: гейт — все службы стартовали в ЭТОМ прогоне?"
+
+# Ожидаемый набор строим из КОНФИГУРАЦИИ (а не из того, что успели рестартнуть),
+# чтобы «phase 3b молча пропустил поллер» тоже ловилось.
+GATE_UNITS="sreda-uvicorn sreda-job-runner"
+for bot_key in $BOT_KEYS; do
+    unit="sreda-telegram-poller@${bot_key}.service"
+    if systemctl cat "$unit" >/dev/null 2>&1; then
+        GATE_UNITS="$GATE_UNITS $unit"
+    elif [ "$bot_key" = "sreda" ] && systemctl cat sreda-telegram-poller.service >/dev/null 2>&1; then
+        GATE_UNITS="$GATE_UNITS sreda-telegram-poller.service"
+    else
+        log "FATAL: [${bot_key}] токен настроен, но юнит поллера не установлен — inbound мёртв"
+        exit 7
+    fi
+done
+
+gate_ok=true
+for unit in $GATE_UNITS; do
+    enter_us=$(systemctl show -p ActiveEnterTimestampMonotonic --value "$unit" 2>/dev/null || echo "")
+    enter_human=$(systemctl show -p ActiveEnterTimestamp --value "$unit" 2>/dev/null || echo "?")
+    if ! printf '%s' "$enter_us" | grep -Eq '^[0-9]+$' || [ "$enter_us" -eq 0 ]; then
+        log "  ✗ ${unit}: времени старта нет (юнит не активен) — деплой не доехал"
+        gate_ok=false
+        continue
+    fi
+    if [ "$enter_us" -lt "$GATE_START_MONOTONIC_US" ]; then
+        log "  ✗ ${unit}: СТАРТОВАЛ РАНЬШЕ прогона (${enter_human}) — процесс СТАРЫЙ, новый код НЕ активирован"
+        gate_ok=false
+    else
+        log "  ✓ ${unit}: перезапущен в этом прогоне (${enter_human})"
+    fi
+done
+
+if [ "$gate_ok" = "false" ]; then
+    log "FATAL: ГЕЙТ НЕ ПРОЙДЕН — часть служб работает на СТАРОМ коде. ДЕПЛОЙ НЕ ЗАСЧИТАН."
+    log "       Это тот самый класс отказа, из-за которого #401/#405 не жили ~15 часов."
+    alert_admin "🔴 P0 Среда: деплой НЕ доехал — службы на старом коде
+
+Прогон стартовал: ${GATE_START_HUMAN}
+Гейт по времени старта не пройден: часть служб не перезапустилась,
+хотя systemctl is-active показывает active.
+
+Юниты прогона: ${GATE_UNITS}
+Лог (детали по каждому юниту): ${LOG}"
+    exit 7
+fi
+log "  ✓ гейт пройден: все службы перезапущены этим прогоном"
+
 # ============ Phase 6: onboarding smoke (отчёт, НЕ гейт) ============
 # Мера B пост-мортема vex-assistant#331 (#334): после рестарта гоняем сквозной
 # онбординг-smoke по каждому тиру (крэш free-тира был невидим канарейке основного
@@ -308,7 +513,7 @@ if [ -f "$SMOKE" ]; then
     for bot_key in $BOT_KEYS; do
         log "phase 6 [${bot_key}]: онбординг-smoke"
         smoke_rc=0
-        sudo -u sreda /opt/sreda/.venv/bin/python "$SMOKE" --bot-key "$bot_key" 2>&1 | tee -a "$LOG" || smoke_rc=$?
+        sudo -u sreda "$VENV_PYTHON" "$SMOKE" --bot-key "$bot_key" 2>&1 | tee -a "$LOG" || smoke_rc=$?
         case "$smoke_rc" in
             0) log "  ✓ [${bot_key}] онбординг-smoke PASS" ;;
             1) log "  ✗ [${bot_key}] онбординг-smoke FAIL — онбординг СЛОМАН, разберись прежде чем считать деплой успешным" ;;
@@ -320,6 +525,9 @@ else
     log "phase 6: ${SMOKE} не найден — онбординг-smoke пропущен"
 fi
 
+# #408: единственная точка, где прогон признаётся успешным. Всё, что не дошло
+# сюда, ловит trap on_exit → ненулевой код + алерт админу.
+SAFE_RESTART_COMPLETED=1
 log "DONE: safe_restart завершён успешно"
 echo
 echo "Можно отправить тестовое сообщение боту — должно дойти в течение 1-2 секунд."
