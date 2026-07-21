@@ -565,6 +565,118 @@ def test_error_then_zero_is_reported_as_failure_not_empty_409() -> None:
     assert "пуст" not in fallback_reply(acts).lower()
 
 
+def _final_reply(text, msgs, declined=False):
+    """Композиция финальной реплики — ТА ЖЕ, что в `react_loop` (#393-финализация). Держим здесь,
+    чтобы пинить наблюдаемый ИТОГ, а не только отдельные коллекторы."""
+    from sreda.runtime.react_result_report import (
+        acts_are_only_bulk,
+        bulk_receipt_sentence,
+        collect_successful_writes,
+        fallback_reply,
+        reply_grounds_result,
+        reply_has_tech_leak,
+        turn_has_non_bulk_success,
+    )
+
+    acts = collect_successful_writes(msgs)
+    if not acts:
+        return text
+    fb = fallback_reply(acts)
+    if not fb:
+        return text
+    if declined:
+        return f"{text} {fb}"
+    if reply_has_tech_leak(text):
+        return fb
+    if acts_are_only_bulk(acts) and turn_has_non_bulk_success(msgs):
+        sentence = bulk_receipt_sentence(acts)
+        return f"{text} {sentence}" if sentence else text
+    if not reply_grounds_result(text, acts):
+        return fb
+    return text
+
+
+def test_other_successful_write_is_not_erased_by_bulk_receipt_409() -> None:
+    """R6 (подтверждающий адверсарный проход, воспроизведено): безусловное «не заземлено» для bulk
+    превращало УСЛОВНУЮ потерю отчёта в ГАРАНТИРОВАННУЮ. Ход `complete_task` + `clear_shopping_list`
+    с ПРАВИЛЬНОЙ репликой, называющей ОБА действия, обрезался до одной очистки — юзер не узнавал
+    про задачу и заводил её повторно. На origin/main тот же ход с той же репликой доезжает целиком,
+    значит это регрессия #409, а не пред-существующее поведение.
+
+    Механизм (неполный аллоулист #393) НЕ трогаем: вместо подмены ДОПИСЫВАЕМ квитанцию."""
+    msgs = _msgs_multi_args(
+        ("complete_task", {"task_ref": "t1"}, "ok:completed:t1", "ok"),
+        ("clear_shopping_list", {}, "ok:cleared:5", "ok"))
+    reply = "Готово, отметила задачу «убраться» выполненной и очистила список покупок - 5 позиций."
+    out = _final_reply(reply, msgs)
+    assert "убраться" in out, f"отчёт о задаче стёрт подменой: {out!r}"
+    assert "5" in out and "покупок" in out, "квитанция очистки потеряна"
+
+
+def test_filler_reply_still_gets_authoritative_receipt_409() -> None:
+    """Обратная сторона: append-режим НЕ ослабляет гарантию. Филлер «Готово.» в том же смешанном
+    ходе всё равно получает детерминированную квитанцию об очистке."""
+    msgs = _msgs_multi_args(
+        ("complete_task", {"task_ref": "t1"}, "ok:completed:t1", "ok"),
+        ("clear_shopping_list", {}, "ok:cleared:5", "ok"))
+    out = _final_reply("Готово.", msgs)
+    assert "5" in out and "покупок" in out, f"квитанция не добавлена к филлеру: {out!r}"
+
+
+def test_bulk_alone_still_replaces_reply_409() -> None:
+    """Когда bulk — ЕДИНСТВЕННАЯ запись хода, поведение прежнее: свободный текст не судим,
+    реплика ПОДМЕНЯЕТСЯ квитанцией (иначе вернулся бы ложный отчёт, закрытый в R2)."""
+    msgs = _messages("ok:cleared:5")
+    assert _final_reply("Готово.", msgs) == "Готово, убрала весь список покупок - 5 позиций."
+    # даже «правильная» реплика подменяется — гарантия детерминирована
+    assert _final_reply("Убрала всё из покупок.", msgs).startswith("Готово, убрала весь список")
+
+
+def test_tracked_act_still_replaces_not_appends_409() -> None:
+    """Пробел, найденный МУТАЦИОННОЙ пробой (`acts_are_only_bulk` → `bool(acts)` выживала):
+    append-режим включается ТОЛЬКО когда все собранные акты — bulk. Если в ходе есть ТРАКУЕМЫЙ
+    не-bulk акт (archive_checklist), подмена обязана остаться — она отчитается об ОБОИХ, а append
+    сохранил бы филлер и потерял отчёт об архивации."""
+    msgs = _msgs_multi_args(
+        ("archive_checklist", {"list_id_or_title": "Дача"}, "ok:archived:cl_1", "ok"),
+        ("clear_shopping_list", {}, "ok:cleared:5", "ok"))
+    out = _final_reply("Готово.", msgs)
+    assert "Дача" in out, f"отчёт об архивации потерян: {out!r}"
+    assert "5" in out and "покупок" in out, "квитанция очистки потеряна"
+    assert out.startswith("Готово,"), "ожидалась ПОДМЕНА страховкой, а не дописка к филлеру"
+
+
+def test_declined_other_tool_does_not_enable_append_mode_409() -> None:
+    """Отказ от подтверждения ДРУГОГО инструмента («Хорошо, не трогаю.») успешной записью НЕ
+    считается — иначе append-режим включался бы там, где отчитываться не о чем."""
+    from sreda.runtime.react_result_report import turn_has_non_bulk_success
+
+    msgs = _msgs_multi_args(
+        ("cancel_task", {"task_ref": "t1"}, "Хорошо, не трогаю.", "ok"),
+        ("clear_shopping_list", {}, "ok:cleared:5", "ok"))
+    assert turn_has_non_bulk_success(msgs) is False
+    assert _final_reply("Готово.", msgs) == "Готово, убрала весь список покупок - 5 позиций."
+
+
+def test_grounding_note_excludes_failure_in_mixed_turn_409() -> None:
+    """MINOR-пин (мутация подтверждающего прохода ВЫЖИВАЛА): в `grounding_note` гейт стоит по
+    `ok_acts`, но факты обязаны собираться ТОЖЕ из `ok_acts`. При сборе из `acts` смешанный ход
+    «archive ok + clear domain_blocked» дал бы промпт «успешно выполнено — заархивирован чек-лист;
+    не получилось очистить список покупок» — то самое противоречие, что sol подняла в R4 как MAJOR,
+    только в промптовой половине. Прежние тесты этого не ловили: один смотрел ходы, где ВСЕ акты
+    неуспешны, другой — только `fallback_reply`."""
+    from sreda.runtime.react_result_report import collect_successful_writes, grounding_note
+
+    acts = collect_successful_writes(_msgs_multi_args(
+        ("archive_checklist", {"list_id_or_title": "Дача"}, "ok:archived:cl_1", "ok"),
+        ("clear_shopping_list", {}, "Инструмент недоступен", "domain_blocked")))
+    assert {a.kind for a in acts} == {"target", "bulk_error"}
+    note = grounding_note(acts)
+    assert "заархивирован" in note, "успешный акт обязан остаться в служебной сводке"
+    assert "не получилось" not in note.lower(), \
+        "неуспех попал в «успешно выполнено» — противоречивый промпт"
+
+
 def test_declined_confirm_is_not_an_outcome_409() -> None:
     """Отказ от подтверждения («Хорошо, не трогаю.») НЕ исход — иначе юзер получил бы
     «не получилось очистить» на собственное «нет»."""

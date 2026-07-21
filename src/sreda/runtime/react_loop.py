@@ -5723,12 +5723,16 @@ async def handle_turn(
         if _post_tool_report_enabled():
             try:
                 from sreda.runtime.react_result_report import (
+                    acts_are_only_bulk,
+                    bulk_receipt_sentence,
                     collect_successful_writes,
                     fallback_reply,
                     reply_grounds_result,
                     reply_has_tech_leak,
+                    turn_has_non_bulk_success,
                 )
-                _writes393 = collect_successful_writes(result.get("messages") or [])
+                _msgs393 = result.get("messages") or []
+                _writes393 = collect_successful_writes(_msgs393)
                 if _writes393:
                     _fb393 = fallback_reply(_writes393)
                     if _fb393:
@@ -5736,10 +5740,23 @@ async def handle_turn(
                             # отказ + ДРУГИЕ успешные write (declined-акт коллектор уже исключил): к
                             # детерминированному тексту отказа ДОПИСЫВАЕМ отчёт об успехах (sol R4).
                             text = f"{text} {_fb393}"
-                        elif (not reply_grounds_result(text, _writes393)
-                              or reply_has_tech_leak(text)):
-                            # подмена ЧИСТОЙ страховкой, если реплика НЕ называет результат ИЛИ несёт
-                            # машинную утечку (okv2/id=/ref=/«—» — Codex terra R3).
+                        elif reply_has_tech_leak(text):
+                            # машинная утечка (okv2/id=/ref=) — подменяем целиком, дописывать нельзя
+                            text = _fb393
+                        elif (acts_are_only_bulk(_writes393)
+                              and turn_has_non_bulk_success(_msgs393)):
+                            # #409 R6: в ходе была ЕЩЁ ОДНА успешная запись, которой нет в узком
+                            # аллоулисте заземления (complete_task/add_task/save_recipe/…). Подмена
+                            # стёрла бы ЕДИНСТВЕННЫЙ отчёт о ней — даже когда реплика модели ПРАВИЛЬНА
+                            # и называет оба действия (воспроизведено: «отметила задачу выполненной и
+                            # очистила список» → юзер видел только про список). Потому ДОПИСЫВАЕМ
+                            # детерминированную квитанцию, а не затираем реплику. Прецедент формы —
+                            # ветка `_declined_confirm` выше. Аллоулист #393 при этом НЕ трогаем.
+                            _bulk_txt393 = bulk_receipt_sentence(_writes393)
+                            if _bulk_txt393:
+                                text = f"{text} {_bulk_txt393}"
+                        elif not reply_grounds_result(text, _writes393):
+                            # подмена ЧИСТОЙ страховкой, если реплика НЕ называет результат
                             text = _fb393
                 # #409 R3: ВТОРАЯ ветка (отдельный сбор bulk-исходов) УДАЛЕНА. Она была источником
                 # сразу трёх MAJOR — противоречивая квитанция при ретрае, затирание отчёта о

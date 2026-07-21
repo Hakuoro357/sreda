@@ -492,6 +492,63 @@ def _phrase(act: WriteAct) -> str:
     return f"{spec[0]} «{act.target}»" if act.target else spec[0]
 
 
+def turn_has_non_bulk_success(messages) -> bool:
+    """#409 R6: были ли в ходе УСПЕШНЫЕ записи, КРОМЕ bulk-инструмента?
+
+    Зачем: `reply_grounds_result` для bulk всегда возвращает False, то есть реплика модели
+    ПОДМЕНЯЕТСЯ детерминированной квитанцией. Если в ходе была ещё одна успешная запись, которой
+    нет в узком аллоулисте заземления (`complete_task`, `add_task`, `save_recipe`,
+    `mark_shopping_bought`, …), подмена стирала ЕДИНСТВЕННЫЙ отчёт о ней — даже когда реплика
+    модели была ПРАВИЛЬНОЙ и называла оба действия. Механизм (неполный аллоулист #393)
+    пред-существует, но безусловное «не заземлено» превратило условную потерю в ГАРАНТИРОВАННУЮ,
+    и это уже регрессия #409 (на origin/main тот же ход с той же репликой доезжает целиком).
+
+    Успех определяется КОНСЕРВАТИВНО: result_kind == "ok" И тело с префиксом ``ok:``/``okv2:``
+    (та же конвенция, что у финализации #393). Отказ от подтверждения («Хорошо, не трогаю.»)
+    под неё НЕ подходит → append-режим на него не включается.
+    """
+    from sreda.services.tool_schemas.families import TOOL_OP_CLASS
+
+    msgs = list(messages or [])
+    start = 0
+    for i in range(len(msgs) - 1, -1, -1):
+        if isinstance(msgs[i], HumanMessage):
+            start = i + 1
+            break
+    window = msgs[start:]
+    results: dict = {}
+    for m in window:
+        if isinstance(m, ToolMessage):
+            results[getattr(m, "tool_call_id", None)] = m
+    for m in window:
+        for tc in (getattr(m, "tool_calls", None) or []):
+            name = tc.get("name")
+            if name in _BULK_SPECS or TOOL_OP_CLASS.get(name) != "write":
+                continue
+            tm = results.get(tc.get("id"))
+            if tm is None:
+                continue
+            art = getattr(tm, "artifact", None) or {}
+            if not (isinstance(art, dict) and art.get("result_kind") == "ok"):
+                continue
+            content = str(getattr(tm, "content", "") or "")
+            if content.startswith("ok:") or content.startswith("okv2:"):
+                return True
+    return False
+
+
+def acts_are_only_bulk(acts) -> bool:
+    """Все собранные акты — bulk (то есть об остальных записях хода структурных данных нет)."""
+    return bool(acts) and all(a.kind in _BULK_KINDS for a in acts)
+
+
+def bulk_receipt_sentence(acts) -> str:
+    """Квитанция bulk-исхода ОТДЕЛЬНЫМ предложением, БЕЗ префикса «Готово,» — чтобы её можно было
+    ДОПИСАТЬ к реплике модели, не затирая её (прецедент — ветка `_declined_confirm`)."""
+    body = "; ".join(p for p in (_phrase(a) for a in acts if a.kind in _BULK_KINDS) if p)
+    return (body[0].upper() + body[1:] + ".") if body else ""
+
+
 def fallback_reply(acts) -> str:
     """Часть 2: детерминированная заземлённая реплика-страховка (тёплый шаблон). Всегда называет
     результат — именами (из okv2-результата) либо, если неотображаемы, серверными фактами (кол-во+тип).
@@ -512,9 +569,12 @@ def fallback_reply(acts) -> str:
 
 __all__ = [
     "WriteAct",
+    "acts_are_only_bulk",
+    "bulk_receipt_sentence",
     "collect_successful_writes",
     "reply_grounds_result",
     "grounding_note",
     "fallback_reply",
     "reply_has_tech_leak",
+    "turn_has_non_bulk_success",
 ]
