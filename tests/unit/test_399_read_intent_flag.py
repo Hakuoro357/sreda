@@ -73,6 +73,21 @@ class TestFlagOffIsIdentical:
         pol = compute_unified_policy(text, route_domains(text))
         assert "read_intent" not in pol["signals"]
 
+    @pytest.mark.parametrize("text,expect_write", [
+        # CR R3 sol MAJOR (НОВЫЙ, внесён правкой R2): расширение общего guard `_framed`
+        # ради #399 МОЛЧА поменяло B1-сигнал записи для ВСЕХ тенантов при выключенном
+        # #399 — «добавь молоко — сказал он» терял allowed_write ['shopping'] → [].
+        # #399 НЕ ИМЕЕТ ПРАВА менять write-путь ни при каких флагах. Этот тест — сторож
+        # инварианта: он бы покраснел на той правке.
+        ("добавь молоко — сказал он", ["shopping"]),
+        ("удали молоко — попросила мама", ["shopping"]),
+        ("добавь молоко", ["shopping"]),
+        ("добавь молоко, сказал он", []),        # запятая-атрибуция глушила и раньше
+    ])
+    def test_399_does_not_touch_write_signals(self, text, expect_write):
+        assert compute_unified_policy(
+            text, route_domains(text))["allowed_write"] == expect_write
+
     def test_flag_on_but_silent_signal_is_still_observable(self):
         """ON+сигнал молчит ≠ OFF: пустой frozenset обязан быть ВИДЕН в трейсе,
         иначе остаточные промахи не отличить от выключенной фичи."""
