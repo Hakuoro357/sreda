@@ -62,8 +62,12 @@ FAILURE_BACKOFF = timedelta(minutes=30)
 ALERT_AFTER_CONSECUTIVE_FAILURES = 3
 # сколько формулировок-лидеров показываем на случай расхождения
 EXAMPLES_PER_CASE = 2
-# потолок строк, чей текст вообще расшифровывается ради частотной статистики
-MAX_EXAMPLE_ROWS = 2000
+# потолок строк ОДНОГО случая, чей текст расшифровывается ради частотной статистики.
+# CR R2 (sol+terra MAJOR): глобальный потолок обрывал набор ДО подсчёта частот и без
+# ORDER BY давал произвольную подвыборку — массовая фраза могла не попасть в топ, а
+# напечатанное xN не было недельной частотой. Потолок теперь ПО-КЕЙСНЫЙ, и если он
+# сработал, случай честно помечается выборкой (см. DivergenceCase.examples_sampled).
+MAX_EXAMPLE_ROWS_PER_CASE = 1000
 # Отчёт идёт ДВУМЯ секциями с раздельными потолками. Общий топ-N не годится: живой
 # прогон 2026-07-21 (214 ходов, 92 расхождения) дал 19 неприменённых, размазанных по
 # 8 подписям, и 73 применённых всего в 2 подписи — единый список из 8 строк выдавил
@@ -112,11 +116,14 @@ def scrub_phrase(text: str | None, *, max_len: int = MAX_PHRASE_LEN) -> str:
 
 
 def _domains_tuple(raw: object) -> tuple[str, ...] | None:
-    """Список доменов из трейса → кортеж строк; всё непохожее → None (битая строка).
+    """Список доменов из трейса → кортеж строк; всё непохожее (в т.ч. ОТСУТСТВИЕ) → None.
+
     CR R1 sol MAJOR: без этого объект внутри ``static_domains`` даёт
-    ``TypeError: unhashable type`` при сборке ключа и роняет ВЕСЬ недельный отчёт."""
-    if raw is None:
-        return ()
+    ``TypeError: unhashable type`` при сборке ключа и роняет ВЕСЬ недельный отчёт.
+    CR R2 (sol+terra MAJOR): отсутствующий список — тоже битая форма, а не «пусто»:
+    ``react_loop`` на живом ходе ВСЕГДА пишет оба списка (react_loop.py:5511-5514),
+    поэтому их нехватка означает разъехавшуюся схему и должна быть видна в отчёте.
+    """
     if not isinstance(raw, (list, tuple)):
         return None
     out: list[str] = []
@@ -125,6 +132,30 @@ def _domains_tuple(raw: object) -> tuple[str, ...] | None:
             return None
         out.append(item)
     return tuple(out)
+
+
+def _validate_disambig(dis: dict) -> tuple[str | None, bool, tuple, tuple] | None:
+    """Строгая проверка формы живого блока ``disambig``. None → строка битая.
+
+    Инварианты берутся из того, что реально пишет ``react_loop`` (строки 5508-5516):
+    ``kind`` ∈ {None, "subtract", "add"}; ``applied`` — НАСТОЯЩИЙ bool и он тождествен
+    ``kind == "subtract" and политика изменилась``, значит при ``kind`` = "add"/None
+    он может быть только False. CR R2 (sol+terra MAJOR): раньше семантически
+    невозможный ``kind="add", applied=True`` проходил и портил разбивку.
+    """
+    kind = dis.get("kind")
+    applied = dis.get("applied")
+    static_d = _domains_tuple(dis.get("static_domains"))
+    freddie_d = _domains_tuple(dis.get("freddie_domains"))
+    if kind not in (None, "subtract", "add"):
+        return None
+    if not isinstance(applied, bool):
+        return None
+    if applied and kind != "subtract":
+        return None
+    if static_d is None or freddie_d is None:
+        return None
+    return kind, applied, static_d, freddie_d
 
 
 @dataclass(frozen=True)
@@ -138,6 +169,8 @@ class DivergenceCase:
     count: int
     # (формулировка, сколько раз встретилась) — лидеры частоты, не «первые попавшиеся»
     examples: tuple[tuple[str, int], ...] = ()
+    # частоты посчитаны не по всем строкам случая (упёрлись в по-кейсный потолок)
+    examples_sampled: bool = False
 
     @property
     def signature(self) -> str:
@@ -189,22 +222,49 @@ def _preview_tenants() -> frozenset[str]:
     return get_settings().admin_alert_preview_tenants
 
 
-def _disambig_tenant_filter() -> list[str]:
-    """Тенанты, у которых #376 вообще может писать блок disambig. CR R1 terra MAJOR:
-    без сужения недельный запрос сканирует ВЕСЬ трейс окна по всем тенантам, а
-    ``MAX_ROWS`` ограничивает только результат, не скан. Явный allowlist (прод сегодня:
-    канарейка владельца) → сужаем. Режим «всем» и «никому» дают пустую итерацию
-    (см. ``_ReactTenantGate``) → сужать нечем/нечего, окно+LIMIT остаются защитой."""
+def _scan_scope() -> tuple[str, list[str]]:
+    """Что вообще нужно сканировать: ``("none"|"all"|"list", тенанты)``.
+
+    CR R1 terra MAJOR: без сужения недельный запрос идёт по ВСЕМУ трейсу окна, а
+    ``MAX_ROWS`` ограничивает результат, не скан.
+    CR R2 terra MAJOR: пустой/выключенный гейт надо ОТЛИЧАТЬ от «всем» — при
+    выключенном #376 блоков disambig нет в принципе, и глобальный скан на первом
+    недельном тике зря придерживал бы job-runner для всех тенантов.
+
+    ``_ReactTenantGate`` в режиме «*» truthy, но итерируется пусто (см. settings.py),
+    поэтому «всем» и «никому» различаются именно так: truthy + пустая итерация = «*».
+    """
     from sreda.config.settings import get_settings
     try:
-        return sorted(get_settings().domain_clf_disambig_tenants)
+        s = get_settings()
+        if not s.domain_clf_disambig_enabled:
+            return ("none", [])
+        gate = s.domain_clf_disambig_tenants
+        if not gate:
+            return ("none", [])
+        explicit = sorted(gate)
+        return ("list", explicit) if explicit else ("all", [])
     except Exception:  # noqa: BLE001 — конфиг не должен ронять отчёт
-        return []
+        return ("all", [])
 
 
 def gather_week_counts(session: Session, *, now: datetime,
-                       window: timedelta = REPORT_WINDOW) -> WeekCounts:
-    """Свести расхождения доменов за окно по durable-трейсу ходов."""
+                       window: timedelta = REPORT_WINDOW,
+                       scope: tuple[str, list[str]] | None = None) -> WeekCounts:
+    """Свести расхождения доменов за окно по durable-трейсу ходов.
+
+    ``scope`` — что сканировать: ``("none", [])`` (ничего, SQL вообще не идёт),
+    ``("all", [])`` (весь трейс окна) или ``("list", [тенанты])``. ``None`` →
+    определить по настройкам. Воркер передаёт ОБЪЕДИНЕНИЕ текущего гейта с гейтом
+    прошлого прогона (CR R2 sol MAJOR: окно охватывает прошедшие 7 дней, а текущая
+    конфигурация не есть источник истины за весь этот исторический период — смена
+    канарейки посреди недели иначе молча теряла бы расхождения прежнего тенанта).
+    """
+    mode, scope_tenants = scope if scope is not None else _scan_scope()
+    if mode == "none":
+        # #376 никому не включён и не был включён → блоков disambig нет; не трогаем БД
+        return WeekCounts(turns_with_disambig=0, divergences=0, subtract_applied=0,
+                          add_not_applied=0, disambig_errors=0)
     since = now - window
     # LIKE сужает выборку на стороне БД (портируется и на SQLite, и на Postgres —
     # JSON-операторы у них разные), окончательный разбор — в Python по JSON.
@@ -219,9 +279,8 @@ def gather_week_counts(session: Session, *, now: datetime,
                 ReactTurnTrace.routing_decision_json.is_not(None),
                 ReactTurnTrace.routing_decision_json.like('%"disambig"%'),
             )))
-    _tenants = _disambig_tenant_filter()
-    if _tenants:
-        stmt = stmt.where(ReactTurnTrace.tenant_id.in_(_tenants))
+    if mode == "list" and scope_tenants:
+        stmt = stmt.where(ReactTurnTrace.tenant_id.in_(scope_tenants))
     rows = session.execute(stmt.limit(MAX_ROWS + 1)).all()
     truncated = len(rows) > MAX_ROWS
     if truncated:
@@ -234,9 +293,8 @@ def gather_week_counts(session: Session, *, now: datetime,
     sub_applied = 0
     add_not_applied = 0
     preview = _preview_tenants()
-    # подпись случая → [счётчик, id строк-кандидатов на текст]
+    # подпись случая → [счётчик, id строк-кандидатов на текст, сколько кандидатов отброшено]
     buckets: dict[tuple, list] = {}
-    example_rows = 0
     any_divergence_outside_preview = False
 
     for rid, tenant_id, raw in rows:
@@ -245,24 +303,17 @@ def gather_week_counts(session: Session, *, now: datetime,
         except (TypeError, ValueError):
             continue
         dis = rdj.get("disambig") if isinstance(rdj, dict) else None
-        if not isinstance(dis, dict) or not dis.get("ran"):
+        if not isinstance(dis, dict) or dis.get("ran") is not True:
             continue
         turns += 1
-        if dis.get("error"):
+        if dis.get("error") is True:
             errors += 1
             continue
-        # CR R1 sol MAJOR: форму блока проверяем ЯВНО. Иначе `kind="bogus", applied=true`
-        # молча уезжает в «применённое вычитание», а нестроковый домен роняет отчёт.
-        kind = dis.get("kind")
-        applied_raw = dis.get("applied")
-        static_d = _domains_tuple(dis.get("static_domains"))
-        freddie_d = _domains_tuple(dis.get("freddie_domains"))
-        if (kind not in (None, "subtract", "add")
-                or not isinstance(applied_raw, (bool, type(None)))
-                or static_d is None or freddie_d is None):
+        parsed = _validate_disambig(dis)
+        if parsed is None:
             malformed += 1
             continue
-        applied = bool(applied_raw)
+        kind, applied, static_d, freddie_d = parsed
         # предикат ровно как у погашенного per-turn алерта (react_loop.py:5520):
         # применённое вычитание ИЛИ неприменённое добавление. Согласие (вердикт
         # совпал, политика не менялась) расхождением НЕ считается.
@@ -273,20 +324,21 @@ def gather_week_counts(session: Session, *, now: datetime,
         else:
             sub_applied += 1
         key = (str(kind), static_d, freddie_d, applied)
-        slot = buckets.setdefault(key, [0, []])
+        slot = buckets.setdefault(key, [0, [], 0])
         slot[0] += 1
         # текст берём ТОЛЬКО у тенантов из privacy-allowlist (CR R1 sol/terra):
         # скраббер не есть анонимизация, поэтому по умолчанию формулировок нет ни у кого
         if str(tenant_id) in preview:
-            if example_rows < MAX_EXAMPLE_ROWS:
+            if len(slot[1]) < MAX_EXAMPLE_ROWS_PER_CASE:
                 slot[1].append(str(rid))
-                example_rows += 1
+            else:
+                slot[2] += 1     # частоты этого случая станут выборочными
         else:
             any_divergence_outside_preview = True
 
     # тексты — вторым проходом и только по отобранным строкам. Сбой чтения/расшифровки
     # не должен съедать весь отчёт: деградируем до «без формулировок».
-    example_ids = [rid for _cnt, ids in buckets.values() for rid in ids]
+    example_ids = [rid for _cnt, ids, _skipped in buckets.values() for rid in ids]
     texts: dict[str, str] = {}
     if example_ids:
         try:
@@ -296,7 +348,7 @@ def gather_week_counts(session: Session, *, now: datetime,
             texts = {}
 
     cases: list[DivergenceCase] = []
-    for (kind, static_d, freddie_d, applied), (cnt, ids) in buckets.items():
+    for (kind, static_d, freddie_d, applied), (cnt, ids, skipped) in buckets.items():
         # CR R1 sol MAJOR: «топ формулировок» = лидеры ЧАСТОТЫ по всем строкам случая,
         # а не первые попавшиеся — иначе редкая старая фраза вытесняет ту, что
         # повторилась сто раз, и рабочая очередь врёт о приоритетах.
@@ -308,7 +360,8 @@ def gather_week_counts(session: Session, *, now: datetime,
         top = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:EXAMPLES_PER_CASE]
         cases.append(DivergenceCase(
             kind=kind, static_domains=static_d, freddie_domains=freddie_d,
-            applied=applied, count=cnt, examples=tuple(top)))
+            applied=applied, count=cnt, examples=tuple(top),
+            examples_sampled=bool(skipped)))
     cases.sort(key=_rank_key)
 
     return WeekCounts(
@@ -333,20 +386,28 @@ def format_report(counts: WeekCounts, *, now: datetime,
             f"{since.strftime('%d.%m')} - {now.strftime('%d.%m')}")
     lines = [head]
 
+    # CR R2 (sol+terra MAJOR): счётчики сбоев/битых строк и отметка усечения должны быть
+    # видны во ВСЕХ ветках. Иначе неделя, где все строки битые, рапортует «согласны».
+    def _health(out: list[str]) -> None:
+        if counts.disambig_errors:
+            out.append(f"сбоев дизамбигуации: {counts.disambig_errors}")
+        if counts.malformed:
+            out.append(f"строк трейса не той формы (пропущены): {counts.malformed}")
+        if counts.truncated:
+            out.append(f"(скан упёрся в потолок {MAX_ROWS} ходов - неделя показана частично)")
+
     if counts.turns_with_disambig == 0:
         lines.append("механизм дизамбигуации за неделю не срабатывал (0 ходов): "
                      "гейт снят или task-ходов на канарейке не было.")
-        if counts.disambig_errors:
-            lines.append(f"сбоев дизамбигуации: {counts.disambig_errors}")
+        _health(lines)
         return "\n".join(lines)
 
     if counts.divergences == 0:
-        lines.append(f"ходов с дизамбигуацией: {counts.turns_with_disambig}; "
-                     "расхождений нет - статик и классификатор согласны.")
-        if counts.disambig_errors:
-            lines.append(f"сбоев дизамбигуации: {counts.disambig_errors}")
-        if counts.truncated:
-            lines.append(f"(скан упёрся в потолок {MAX_ROWS} ходов - неделя показана частично)")
+        _agree = ("расхождений нет - статик и классификатор согласны."
+                  if not counts.malformed
+                  else "расхождений не насчитано.")
+        lines.append(f"ходов с дизамбигуацией: {counts.turns_with_disambig}; {_agree}")
+        _health(lines)
         return "\n".join(lines)
 
     pct = 100.0 * counts.divergences / counts.turns_with_disambig
@@ -354,12 +415,7 @@ def format_report(counts: WeekCounts, *, now: datetime,
                  f"расхождений: {counts.divergences} ({pct:.1f}%)")
     lines.append(f"из них вычтено классификатором (применено): {counts.subtract_applied}; "
                  f"добавление вне статика (не применено): {counts.add_not_applied}")
-    if counts.disambig_errors:
-        lines.append(f"сбоев дизамбигуации: {counts.disambig_errors}")
-    if counts.malformed:
-        lines.append(f"строк трейса не той формы (пропущены): {counts.malformed}")
-    if counts.truncated:
-        lines.append(f"(скан упёрся в потолок {MAX_ROWS} ходов - неделя показана частично)")
+    _health(lines)
     if counts.examples_suppressed:
         lines.append("формулировки части тенантов скрыты: их нет в privacy-allowlist "
                      "SREDA_ADMIN_ALERT_PREVIEW_TENANTS")
@@ -382,8 +438,11 @@ def _section(lines: list[str], title: str, cases: list[DivergenceCase], top: int
     for i, case in enumerate(cases[:top], start=1):
         lines.append(f"{i}. {case.signature} · ходов: {case.count}")
         if case.examples:
+            # «по выборке» — честная метка, если частоты посчитаны не по всем строкам
+            # случая (CR R2: выборочное xN нельзя выдавать за недельную частоту)
+            _mark = " (по выборке)" if case.examples_sampled else ""
             lines.append("   частые формулировки: "
-                         + "; ".join(f"«{p}» x{n}" for p, n in case.examples))
+                         + "; ".join(f"«{p}» x{n}" for p, n in case.examples) + _mark)
     hidden = len(cases) - top
     if hidden > 0:
         lines.append(f"   ещё видов в этой группе: {hidden} (реже)")
@@ -396,10 +455,30 @@ def _week_key(now: datetime) -> str:
     return f"{iso[0]}-W{iso[1]:02d}"
 
 
-def _gather_with_session(now: datetime) -> WeekCounts:
-    """Глобальный срез по ВСЕМ тенантам (#138 Ф2) → privileged-сессия, как у #139."""
+def _merge_scope(current: tuple[str, list[str]],
+                 prev_mode: object, prev_tenants: object) -> tuple[str, list[str]]:
+    """Объединить область скана текущего гейта с гейтом ПРОШЛОГО прогона.
+
+    CR R2 sol MAJOR: окно отчёта охватывает прошедшие 7 дней, поэтому сегодняшняя
+    конфигурация — не источник истины за весь этот период. Смена канарейки (или снятие
+    гейта) посреди недели иначе молча выкидывала бы валидные расхождения прежнего
+    тенанта. Объединение self-healing: в state лежит только гейт последнего прогона,
+    накапливать историю не нужно — прогоны идут раз в неделю, ровно по ширине окна.
+    """
+    mode, tenants = current
+    if mode == "all" or prev_mode == "all":
+        return ("all", [])
+    merged = set(tenants)
+    if isinstance(prev_tenants, list):
+        merged |= {str(t) for t in prev_tenants if isinstance(t, str)}
+    return ("list", sorted(merged)) if merged else ("none", [])
+
+
+def _gather_with_session(now: datetime,
+                         scope: tuple[str, list[str]] | None = None) -> WeekCounts:
+    """Срез по трейсу (#138 Ф2: глобальный COUNT → privileged-сессия, как у #139)."""
     with privileged_session("monitor") as session:
-        return gather_week_counts(session, now=now)
+        return gather_week_counts(session, now=now, scope=scope)
 
 
 class DomainDivergenceDigestWorker:
@@ -419,10 +498,13 @@ class DomainDivergenceDigestWorker:
         if not self._should_run(now, state):
             return 0
         week = _week_key(now)
+        current_scope = _scan_scope()
+        scope = _merge_scope(current_scope, state.get("last_scan_mode"),
+                             state.get("last_scan_tenants"))
         try:
             # скан недели + расшифровка примеров — в поток: job_runner не должен
             # замирать на время запроса (раз в неделю, но выборка до MAX_ROWS)
-            counts = await _aio.to_thread(_gather_with_session, now)
+            counts = await _aio.to_thread(_gather_with_session, now, scope)
             send_admin_alert(
                 "INFO", "расхождения доменов - недельный разбор",
                 format_report(counts, now=now),
@@ -444,6 +526,9 @@ class DomainDivergenceDigestWorker:
                     logger.exception("domain_divergence: alert delivery failed")
             return 0
         state["last_run_week"] = week
+        # гейт ЭТОГО прогона — чтобы следующая неделя знала, что было в начале окна
+        state["last_scan_mode"] = current_scope[0]
+        state["last_scan_tenants"] = current_scope[1]
         state.pop("last_failure_at", None)
         state["failure_count"] = 0
         if not self._write_state(state):

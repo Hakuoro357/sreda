@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -26,6 +27,7 @@ from sqlalchemy.orm import sessionmaker
 from sreda.db.base import Base
 from sreda.db.models.react_trace import ReactTurnTrace
 from sreda.workers import domain_divergence_digest as dd
+from sreda.workers.domain_divergence_digest import _scan_scope as _real_scan_scope
 from sreda.workers.domain_divergence_digest import (
     DomainDivergenceDigestWorker,
     format_report,
@@ -54,7 +56,7 @@ def _allow_previews(monkeypatch):
     не будет вовсе (CR R1: показывать тексты можно только явно разрешённым тенантам).
     Тесты про запрет переопределяют фикстуру своим monkeypatch."""
     monkeypatch.setattr(dd, "_preview_tenants", lambda: frozenset({TENANT}))
-    monkeypatch.setattr(dd, "_disambig_tenant_filter", lambda: [])
+    monkeypatch.setattr(dd, "_scan_scope", lambda: ("all", []))
 
 
 _seq = iter(range(100000))
@@ -309,48 +311,174 @@ def test_top_phrasings_ranked_by_frequency(session):
     assert "x30" in format_report(counts, now=NOW)
 
 
-def test_malformed_disambig_block_is_skipped_not_counted(session):
-    """CR R1 sol MAJOR: битая форма блока не должна засчитываться как расхождение."""
-    _trace(session, disambig={"ran": True, "kind": "bogus", "applied": True,
-                              "static_domains": ["a"], "freddie_domains": ["b"]})
-    _trace(session, disambig={"ran": True, "kind": "add", "applied": "да",
-                              "static_domains": ["a"], "freddie_domains": ["b"]})
+@pytest.mark.parametrize("bad", [
+    pytest.param({"kind": "bogus", "applied": True,
+                  "static_domains": ["a"], "freddie_domains": ["b"]}, id="kind-не-из-набора"),
+    pytest.param({"kind": "add", "applied": "да",
+                  "static_domains": ["a"], "freddie_domains": ["b"]}, id="applied-не-bool"),
+    pytest.param({"kind": "add", "applied": True,
+                  "static_domains": ["a"], "freddie_domains": ["b"]},
+                 id="add+applied-невозможно"),
+    pytest.param({"kind": None, "applied": True,
+                  "static_domains": ["a"], "freddie_domains": ["b"]},
+                 id="вердикта-нет-но-применено"),
+    pytest.param({"kind": "add", "applied": False, "freddie_domains": ["b"]},
+                 id="нет-static_domains"),
+    pytest.param({"kind": "add", "applied": False, "static_domains": ["a"]},
+                 id="нет-freddie_domains"),
+    pytest.param({"kind": "add", "applied": False,
+                  "static_domains": [{"oops": 1}], "freddie_domains": ["b"]},
+                 id="нехешируемый-домен"),
+])
+def test_malformed_disambig_block_is_skipped_not_counted(session, bad):
+    """CR R1+R2 (sol+terra MAJOR): любая битая/семантически невозможная форма блока
+    считается malformed, а НЕ расхождением. Иначе разбивка и проценты врут, а
+    нехешируемый домен вообще роняет весь недельный отчёт."""
+    _trace(session, disambig={"ran": True, **bad})
     _trace(session, disambig=_sub_applied(), text="что в списке кино")
     session.commit()
 
     c = gather_week_counts(session, now=NOW)
 
-    assert c.turns_with_disambig == 3
-    assert c.divergences == 1, "битые строки не считаются расхождениями"
-    assert c.malformed == 2
+    assert c.turns_with_disambig == 2
+    assert c.divergences == 1, "битая строка не считается расхождением"
+    assert c.malformed == 1
     assert "не той формы" in format_report(c, now=NOW)
 
 
-def test_unhashable_domains_do_not_crash_report(session):
-    """CR R1 sol MAJOR: объект внутри static_domains раньше давал TypeError при сборке
-    ключа и ронял ВЕСЬ недельный отчёт из-за одной строки."""
-    _trace(session, disambig={"ran": True, "kind": "add", "applied": False,
-                              "static_domains": [{"oops": 1}], "freddie_domains": ["b"]})
-    _trace(session, disambig=_add_not_applied(), text="покажи покупки")
+def test_week_of_only_malformed_rows_does_not_claim_agreement(session):
+    """CR R2 (sol+terra MAJOR): неделя, где ВСЕ строки битые, не должна рапортовать
+    «статик и классификатор согласны» и прятать счётчик битых."""
+    for _ in range(4):
+        _trace(session, disambig={"ran": True, "kind": "bogus", "applied": True,
+                                  "static_domains": ["a"], "freddie_domains": ["b"]})
     session.commit()
 
     c = gather_week_counts(session, now=NOW)
+    text = format_report(c, now=NOW)
 
-    assert c.divergences == 1 and c.malformed == 1
-    assert format_report(c, now=NOW).strip()
+    assert c.divergences == 0 and c.malformed == 4
+    assert "согласны" not in text
+    assert "не той формы (пропущены): 4" in text
 
 
-def test_scan_narrowed_to_disambig_tenants(session, monkeypatch):
+def test_ran_flag_must_be_true_bool(session):
+    """Строка с ran не-True не засчитывается ходом дизамбигуации."""
+    _trace(session, disambig={"ran": 1, "kind": "add", "applied": False,
+                              "static_domains": [], "freddie_domains": ["b"]})
+    session.commit()
+
+    assert gather_week_counts(session, now=NOW).turns_with_disambig == 0
+
+
+def test_scan_narrowed_to_disambig_tenants(session):
     """CR R1 terra MAJOR: при явном allowlist #376 недельный запрос сужается по тенанту,
     а не сканирует весь трейс окна по всем тенантам."""
-    monkeypatch.setattr(dd, "_disambig_tenant_filter", lambda: [TENANT])
     _trace(session, disambig=_add_not_applied(), text="своя")
     _trace(session, disambig=_add_not_applied(), text="чужая", tenant="tenant_tg_777")
     session.commit()
 
-    c = gather_week_counts(session, now=NOW)
+    c = gather_week_counts(session, now=NOW, scope=("list", [TENANT]))
 
     assert c.divergences == 1, "чужой тенант вне выборки"
+
+
+def test_scope_none_skips_sql_entirely(session, monkeypatch):
+    """CR R2 terra MAJOR: гейт #376 выключен → блоков disambig нет в принципе,
+    и воркер не должен трогать БД (глобальный LIKE-скан ради нулевого отчёта)."""
+    _trace(session, disambig=_add_not_applied(), text="покажи покупки")
+    session.commit()
+
+    def _boom(*a, **kw):
+        raise AssertionError("SQL не должен выполняться при выключенном гейте")
+    monkeypatch.setattr(session, "execute", _boom)
+
+    c = gather_week_counts(session, now=NOW, scope=("none", []))
+
+    assert c.turns_with_disambig == 0 and c.divergences == 0
+    assert "не срабатывал" in format_report(c, now=NOW).lower()
+
+
+def test_scope_resolution_from_settings(monkeypatch):
+    """Разбор гейта: выключен → none; пусто → none; список → list; «*» → all."""
+    from sreda.config import settings as st
+
+    def _fake(enabled, raw):
+        return SimpleNamespace(
+            domain_clf_disambig_enabled=enabled,
+            domain_clf_disambig_tenants=st._parse_tenant_gate(raw))
+    # _real_scan_scope импортирован до autouse-подмены — зовём настоящую реализацию
+    monkeypatch.setattr(st, "get_settings", lambda: _fake(False, "t1"))
+    assert _real_scan_scope() == ("none", []), "флаг выключен"
+    monkeypatch.setattr(st, "get_settings", lambda: _fake(True, None))
+    assert _real_scan_scope() == ("none", []), "список тенантов пуст"
+    monkeypatch.setattr(st, "get_settings", lambda: _fake(True, "t1,t2"))
+    assert _real_scan_scope() == ("list", ["t1", "t2"])
+    monkeypatch.setattr(st, "get_settings", lambda: _fake(True, "*"))
+    assert _real_scan_scope() == ("all", []), "режим «всем» отличается от «никому»"
+
+
+def test_scope_union_survives_canary_change_mid_week():
+    """CR R2 sol MAJOR: окно охватывает 7 прошедших дней, поэтому сегодняшний гейт не
+    источник истины за весь период — смена канарейки внутри недели не должна терять
+    расхождения прежнего тенанта."""
+    assert dd._merge_scope(("list", ["t_new"]), "list", ["t_old"]) == \
+        ("list", ["t_new", "t_old"])
+    # гейт сняли совсем, но неделя ещё содержит ходы прежнего тенанта
+    assert dd._merge_scope(("none", []), "list", ["t_old"]) == ("list", ["t_old"])
+    # «всем» с любой стороны поглощает
+    assert dd._merge_scope(("list", ["t1"]), "all", []) == ("all", [])
+    assert dd._merge_scope(("all", []), "list", ["t1"]) == ("all", [])
+    # ничего не было и нет → сканировать нечего
+    assert dd._merge_scope(("none", []), None, None) == ("none", [])
+
+
+def test_worker_records_gate_and_merges_next_run(tmp_path, monkeypatch):
+    """Гейт прогона ложится в state и участвует в объединении на следующей неделе."""
+    import asyncio
+    import json as _json
+    state_path = tmp_path / "state.json"
+    w = DomainDivergenceDigestWorker(state_file=str(state_path))
+    seen: list = []
+    monkeypatch.setattr(dd, "send_admin_alert", lambda *a, **kw: None)
+    monkeypatch.setattr(dd, "_scan_scope", lambda: ("list", ["t_old"]))
+    monkeypatch.setattr(dd, "_gather_with_session", lambda now, scope=None: (
+        seen.append(scope) or dd.WeekCounts(0, 0, 0, 0, 0)))
+
+    asyncio.run(w.process_pending(now=NOW))
+    assert _json.loads(state_path.read_text(encoding="utf-8"))["last_scan_tenants"] == ["t_old"]
+
+    monkeypatch.setattr(dd, "_scan_scope", lambda: ("list", ["t_new"]))
+    asyncio.run(w.process_pending(now=NOW + timedelta(days=7)))
+    assert seen[-1] == ("list", ["t_new", "t_old"])
+
+
+def test_sampled_frequencies_are_labelled(session, monkeypatch):
+    """CR R2 (sol+terra MAJOR): если частоты посчитаны не по всем строкам случая,
+    отчёт обязан это сказать, а не выдавать выборочное xN за недельную частоту."""
+    monkeypatch.setattr(dd, "MAX_EXAMPLE_ROWS_PER_CASE", 2)
+    for _ in range(5):
+        _trace(session, disambig=_add_not_applied(), text="покажи покупки")
+    session.commit()
+
+    c = gather_week_counts(session, now=NOW)
+
+    assert c.cases[0].count == 5, "сам счётчик расхождений остаётся точным"
+    assert c.cases[0].examples_sampled is True
+    assert "(по выборке)" in format_report(c, now=NOW)
+
+
+def test_full_frequencies_are_not_labelled_as_sample(session):
+    """И наоборот: когда посчитано по всем строкам, метки выборки нет."""
+    for _ in range(5):
+        _trace(session, disambig=_add_not_applied(), text="покажи покупки")
+    session.commit()
+
+    c = gather_week_counts(session, now=NOW)
+
+    assert c.cases[0].examples == (("покажи покупки", 5),)
+    assert c.cases[0].examples_sampled is False
+    assert "(по выборке)" not in format_report(c, now=NOW)
 
 
 def test_scrub_normalises_em_dash():
@@ -425,7 +553,7 @@ def _worker(tmp_path, monkeypatch, counts_stub=None):
         dd, "send_admin_alert",
         lambda sev, title, body, **kw: sent.append((sev, title, body)))
     monkeypatch.setattr(dd, "_gather_with_session",
-                        counts_stub or (lambda now: dd.WeekCounts(
+                        counts_stub or (lambda now, scope=None: dd.WeekCounts(
                             turns_with_disambig=5, divergences=0,
                             subtract_applied=0, add_not_applied=0,
                             disambig_errors=0, cases=(), truncated=False)))
@@ -448,7 +576,7 @@ def test_backoff_after_failure(tmp_path, monkeypatch):
     """Провал сбора → откат (не шторм): повтор в окне backoff молчит."""
     import asyncio
 
-    def _boom(now):
+    def _boom(now, scope=None):
         raise RuntimeError("db down")
     w, sent = _worker(tmp_path, monkeypatch, counts_stub=_boom)
 
@@ -464,7 +592,7 @@ def test_delivery_uses_dual_channel_helper(tmp_path, monkeypatch):
     calls: list = []
     monkeypatch.setattr(dd, "send_admin_alert",
                         lambda sev, title, body, **kw: calls.append((sev, title, kw)))
-    monkeypatch.setattr(dd, "_gather_with_session", lambda now: dd.WeekCounts(
+    monkeypatch.setattr(dd, "_gather_with_session", lambda now, scope=None: dd.WeekCounts(
         turns_with_disambig=3, divergences=0, subtract_applied=0,
         add_not_applied=0, disambig_errors=0, cases=(), truncated=False))
 
