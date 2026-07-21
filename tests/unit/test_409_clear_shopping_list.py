@@ -384,65 +384,136 @@ def test_generic_filler_is_not_grounded_409() -> None:
     assert reply_grounds_result("Хорошо, приняла к сведению.", acts) is False
 
 
-def test_reply_naming_the_count_is_grounded_409() -> None:
-    """Живой голос, назвавший результат, НЕ подменяется (правило #121 — голос сохраняем)."""
+def test_receipt_is_deterministic_and_names_result_409() -> None:
+    """R2: раз свободный текст не судим, юзер обязан получить КВИТАНЦИЮ, которая называет
+    результат («убрала весь список покупок - 5 позиций»), а не «Готово». Это и есть цель #393
+    для этого действия — сузили правило #121 осознанно, но НЕ ценой безымянного ответа."""
+    from sreda.runtime.react_result_report import collect_successful_writes, fallback_reply
+
+    acts = collect_successful_writes(_messages("ok:cleared:5"))
+    reply = fallback_reply(acts)
+    assert "покупок" in reply and "5" in reply, f"квитанция не называет результат: {reply!r}"
+    assert "позиц" in reply, "квитанция не называет единицы"
+
+
+@pytest.mark.parametrize("reply", [
+    "Напоминание поставила на 5 минут.",          # R1: постороннее число
+    "В списке покупок 5 позиций.",                 # R2 sol: доменный якорь без факта действия
+    "Напоминание о покупках поставила на 5 минут.",  # R2 terra: и число, и «покупки», но не очистка
+    "Убрала 5 позиций из списка.",                  # R2: корректная реплика без слова «покупки»
+    "Готово.",
+    "Хорошо, приняла к сведению.",
+])
+def test_bulk_reply_is_never_judged_by_free_text_409(reply) -> None:
+    """R2 (Codex sol+terra, оба: «M1 закрыт неверно»): свободный текст модели для bulk-деструктива
+    НЕ судим ВООБЩЕ. Любой текстовой критерий давал либо ложный положительный («в списке покупок
+    5 позиций» ≠ отчёт об очистке), либо ложный отрицательный («убрала 5 позиций из списка» —
+    корректно, но без слова-якоря). Всегда «не заземлено» → финализация ставит детерминированную
+    квитанцию из СТРУКТУРНОГО исхода."""
     from sreda.runtime.react_result_report import collect_successful_writes, reply_grounds_result
 
     acts = collect_successful_writes(_messages("ok:cleared:5"))
-    assert reply_grounds_result("Убрала весь список покупок - 5 позиций.", acts) is True
+    assert acts, "успешный bulk-акт должен собираться"
+    assert reply_grounds_result(reply, acts) is False, \
+        f"свободный текст зачтён как отчёт об очистке: {reply!r}"
 
 
-def test_unrelated_number_is_not_grounding_409() -> None:
-    """R1 (Codex sol+terra MAJOR, независимо оба): одного ЧИСЛА мало. В смешанном ходе реплика
-    про другое действие с тем же числом («напомню через 5 минут») не должна засчитываться как
-    отчёт об очистке — иначе страховка #393 молчит там, где очистка вообще не названа."""
-    from sreda.runtime.react_result_report import collect_successful_writes, reply_grounds_result
+def test_empty_outcome_gets_honest_deterministic_reply_409() -> None:
+    """R1/R2 MAJOR M2 (sol+terra, оба ОТКЛОНИЛИ довод «вне scope»): при ok:cleared:0 набор
+    успешных актов ПУСТ → страховка #393 раньше не включалась вовсе, и «убрала весь список
+    покупок» после пустого списка уходило юзеру. Теперь исход честный и детерминированный."""
+    from sreda.runtime.react_result_report import bulk_outcome_reply, collect_bulk_outcomes
 
-    acts = collect_successful_writes(_messages("ok:cleared:5"))
-    for reply in ("Напоминание поставила на 5 минут.",
-                  "Через 5 минут напомню проверить холодильник.",
-                  "Готово, 5."):
-        assert reply_grounds_result(reply, acts) is False, \
-            f"постороннее число зачлось как отчёт об очистке: {reply!r}"
+    outcomes = collect_bulk_outcomes(_messages("ok:cleared:0"))
+    assert [o.kind for o in outcomes] == ["empty"]
+    reply = bulk_outcome_reply(outcomes)
+    assert "пуст" in reply.lower(), f"пустой список должен читаться как «уже пуст»: {reply!r}"
+    assert "убрала" not in reply.lower(), "ложный успех: нечего было убирать"
 
 
-def test_anchor_without_count_is_not_grounding_409() -> None:
-    """Обратная сторона: якорь без числа тоже не заземление (иначе «а что в покупках?» сойдёт
-    за отчёт). Нужны ОБА признака."""
-    from sreda.runtime.react_result_report import collect_successful_writes, reply_grounds_result
+def test_error_outcome_gets_honest_deterministic_reply_409() -> None:
+    """Тот же класс: после `error:` нельзя отрапортовать успех."""
+    from sreda.runtime.react_result_report import bulk_outcome_reply, collect_bulk_outcomes
 
-    acts = collect_successful_writes(_messages("ok:cleared:5"))
-    assert reply_grounds_result("Убрала всё из списка покупок.", acts) is False
+    outcomes = collect_bulk_outcomes(_messages("error: internal", result_kind="error"))
+    assert [o.kind for o in outcomes] == ["error"]
+    reply = bulk_outcome_reply(outcomes).lower()
+    assert "не получилось" in reply
+    assert "убрала" not in reply, "ложный успех после ошибки"
+
+
+def test_declined_confirm_is_not_an_outcome_409() -> None:
+    """Отказ от подтверждения («Хорошо, не трогаю.») НЕ должен читаться как исход — иначе юзер
+    получил бы «не получилось очистить» там, где он сам отказался."""
+    from sreda.runtime.react_result_report import collect_bulk_outcomes, collect_successful_writes
+
+    msgs = _messages("Хорошо, не трогаю.")
+    assert collect_bulk_outcomes(msgs) == ()
+    assert collect_successful_writes(msgs) == ()
+
+
+def test_successful_clear_is_not_double_reported_409() -> None:
+    """N>0 покрыт успешным актом (fallback_reply) — в non-success исходы он попадать НЕ должен,
+    иначе ход отчитается дважды."""
+    from sreda.runtime.react_result_report import collect_bulk_outcomes
+
+    assert collect_bulk_outcomes(_messages("ok:cleared:5")) == ()
+
+
+def test_bare_tool_name_scrubbed_from_live_reply_409() -> None:
+    """R1/R2 MINOR (sol+terra, оба: «на ЖИВОМ ReAct-пути голое имя не ловится»): `_postformat`
+    не использует ни `_TOOL_NAMES_SET` (легаси), ни `_KNOWN_TOOL_NAMES` (снимает лишь `name(...)`).
+    Жёсткое правило проекта: пользователь не видит никаких технических данных."""
+    from sreda.runtime.react_loop import _postformat
+
+    for raw in ("clear_shopping_list убрала весь список покупок - 5 позиций",
+                "Вызвала clear_shopping_list(), готово",
+                "remove_shopping_items убрала молоко"):
+        out = _postformat(raw)
+        assert "clear_shopping_list" not in out and "remove_shopping_items" not in out, \
+            f"имя инструмента утекло пользователю: {out!r}"
+
+
+def test_not_exposed_to_legacy_path_without_confirm_409(db_session) -> None:
+    """R1 (Codex sol+terra CRITICAL, независимо оба) + R2 sol MINOR («проверяй ПОВЕДЕНЧЕСКИ, не
+    поиском строки в исходнике»): у ЛЕГАСИ-пути нет механизма подтверждения — `_invoke_one_tool`
+    зовёт `tool.invoke()` напрямую. ReAct-only деструктив там = массовая мутация БЕЗ «да» при
+    откате флага / тенанте вне react_loop_enabled_tenants. Проверяем на РЕАЛЬНОМ наборе."""
+    from sreda.runtime.handlers import (
+        _LEGACY_REACT_ONLY_GRANDFATHERED,
+        filter_tools_for_legacy_path,
+    )
+    from sreda.services.tool_schemas.families import REACT_ONLY_TOOLS
+
+    u, _ = _seed(db_session, [])
+    from sreda.services.embeddings import get_embeddings_client
+    from sreda.services.housewife_chat_tools import build_housewife_tools
+
+    built = build_housewife_tools(
+        session=db_session, tenant_id=u.tenant_id, user_id=u.user_id,
+        pending_buttons_state={}, menu_display_state={},
+        embedding_client=get_embeddings_client())
+    assert "clear_shopping_list" in {t.name for t in built}, "фабрика инструмент не отдала"
+
+    visible = {t.name for t in filter_tools_for_legacy_path(built)}
+    assert "clear_shopping_list" not in visible, \
+        "деструктив виден легаси-пути, где НЕТ подтверждения → мутация без «да»"
+    assert "get_checklist" not in visible, "#213: get_checklist не должен вернуться на легаси"
+    # grandfather сохранён байт-в-байт (поведение чужих фич не менялось)
+    for name in _LEGACY_REACT_ONLY_GRANDFATHERED & {t.name for t in built}:
+        assert name in visible, f"{name} экспонировался легаси до #409 — поведение менять не должны"
+    # гейт по РЕЕСТРУ: любой НЕ-grandfathered ReAct-only инструмент исключён
+    for name in (REACT_ONLY_TOOLS - _LEGACY_REACT_ONLY_GRANDFATHERED):
+        assert name not in visible, f"{name}: ReAct-only просочился на легаси-путь"
 
 
 def test_tool_name_in_leak_guards_409() -> None:
-    """R1 (sol MINOR) + жёсткое правило проекта «никаких технических данных пользователю»:
-    имя инструмента обязано вычищаться из текста ответа, если модель его выплюнет."""
+    """R1 (sol MINOR): имя инструмента в реестрах скрабберов легаси-пути и llm-слоя."""
     from sreda.runtime.handlers import _TOOL_NAMES_SET
     from sreda.services.llm import _KNOWN_TOOL_NAMES
 
     assert "clear_shopping_list" in _TOOL_NAMES_SET
     assert "clear_shopping_list" in _KNOWN_TOOL_NAMES
-
-
-def test_not_exposed_to_legacy_path_without_confirm_409() -> None:
-    """R1 (Codex sol+terra CRITICAL, независимо оба): у ЛЕГАСИ-пути нет механизма подтверждения
-    (`_invoke_one_tool` зовёт tool.invoke напрямую, без _confirm_wrap/interrupt). ReAct-only
-    деструктив там = массовая мутация БЕЗ «да» при откате флага/новом тенанте. Гейт обязан быть
-    по РЕЕСТРУ REACT_ONLY_TOOLS, а не по одному имени — иначе следующий такой инструмент снова
-    просочится."""
-    import inspect
-
-    from sreda.runtime import handlers
-    from sreda.services.tool_schemas.families import REACT_ONLY_TOOLS
-
-    src = inspect.getsource(handlers)
-    assert "REACT_ONLY_TOOLS - _legacy_grandfathered" in src, \
-        "легаси-фильтр не гейтится реестром ReAct-only — новый деструктив просочится"
-    # grandfather фиксирован явно и НЕ содержит нового инструмента
-    grandfathered = frozenset({"create_memory_category", "update_checklist_item", "update_recipe"})
-    assert "clear_shopping_list" in (REACT_ONLY_TOOLS - grandfathered), \
-        "clear_shopping_list обязан попадать в исключаемый набор легаси-пути"
 
 
 def test_grounding_note_carries_server_facts_409() -> None:

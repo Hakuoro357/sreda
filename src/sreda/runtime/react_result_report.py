@@ -144,16 +144,39 @@ _TARGET_SPECS: dict[str, tuple[str, str, str, str]] = {
 #   * count у target захардкожен в 1 — здесь количество и есть суть результата («убрала N позиций»);
 #   * заземлённость у target проверяется по ИМЕНИ цели, а у bulk имени нет — проверяем по числу
 #     (иначе `not act.target` всегда давал бы «не заземлено» → живой голос подменялся бы ВСЕГДА).
-# Пятое поле — ЯКОРЬ действия: слово, которое обязано прозвучать в реплике вдобавок к числу
-# (#409 R1, sol+terra MAJOR, независимо оба: одного числа МАЛО — «напомню через 5 минут» после
-# ok:cleared:5 проходило как «отчёт об очистке»). Якорь сверяется ТЕМ ЖЕ токен/stem-механизмом
-# (_name_mentioned), что и имена в add/target — не новый языковой детектор.
-_BULK_SPECS: dict[str, tuple[str, str, str, tuple[str, str, str], str]] = {
+# #409 R2 (sol+terra, независимо оба): для bulk-деструктива СВОБОДНЫЙ ТЕКСТ МОДЕЛИ НЕ СУДИМ
+# ВООБЩЕ. История: R1 — критерий «названо число» пропускал «напомню через 5 минут» (ложный
+# положительный); R2 — критерий «число + доменный якорь» пропускал «в списке покупок 5 позиций»
+# (доменный якорь ≠ признак ВЫПОЛНЕННОГО действия) и заодно резал корректное «убрала 5 позиций
+# из списка» (ложный отрицательный). Наращивать русские паттерны запрещено правилом проекта
+# («недетерминизм чинить промптом, не языковыми паттернами»). Потому: результат bulk-действия
+# всегда отдаём ДЕТЕРМИНИРОВАННОЙ квитанцией из СТРУКТУРНОГО исхода инструмента. Это и проще
+# (эвристика удалена, а не усложнена), и закрывает оба класса ошибок сразу.
+#
+# Поля: (глагол успеха, success-префикс с КОЛИЧЕСТВОМ после него, тип-фраза для промпта,
+#        единицы, текст «нечего было делать», текст «не получилось»).
+_BULK_SPECS: dict[str, tuple[str, str, str, tuple[str, str, str], str, str]] = {
     "clear_shopping_list": (
         "убрала весь список покупок", "ok:cleared:", "очищен список покупок",
-        ("позиция", "позиции", "позиций"), "покупки",
+        ("позиция", "позиции", "позиций"),
+        "список покупок и так был пуст",
+        "не получилось очистить список покупок",
     ),
 }
+
+
+@dataclass(frozen=True)
+class BulkOutcome:
+    """#409 R2: ТЕРМИНАЛЬНЫЙ исход bulk-инструмента текущего хода — включая те, что НЕ являются
+    успехом с эффектом. ``kind``: "cleared" (N>0) | "empty" (N=0, чистить было нечего) |
+    "error" (инструмент не отработал). Нужен именно отдельный сбор: ``collect_successful_writes``
+    по контракту #393 отдаёт ТОЛЬКО доказанные эффекты, и потому после ok:cleared:0 / error
+    страховка не включалась вовсе — модель могла безнаказанно отрапортовать «убрала всё»
+    (R1/R2 MAJOR M2, оба ревьюера отклонили довод «это вне scope»)."""
+
+    tool: str
+    kind: str
+    count: int
 
 
 def _okv2_created(content: str) -> tuple[str, ...]:
@@ -227,7 +250,7 @@ def collect_successful_writes(messages) -> tuple[WriteAct, ...]:
                 # #409: эффект ДОКАЗАН количеством из результата. N=0 («список уже был пуст») —
                 # no-op: НЕ заземляем, иначе страховка отрапортовала бы ложный успех («убрала
                 # весь список покупок») там, где ничего не убрано. Битый хвост → тоже не заземляем.
-                _verb, prefix, _type, _units_, _anchor = _BULK_SPECS[name]
+                _verb, prefix, _type, _units_, _empty, _err = _BULK_SPECS[name]
                 if not content.startswith(prefix):
                     continue
                 try:
@@ -297,17 +320,14 @@ def reply_grounds_result(reply: str, acts) -> bool:
                     act.target and _name_mentioned(reply_tokens, act.target)):
                 return False
         elif act.kind == "bulk":
-            # #409: у bulk-акта имени цели нет by design — верифицируем по КОЛИЧЕСТВУ + ЯКОРЮ
-            # действия. Одного числа мало (R1 sol+terra MAJOR): в смешанном ходе «напомню через
-            # 5 минут» после ok:cleared:5 проходило бы как отчёт об очистке. Требуем ОБА признака:
-            # число И слово-якорь («покупки») по тому же stem-матчу, что и имена в add/target.
-            # «Готово.» / «приняла к сведению» не несут ни того, ни другого → подмена страховкой
-            # (ровно класс #393). Голос, назвавший и то и другое, сохраняется (правило #121).
-            bulk = _BULK_SPECS.get(act.tool)
-            if str(act.count) not in reply_tokens:
-                return False
-            if bulk and not _name_mentioned(reply_tokens, bulk[4]):
-                return False
+            # #409 R2 (sol+terra): свободный текст модели для bulk-деструктива НЕ судим — любой
+            # текстовой критерий здесь давал либо ложный положительный, либо ложный отрицательный
+            # (см. комментарий у _BULK_SPECS). Всегда «не заземлено» → финализация ставит
+            # детерминированную квитанцию из структурного исхода. Осознанное сужение правила #121
+            # для ОДНОГО класса действий: подтверждение массового удаления важнее вариативности
+            # формулировки, и квитанция всё равно человеческая («убрала весь список покупок - 5
+            # позиций»), а не машинная.
+            return False
         elif not (act.target and _name_mentioned(reply_tokens, act.target)):
             return False
     return True
@@ -391,6 +411,68 @@ def _phrase(act: WriteAct) -> str:
     return f"{spec[0]} «{act.target}»" if act.target else spec[0]
 
 
+def collect_bulk_outcomes(messages) -> tuple[BulkOutcome, ...]:
+    """#409 R2: терминальные исходы bulk-инструментов текущего хода, КРОМЕ успеха с эффектом
+    (тот уже покрыт ``collect_successful_writes``/``fallback_reply``). Возвращает "empty" (N=0)
+    и "error" — ровно те случаи, где страховка #393 раньше вообще не включалась.
+
+    ОТКАЗ от подтверждения («Хорошо, не трогаю.») исходом НЕ считается: он не несёт ни
+    success-префикса, ни `error:` → распознаётся как «ничего не произошло» и обрабатывается
+    отдельной веткой `_declined_confirm`. Иначе отказ порождал бы ложное «не получилось»."""
+    msgs = list(messages or [])
+    start = 0
+    for i in range(len(msgs) - 1, -1, -1):
+        if isinstance(msgs[i], HumanMessage):
+            start = i + 1
+            break
+    window = msgs[start:]
+    results: dict = {}
+    for m in window:
+        if isinstance(m, ToolMessage):
+            results[getattr(m, "tool_call_id", None)] = m
+    out: list[BulkOutcome] = []
+    for m in window:
+        for tc in (getattr(m, "tool_calls", None) or []):
+            name = tc.get("name")
+            spec = _BULK_SPECS.get(name)
+            if spec is None:
+                continue
+            tm = results.get(tc.get("id"))
+            if tm is None:
+                continue
+            content = str(getattr(tm, "content", "") or "")
+            art = getattr(tm, "artifact", None) or {}
+            ok = isinstance(art, dict) and art.get("result_kind") == "ok"
+            prefix = spec[1]
+            if ok and content.startswith(prefix):
+                try:
+                    n = int(content[len(prefix):].strip())
+                except ValueError:
+                    continue
+                if n == 0:  # N>0 покрыт успешным актом — здесь только «делать было нечего»
+                    out.append(BulkOutcome(name, "empty", 0))
+            elif content.startswith("error:") or (
+                    isinstance(art, dict) and art.get("result_kind") == "error"):
+                out.append(BulkOutcome(name, "error", 0))
+            # прочее (в т.ч. «Хорошо, не трогаю.» после отказа) — не исход, не трогаем
+    return tuple(out)
+
+
+def bulk_outcome_reply(outcomes) -> str:
+    """Детерминированный ЧЕСТНЫЙ текст для non-success исходов bulk-действия. Пусто, если
+    исходов нет. Без техданных, без длинного тире (правила проекта)."""
+    parts: list[str] = []
+    for o in outcomes:
+        spec = _BULK_SPECS.get(o.tool)
+        if not spec:
+            continue
+        parts.append(spec[4] if o.kind == "empty" else spec[5])
+    if not parts:
+        return ""
+    body = "; ".join(parts)
+    return body[0].upper() + body[1:] + "."
+
+
 def fallback_reply(acts) -> str:
     """Часть 2: детерминированная заземлённая реплика-страховка (тёплый шаблон). Всегда называет
     результат — именами (из okv2-результата) либо, если неотображаемы, серверными фактами (кол-во+тип).
@@ -400,7 +482,10 @@ def fallback_reply(acts) -> str:
 
 
 __all__ = [
+    "BulkOutcome",
     "WriteAct",
+    "bulk_outcome_reply",
+    "collect_bulk_outcomes",
     "collect_successful_writes",
     "reply_grounds_result",
     "grounding_note",

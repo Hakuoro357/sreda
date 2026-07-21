@@ -1350,6 +1350,35 @@ def _dispatch_one_tool(
     return t_id, t_name, str(t_result)
 
 
+# #409 R1/R2: ReAct-only инструменты, которые исторически ВИДНЫ легаси-пути. Их экспозицию
+# намеренно НЕ меняем (вне scope #409) — снятие требует отдельного решения владельца. Список
+# ЯВНЫЙ, чтобы новые ReAct-only инструменты в него не попадали автоматически.
+_LEGACY_REACT_ONLY_GRANDFATHERED: frozenset[str] = frozenset({
+    "create_memory_category", "update_checklist_item", "update_recipe",
+})
+
+
+def filter_tools_for_legacy_path(tools: list) -> list:
+    """Убрать из набора легаси-пути ReAct-only инструменты (#213 Срез A, #409).
+
+    Зачем: у замороженного легаси-пути нет ни спека/парсера (канон #210 — эмиссия дала бы
+    ToolOutputContractViolation), ни МЕХАНИЗМА ПОДТВЕРЖДЕНИЯ — ``_invoke_one_tool`` зовёт
+    ``tool.invoke()`` напрямую, без ``_confirm_wrap``/``interrupt``. Для ДЕСТРУКТИВНОГО
+    инструмента это означало бы массовую мутацию без «да» пользователя.
+
+    #409 R1 (Codex sol+terra, CRITICAL, независимо оба): раньше гейт был захардкожен на ОДНО имя
+    (``get_checklist``) и потому пропустил новый ReAct-only деструктив. Теперь гейт по РЕЕСТРУ —
+    новый ReAct-only инструмент безопасен ПО УМОЛЧАНИЮ, а не «если автор вспомнил про фильтр».
+
+    Отдельная функция (а не инлайн-выражение) — по R2 sol MINOR: регрессию P0 надо фиксировать
+    ПОВЕДЕНЧЕСКИ, на реальном наборе инструментов, а не поиском строки в исходнике.
+    """
+    from sreda.services.tool_schemas.families import REACT_ONLY_TOOLS
+
+    excluded = REACT_ONLY_TOOLS - _LEGACY_REACT_ONLY_GRANDFATHERED
+    return [t for t in tools if getattr(t, "name", None) not in excluded]
+
+
 def _canonical_tool_call_key(tc: dict) -> tuple[str, str]:
     """R-32 (2026-05-15): canonical (name, args) key для dedup.
 
@@ -3104,13 +3133,7 @@ async def _chat_preflight(
     # легаси ДО #409. Их поведение здесь НЕ меняем (это вне scope #409) — снятие grandfather'а
     # требует отдельного решения владельца. Список фиксирован ЯВНО, чтобы новые ReAct-only
     # инструменты в него не попадали автоматически.
-    from sreda.services.tool_schemas.families import REACT_ONLY_TOOLS
-
-    _legacy_grandfathered = frozenset({
-        "create_memory_category", "update_checklist_item", "update_recipe",
-    })
-    _legacy_excluded = REACT_ONLY_TOOLS - _legacy_grandfathered
-    tools = [t for t in tools if t.name not in _legacy_excluded]
+    tools = filter_tools_for_legacy_path(tools)
     tools_by_name = {t.name: t for t in tools}
 
     # Issue #68 — snapshot OpenAI-style tool schemas для llm-trace replay.
