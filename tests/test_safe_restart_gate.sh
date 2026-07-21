@@ -205,6 +205,7 @@ else
         kk=$(printf '%s' "$SR_CRASH_DURING_SMOKE" | tr -c 'A-Za-z0-9' '_')
         echo "failed" > "$SR_TEST_STATE/state_$kk"
     fi
+    [ -n "${SR_SMOKE_SLEEP:-}" ] && sleep "$SR_SMOKE_SLEEP"
     echo "[smoke stub] PASS"
 fi
 exit 0
@@ -249,6 +250,8 @@ restarted() { grep -qx "$1" "$STATE/restarts" 2>/dev/null; }
 logged()    { grep -q "$1" "$LOGF" 2>/dev/null; }
 freeze()    { touch "$STATE/frozen_$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
 crash()     { touch "$STATE/crashafter_$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
+# enabled, но ОСТАНОВЛЕН: InvocationID пуст, состояние inactive (как на живом боксе)
+stopped()   { kk=$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_'); : > "$STATE/inv_$kk"; echo "inactive" > "$STATE/state_$kk"; }
 
 # Независимый оракул: КАЖДЫЙ внешний вызов обязан нести оба таймаут-флага.
 assert_all_curls_bounded() {
@@ -319,7 +322,10 @@ setup_ws
 crash sreda-job-runner.service
 run_script
 [ "$RC" -eq 7 ] && ok "exit 7" || bad "exit 7" "RC=$RC"
-logged "служба упала после старта" && ok "названа причина (упала после старта)" || bad "названа причина"
+logged "служба НЕ работает" && ok "названа причина (служба не работает)" || bad "названа причина (служба не работает)"
+# m-1: отказ обязан быть найден ГЕЙТОМ, до phase 6 — иначе запас обнаружения
+# держится на одной лог-строке перепроверки после смоука.
+! logged "phase 6" && ok "пойман ГЕЙТОМ, до смоука" || bad "пойман ГЕЙТОМ, до смоука" "дошло до phase 6"
 ! logged "DONE: safe_restart завершён успешно" && ok "DONE отсутствует" || bad "DONE отсутствует"
 teardown_ws
 
@@ -340,10 +346,23 @@ elif [ -f "$REPO_ROOT/tests/fixtures/safe_restart_prefix.sh" ]; then
 elif git -C "$REPO_ROOT" show "${SR_OLD_SHA:-74adbfbff62f88edfc53f31f340336a98af70ae6}:scripts/safe_restart.sh" > "$OLD" 2>/dev/null; then
     GOT_OLD=1
 fi
-# ЗАЩИТА ОТ ТАВТОЛОГИИ (R2 C2): базлайн раньше брался из origin/main — после
-# мержа это стал бы ИСПРАВЛЕННЫЙ скрипт, и тест «доказывал» бы инцидент на самом
-# фиксе. Поэтому базлайн пиним на SHA дофиксового коммита и убеждаемся, что в нём
-# нет InvocationID.
+# ЗАЩИТА ОТ ТАВТОЛОГИИ (R2 C2 / R3 m-2): базлайн раньше брался из origin/main —
+# после мержа это стал бы ИСПРАВЛЕННЫЙ скрипт, и тест «доказывал» бы инцидент на
+# самом фиксе. Поэтому базлайн пиним на SHA дофиксового коммита и проверяем его
+# содержимое ДВУМЯ независимыми способами: точный sha256 и отсутствие
+# InvocationID (второе — читаемая подсказка, если первое разъедется).
+# Этот же sha256 снят с ЖИВОГО /opt/sreda/scripts/safe_restart.sh на проде
+# 2026-07-21 — то есть фикстура байт-в-байт равна версии, вызвавшей инцидент.
+EXPECTED_OLD_SHA256=8921f5108f493dd1aa9d65535fc78057f23aee3eecf99b844f373598a4cd5082
+if [ "$GOT_OLD" -eq 1 ]; then
+    got_sha=$(sha256sum "$OLD" | cut -d" " -f1)
+    if [ "$got_sha" != "$EXPECTED_OLD_SHA256" ]; then
+        bad "базлайн T5 совпадает по sha256" "ожидали ${EXPECTED_OLD_SHA256:0:16}…, получили ${got_sha:0:16}…"
+        GOT_OLD=0
+    else
+        ok "базлайн T5 совпадает по sha256 с дофиксовой версией (она же стояла на проде)"
+    fi
+fi
 if [ "$GOT_OLD" -eq 1 ] && grep -q "InvocationID" "$OLD"; then
     bad "базлайн T5 действительно дофиксовый" "в базлайне есть InvocationID — взят ФИКС, тест стал бы тавтологией"
     GOT_OLD=0
@@ -354,6 +373,15 @@ if [ "$GOT_OLD" -eq 1 ]; then
         -e "s#^LOG=/var/log/sreda/safe_restart.log#LOG=$LOGF#" \
         -e "s#/opt/sreda/.venv/bin/python#$WS/venv/bin/python#g" \
         "$OLD"
+    # m-3: фикстура — рабочая копия ДОФИКСОВОГО деплой-скрипта. Без предохранителя
+    # случайный `bash` по ней на боксе сделал бы НАСТОЯЩИЙ рестарт служб.
+    sed -i "1a # ФИКСТУРА ТЕСТА #408 — НЕ ЗАПУСКАТЬ ВРУЧНУЮ (дофиксовый safe_restart)\n[ -n \"\${SR_FIXTURE_OK:-}\" ] || { echo \"это тестовая фикстура; запуск вне теста запрещён\" >&2; exit 1; }" "$OLD"
+    # предохранитель обязан работать: без флага фикстура не должна стартовать
+    if bash "$OLD" >/dev/null 2>&1; then
+        bad "предохранитель фикстуры" "фикстура запустилась БЕЗ SR_FIXTURE_OK"
+    else
+        ok "предохранитель фикстуры: без SR_FIXTURE_OK не запускается"
+    fi
     cat > "$BIN/curl" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in *127.0.0.1*) printf '404'; exit 0;; esac
@@ -361,7 +389,7 @@ echo "$*" >> "$SR_TEST_STATE/curl_argv"
 sleep 300
 STUB
     chmod +x "$BIN/curl"
-    setsid env PATH="$BIN:$PATH" SR_TEST_STATE="$STATE" bash "$OLD" >"$WS/o" 2>&1 &
+    setsid env PATH="$BIN:$PATH" SR_TEST_STATE="$STATE" SR_FIXTURE_OK=1 bash "$OLD" >"$WS/o" 2>&1 &
     BGPID=$!
     sleep 6
     hup_group
@@ -445,7 +473,7 @@ setup_ws
 touch "$STATE/noinv_sreda_job_runner_service"
 run_script
 [ "$RC" -eq 8 ] && ok "пустой снимок ДО → exit 8" || bad "пустой снимок ДО → exit 8" "RC=$RC"
-logged "смену подтвердить НЕЧЕМ" && ok "названо как непроверяемое (пустой снимок ДО)" || bad "названо как непроверяемое (пустой снимок ДО)"
+logged "InvocationID пуст" && ok "названо как непроверяемое (ID не читается)" || bad "названо как непроверяемое (ID не читается)"
 logged "Откатывать вслепую ОПАСНО" && ok "явно предупреждает против отката" || bad "явно предупреждает против отката"
 ! logged "DONE: safe_restart завершён успешно" && ok "DONE отсутствует" || bad "DONE отсутствует"
 teardown_ws
@@ -475,8 +503,8 @@ echo "T13: обрыв ПОСЛЕ гейта → «деплой доехал» (�
 setup_ws
 run_script "$TARGET" env SR_TEE_FAIL_ON_DONE=1
 [ "$RC" -eq 9 ] && ok "exit 9 (доехал, хвост не доиграл)" || bad "exit 9" "RC=$RC"
-logged "ДЕПЛОЙ ДОЕХАЛ" && ok "сказано, что деплой доехал" || bad "сказано, что деплой доехал"
-logged "ОТКАТ НЕ НУЖЕН" && ok "явно сказано, что откат не нужен" || bad "явно сказано, что откат не нужен"
+logged "Активация нового кода ДОКАЗАНА" && ok "сказано, что активация доказана" || bad "сказано, что активация доказана"
+logged "откат по причине" && ok "явно сказано, что откат не нужен" || bad "явно сказано, что откат не нужен"
 ! logged "ДЕПЛОЙ НЕ ЗАСЧИТАН" && ok "НЕ рапортует «не засчитан»" || bad "НЕ рапортует «не засчитан»"
 teardown_ws
 
@@ -521,6 +549,78 @@ echo "T17: оба обращения к Telegram провалились → гр
 setup_ws
 run_script "$TARGET" env SR_TG_MODE=fail
 logged "ОБА обращения к Telegram провалились" && ok "предупреждение про оба сбоя" || bad "предупреждение про оба сбоя"
+teardown_ws
+
+# ---------------------------------------------------------------- T18
+# R3 C-2 (CRITICAL): у enabled-но-ОСТАНОВЛЕННОГО юнита InvocationID ПУСТ
+# (проверено на проде). Связка «был неактивен → стал active с новым ID» —
+# ПОЛОЖИТЕЛЬНОЕ доказательство активации. Прошлая версия отдавала здесь exit 8,
+# из-за чего вызывающий откатывал УДАВШИЙСЯ деплой.
+echo "T18: поллер был остановлен (enable без --now) → успешный деплой, НЕ откат"
+setup_ws
+stopped sreda-telegram-poller@sreda.service
+run_script
+[ "$RC" -eq 0 ] && ok "exit 0 (деплой засчитан)" || bad "exit 0" "RC=$RC — здоровый деплой выдан за провал; $(tail -4 "$LOGF")"
+logged "активация ДОКАЗАНА" && ok "названо доказанной активацией" || bad "названо доказанной активацией"
+logged "DONE: safe_restart завершён успешно" && ok "есть DONE" || bad "есть DONE"
+restarted "sreda-telegram-poller@sreda.service" && ok "поллер поднят" || bad "поллер поднят"
+teardown_ws
+
+echo "T18b: то же для uvicorn и job-runner"
+for victim in sreda-uvicorn.service sreda-job-runner.service; do
+    setup_ws
+    stopped "$victim"
+    run_script
+    [ "$RC" -eq 0 ] && ok "${victim}: exit 0" || bad "${victim}: exit 0" "RC=$RC"
+    teardown_ws
+done
+
+# ---------------------------------------------------------------- T19
+# R3 M-1: бюджет смоука ОБЩИЙ на прогон, а не на каждого бота. Два бота,
+# лимит 3с, смоук спит 5с → второй бот обязан быть пропущен по бюджету,
+# а не получить свои полные 3с.
+echo "T19: бюджет смоука общий на прогон, а не на каждого бота"
+setup_ws
+t0=$SECONDS
+PATH="$BIN:$PATH" SR_TEST_STATE="$STATE" \
+  SAFE_RESTART_ENV_FILE="$ENVF" SAFE_RESTART_LOG="$LOGF" \
+  SAFE_RESTART_VENV_PYTHON="$WS/venv/bin/python" \
+  SAFE_RESTART_TG_CONNECT_TIMEOUT=1 SAFE_RESTART_TG_MAX_TIME=1 \
+  SAFE_RESTART_SMOKE_TIMEOUT=3 SR_SMOKE_SLEEP=5 \
+  bash "$TARGET" >"$WS/stdout" 2>"$WS/stderr"
+RC=$?
+elapsed=$((SECONDS - t0))
+[ "$RC" -eq 0 ] && ok "exit 0" || bad "exit 0" "RC=$RC"
+# Точный оракул «бюджет ОБЩИЙ»: второй бот обязан получить ОСТАТОК, а не свежий
+# полный лимит. Либо он вовсе пропущен (бюджет исчерпан) — тоже верно.
+first_left=$(grep -o 'осталось [0-9]*s общего бюджета' "$LOGF" | sed -n 1p | grep -o '[0-9]*')
+second_left=$(grep -o 'осталось [0-9]*s общего бюджета' "$LOGF" | sed -n 2p | grep -o '[0-9]*')
+if logged "исчерпан — ПРОПУСКАЕМ"; then
+    ok "второй бот пропущен: общий бюджет исчерпан первым"
+elif [ -n "$second_left" ] && [ -n "$first_left" ] && [ "$second_left" -lt "$first_left" ]; then
+    ok "бюджет ОБЩИЙ: второму боту достался остаток ${second_left}s из ${first_left}s"
+else
+    bad "бюджет общий, а не на каждого бота" "первому ${first_left:-?}s, второму ${second_left:-?}s — похоже на лимит на каждого"
+fi
+[ "$elapsed" -lt 20 ] && ok "прогон ограничен по времени (${elapsed}s)" \
+    || bad "прогон ограничен по времени" "занял ${elapsed}s"
+teardown_ws
+
+# ---------------------------------------------------------------- T20
+# R3 M-2: код 9 не должен обещать «новый код работает», если живучесть не
+# подтверждена (обрыв до финальной перепроверки).
+echo "T20: код 9 честен про живучесть"
+setup_ws
+run_script_bg "$TARGET" SR_TG_MODE=hang
+sleep 6
+hup_group
+reap_group
+teardown_ws
+setup_ws
+run_script "$TARGET" env SR_TEE_FAIL_ON_DONE=1
+[ "$RC" -eq 9 ] && ok "exit 9 после пройденной перепроверки" || bad "exit 9" "RC=$RC"
+logged "Живучесть служб подтверждена" && ok "живучесть названа подтверждённой (перепроверка прошла)" \
+    || bad "живучесть названа подтверждённой"
 teardown_ws
 
 echo

@@ -62,7 +62,8 @@ set -euo pipefail
 # конфигурируемое поведение, а не гарантия.
 if [ "$(id -u)" -eq 0 ]; then
     for _v in SAFE_RESTART_ENV_FILE SAFE_RESTART_LOG SAFE_RESTART_VENV_PYTHON \
-              SAFE_RESTART_TG_CONNECT_TIMEOUT SAFE_RESTART_TG_MAX_TIME; do
+              SAFE_RESTART_TG_CONNECT_TIMEOUT SAFE_RESTART_TG_MAX_TIME \
+              SAFE_RESTART_SMOKE_TIMEOUT; do
         if [ -n "${!_v:-}" ]; then
             echo "FATAL: ${_v} задан под root — override'ы разрешены только вне root (тесты)." >&2
             exit 1
@@ -112,14 +113,17 @@ for _t in TG_CONNECT_TIMEOUT TG_MAX_TIME; do
 done
 unset _t
 
-# Общий лимит онбординг-смоука (R2 B4). Не override-ится: смоук — хвост прогона,
-# а не настраиваемый параметр деплоя.
-SMOKE_TIMEOUT=180
+# ОБЩИЙ лимит онбординг-смоука НА ВЕСЬ ПРОГОН (R2 B4 / R3 M-1). Именно общий:
+# лимит «на бота» при двух ботах давал бы 2xN и не защищал от того, ради чего
+# заведён — бюджета деплой-сессии (в инциденте её убило на ~140с). Не
+# override-ится: это хвост прогона, а не настраиваемый параметр деплоя.
+SMOKE_TIMEOUT="${SAFE_RESTART_SMOKE_TIMEOUT:-90}"
 
 GATE_START_HUMAN=$(ts)
 SAFE_RESTART_COMPLETED=0
 FAILURE_ALERTED=0
-GATE_PASSED=0
+GATE_PASSED=0      # активация доказана
+LIVENESS_OK=0      # службы ещё и ЖИВЫ на момент финальной перепроверки
 
 # Алерт админу через СУЩЕСТВУЮЩИЙ дуал-канал (#395: Telegram основной + MAX дубль).
 # Best-effort: сам никогда не роняет скрипт (мы уже на аварийном пути) и ограничен
@@ -176,17 +180,33 @@ on_exit() {
     # (смоук — он и так «отчёт, не гейт»). Рапортовать это как «не засчитан»
     # значило бы спровоцировать откат УЖЕ ДОЕХАВШЕГО кода.
     if [ "${GATE_PASSED:-0}" = "1" ]; then
-        log "ВНИМАНИЕ: прогон оборван ПОСЛЕ гейта (код ${rc}) — но ДЕПЛОЙ ДОЕХАЛ."
-        log "        Активация всех служб доказана гейтом; не доиграл хвост (смоук)."
-        log "        ОТКАТ НЕ НУЖЕН. Код возврата 9."
-        alert_admin "🟡 P2 Среда: деплой доехал, но прогон не доиграл
+        # R3 M-2: гейт доказывает АКТИВАЦИЮ, а не ЖИВУЧЕСТЬ. Живучесть
+        # подтверждает финальная перепроверка (LIVENESS_OK). Если её не было —
+        # честно говорим, что служба могла умереть уже на смоуке, и НЕ обещаем
+        # «новый код работает».
+        log "ВНИМАНИЕ: прогон оборван ПОСЛЕ гейта (код ${rc})."
+        log "        Активация нового кода ДОКАЗАНА → откат по причине «не доехало» НЕ нужен."
+        if [ "${LIVENESS_OK:-0}" = "1" ]; then
+            log "        Живучесть служб подтверждена. Не доиграл только финальный хвост."
+            _live="Живучесть служб подтверждена финальной перепроверкой."
+            _sev="P2"
+        else
+            log "        ⚠ Живучесть НЕ подтверждена: обрыв до финальной перепроверки —"
+            log "          служба могла упасть уже на смоуке. ПРОВЕРЬ: systemctl status <юнит>."
+            _live="⚠ Живучесть НЕ подтверждена — обрыв до финальной перепроверки. Служба могла упасть на смоуке."
+            _sev="P1"
+        fi
+        log "        Код возврата 9."
+        alert_admin "${_sev} Среда: деплой доехал, прогон не доиграл
 
 Прогон стартовал: ${GATE_START_HUMAN}
 Хост: $(hostname)
 
-Гейт активации ПРОЙДЕН — новый код работает, откат НЕ нужен.
-Прогон оборвался позже (код ${rc}), на смоуке/хвосте: результаты смоука
-могли не записаться. Лог: ${LOG}"
+Гейт активации ПРОЙДЕН — новый код активирован, откат по причине «не доехало» НЕ нужен.
+${_live}
+Прогон оборвался позже (код ${rc}).
+Проверь: systemctl status sreda-uvicorn sreda-job-runner sreda-telegram-poller@sreda
+Лог: ${LOG}"
         exit 9
     fi
 
@@ -289,9 +309,11 @@ done
 # Снимок InvocationID ДО любых рестартов — база сравнения для гейта.
 for unit in $GATE_UNITS; do
     _iv=$(systemctl show -p InvocationID --value "$unit" 2>/dev/null || echo "")
+    _st=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || echo "")
     eval "$(unit_var "$unit")_PRE=\$_iv"
+    eval "$(unit_var "$unit")_PRESTATE=\$_st"
 done
-unset _iv
+unset _iv _st
 log "гейт #408: под контролем юниты — ${GATE_UNITS}"
 
 # ============ Phase 1: restart uvicorn + job-runner ============
@@ -572,25 +594,44 @@ for unit in $GATE_UNITS; do
     state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || echo "")
     human=$(systemctl show -p ActiveEnterTimestamp --value "$unit" 2>/dev/null || echo "?")
 
-    # R2 A1: пустой снимок ДО — сравнивать НЕ С ЧЕМ. Раньше это молча проходило
-    # (сравнение `post != pre` при пустом pre всегда истинно) → fail-OPEN.
-    if [ -z "$pre" ]; then
-        log "  ? ${unit}: снимок InvocationID ДО рестарта пуст — смену подтвердить НЕЧЕМ"
+    eval "prestate=\${$(unit_var "$unit")_PRESTATE:-}"
+
+    # Порядок ветвей важен: сначала СОСТОЯНИЕ (факт про «сейчас»), затем
+    # идентичность активации.
+    if [ -z "$state" ]; then
+        log "  ? ${unit}: systemd не ответил про ActiveState — ПРОВЕРИТЬ НЕ СМОГЛИ"
         gate_unverified="$gate_unverified $unit"
         continue
     fi
-    if [ -z "$post" ] || [ -z "$state" ]; then
-        log "  ? ${unit}: systemd не ответил (InvocationID/ActiveState пусты) — ПРОВЕРИТЬ НЕ СМОГЛИ"
+    if [ "$state" != "active" ]; then
+        log "  ✗ ${unit}: состояние '${state}' — служба НЕ работает"
+        gate_stale="$gate_stale $unit"
+        continue
+    fi
+    if [ -z "$post" ]; then
+        log "  ? ${unit}: active, но InvocationID пуст — аномалия, ПРОВЕРИТЬ НЕ СМОГЛИ"
         gate_unverified="$gate_unverified $unit"
+        continue
+    fi
+    # R3 C-2: пустой снимок ДО — это НЕ «непроверяемое». У enabled-но-остановленного
+    # юнита InvocationID ПУСТ (проверено на проде: networkd-dispatcher, open-iscsi
+    # и др.). Связка «до — не работал, сейчас — active с непустым ID» есть
+    # ПОЛОЖИТЕЛЬНОЕ доказательство свежей активации, самое сильное из возможных.
+    # Прошлая версия отдавала здесь exit 8 и провоцировала откат УДАВШЕГОСЯ деплоя
+    # (сценарий: поллер `enable` без `--now` либо остановлен оператором).
+    # Оговорка: если ДО юнит числился active, а ID не считался — вот это аномалия
+    # опроса, её и помечаем непроверяемой.
+    if [ -z "$pre" ]; then
+        if [ "$prestate" = "active" ]; then
+            log "  ? ${unit}: до рестарта был active, но InvocationID не считался — ПРОВЕРИТЬ НЕ СМОГЛИ"
+            gate_unverified="$gate_unverified $unit"
+        else
+            log "  ✓ ${unit}: был неактивен (${prestate:-неизвестно}) → сейчас active — активация ДОКАЗАНА (${human})"
+        fi
         continue
     fi
     if [ "$post" = "$pre" ]; then
         log "  ✗ ${unit}: InvocationID НЕ изменился — РЕСТАРТА НЕ БЫЛО, работает СТАРЫЙ процесс (запущен ${human})"
-        gate_stale="$gate_stale $unit"
-        continue
-    fi
-    if [ "$state" != "active" ]; then
-        log "  ✗ ${unit}: активация была, но состояние сейчас '${state}' — служба упала после старта"
         gate_stale="$gate_stale $unit"
         continue
     fi
@@ -646,18 +687,27 @@ log "  ✓ гейт пройден: все службы (${GATE_UNITS}) пере
 # тенант и не трогает реальные данные (ownership-пруф, см. шапку onboard_smoke.py).
 SMOKE="$(cd "$(dirname "$0")" && pwd)/onboard_smoke.py"
 if [ -f "$SMOKE" ]; then
+    smoke_deadline=$((SECONDS + SMOKE_TIMEOUT))
     for bot_key in $BOT_KEYS; do
-        log "phase 6 [${bot_key}]: онбординг-smoke"
+        smoke_left=$((smoke_deadline - SECONDS))
+        if [ "$smoke_left" -le 0 ]; then
+            log "phase 6 [${bot_key}]: общий бюджет смоука (${SMOKE_TIMEOUT}s) исчерпан — ПРОПУСКАЕМ"
+            log "  (деплой уже доказан гейтом; смоук — отчёт, не гейт)"
+            continue
+        fi
+        log "phase 6 [${bot_key}]: онбординг-smoke (осталось ${smoke_left}s общего бюджета)"
         smoke_rc=0
         # R2 B4: общий wall-clock лимит. Внутри onboard_smoke.py лимиты только
         # пооперационные — суммарно смоук мог перевалить за бюджет деплой-сессии
         # (в инциденте её убило на ~140с), и обрыв случился бы уже ПОСЛЕ гейта.
-        timeout "$SMOKE_TIMEOUT" sudo -u sreda "$VENV_PYTHON" "$SMOKE" --bot-key "$bot_key" 2>&1 | tee -a "$LOG" || smoke_rc=$?
+        timeout "$smoke_left" sudo -u sreda "$VENV_PYTHON" "$SMOKE" --bot-key "$bot_key" 2>&1 | tee -a "$LOG" || smoke_rc=$?
         case "$smoke_rc" in
             0) log "  ✓ [${bot_key}] онбординг-smoke PASS" ;;
             1) log "  ✗ [${bot_key}] онбординг-smoke FAIL — онбординг СЛОМАН, разберись прежде чем считать деплой успешным" ;;
             2) log "  ⚠ [${bot_key}] онбординг-smoke ABORT/остаток — нужно ручное внимание (см. вывод выше)" ;;
-            124) log "  ⚠ [${bot_key}] онбординг-smoke не уложился в ${SMOKE_TIMEOUT}s — прерван (деплой уже доказан гейтом)" ;;
+            124) log "  ⚠ [${bot_key}] онбординг-smoke прерван по общему бюджету (${SMOKE_TIMEOUT}s)."
+                 log "      Деплой доказан гейтом, НО смоук убит сигналом без раскрутки —"
+                 log "      мог остаться синтетический тест-тенант. Проверь и вычисти вручную." ;;
             *) log "  ⚠ [${bot_key}] онбординг-smoke неожиданный код ${smoke_rc}" ;;
         esac
     done
@@ -689,6 +739,7 @@ ${unit} прошёл гейт активации, но к концу прого�
         exit 7
     fi
 done
+LIVENESS_OK=1
 
 # #408: единственная точка, где прогон признаётся успешным. Всё, что не дошло
 # сюда, ловит trap on_exit → ненулевой код + алерт админу.
