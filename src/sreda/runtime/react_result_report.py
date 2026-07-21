@@ -165,18 +165,15 @@ _BULK_SPECS: dict[str, tuple[str, str, str, tuple[str, str, str], str, str]] = {
 }
 
 
-@dataclass(frozen=True)
-class BulkOutcome:
-    """#409 R2: ТЕРМИНАЛЬНЫЙ исход bulk-инструмента текущего хода — включая те, что НЕ являются
-    успехом с эффектом. ``kind``: "cleared" (N>0) | "empty" (N=0, чистить было нечего) |
-    "error" (инструмент не отработал). Нужен именно отдельный сбор: ``collect_successful_writes``
-    по контракту #393 отдаёт ТОЛЬКО доказанные эффекты, и потому после ok:cleared:0 / error
-    страховка не включалась вовсе — модель могла безнаказанно отрапортовать «убрала всё»
-    (R1/R2 MAJOR M2, оба ревьюера отклонили довод «это вне scope»)."""
-
-    tool: str
-    kind: str
-    count: int
+# #409 R3: bulk-исход хода — ОДИН РЕДЬЮСЕР, а не два коллектора со склейкой строк.
+# История: R2 добавил второй коллектор + отдельную ветку финализации, и это породило сразу три
+# MAJOR (противоречивая квитанция при ретрае; затирание отчёта о НЕ-bulk записи; неисполнение
+# domain_blocked/unavailable мимо классификации). Причина у всех ОДНА — два независимых источника
+# истины. Потому исходы ВСЕХ вызовов bulk-инструмента за ход СХЛОПЫВАЮТСЯ в ОДНО терминальное
+# состояние и едут по ОБЩЕМУ пути WriteAct (вторая ветка финализации удалена).
+#
+# kind: "bulk" (очищено N>0) | "bulk_empty" (чистить было нечего) | "bulk_error" (не исполнено).
+_BULK_KINDS = ("bulk", "bulk_empty", "bulk_error")
 
 
 def _okv2_created(content: str) -> tuple[str, ...]:
@@ -202,6 +199,69 @@ def _target_name(field: str | None, args: dict) -> str:
         return ""
     val = args.get(field)
     return _clean_name(val) if isinstance(val, str) else ""
+
+
+def _reduce_bulk_acts(window, results: dict) -> tuple[WriteAct, ...]:
+    """#409 R3: ОДНО терминальное состояние на bulk-инструмент за весь ход.
+
+    ReAct допускает ПОВТОРНЫЕ вызовы (ретрай после ошибки, второй заход). Без схлопывания ход
+    «error: → ретрай → ok:cleared:5» давал противоречивую квитанцию «убрала 5 позиций. Не
+    получилось очистить список покупок.» (воспроизведено адверсарным проходом, R3 MAJOR у обоих
+    ревьюеров). Правило схлопывания — ПО ДОКАЗАННОМУ ЭФФЕКТУ:
+
+      * был хоть один ``ok:cleared:N`` с N>0 → "bulk" с СУММОЙ реально убранного
+        (ретрай после ошибки отчитывается успехом — это и произошло; ложного успеха нет,
+        сумма — ровно то, что инструмент подтвердил);
+      * иначе был ``ok:cleared:0``          → "bulk_empty" («чистить было нечего»);
+      * иначе было неисполнение            → "bulk_error" («не получилось»);
+      * иначе (только отказ от подтверждения / нераспознанное) → акта нет.
+
+    НЕИСПОЛНЕНИЕ определяется FAIL-SAFE: любой ``result_kind`` != "ok" (error, domain_blocked,
+    unavailable, withdrawn и ЛЮБОЙ будущий) либо тело с префиксом ``error:``. Перечислять
+    конкретные виды нельзя — ровно на этом R2-версия и прокололась (``domain_blocked`` не
+    классифицировался → ложный отчёт «убрала весь список» доезжал до юзера).
+
+    ОТКАЗ от подтверждения («Хорошо, не трогаю.») исходом НЕ считается: у него свой
+    детерминированный путь ``_declined_reply``; иначе юзер получил бы «не получилось» на
+    собственное «нет».
+    """
+    cleared: dict[str, int] = {}
+    empty: set[str] = set()
+    failed: set[str] = set()
+    for m in window:
+        for tc in (getattr(m, "tool_calls", None) or []):
+            name = tc.get("name")
+            spec = _BULK_SPECS.get(name)
+            if spec is None:
+                continue
+            tm = results.get(tc.get("id"))
+            if tm is None:
+                continue
+            content = str(getattr(tm, "content", "") or "")
+            art = getattr(tm, "artifact", None) or {}
+            kind = art.get("result_kind") if isinstance(art, dict) else None
+            prefix = spec[1]
+            if kind == "ok" and content.startswith(prefix):
+                try:
+                    n = int(content[len(prefix):].strip())
+                except ValueError:
+                    continue
+                if n > 0:
+                    cleared[name] = cleared.get(name, 0) + n
+                else:
+                    empty.add(name)
+            elif content.startswith("error:") or (kind is not None and kind != "ok"):
+                failed.add(name)
+            # прочее (отказ confirm, нераспознанное тело при result_kind=ok) — не исход
+    out: list[WriteAct] = []
+    for name in _BULK_SPECS:
+        if name in cleared:
+            out.append(WriteAct(name, "bulk", "", (), cleared[name]))
+        elif name in empty:
+            out.append(WriteAct(name, "bulk_empty", "", (), 0))
+        elif name in failed:
+            out.append(WriteAct(name, "bulk_error", "", (), 0))
+    return tuple(out)
 
 
 def collect_successful_writes(messages) -> tuple[WriteAct, ...]:
@@ -246,22 +306,10 @@ def collect_successful_writes(messages) -> tuple[WriteAct, ...]:
                 if not content.startswith(prefix):  # нет эффекта (не тот исход)
                     continue
                 acts.append(WriteAct(name, "target", _target_name(field, args), (), 1))
-            elif name in _BULK_SPECS:
-                # #409: эффект ДОКАЗАН количеством из результата. N=0 («список уже был пуст») —
-                # no-op: НЕ заземляем, иначе страховка отрапортовала бы ложный успех («убрала
-                # весь список покупок») там, где ничего не убрано. Битый хвост → тоже не заземляем.
-                _verb, prefix, _type, _units_, _empty, _err = _BULK_SPECS[name]
-                if not content.startswith(prefix):
-                    continue
-                try:
-                    n = int(content[len(prefix):].strip())
-                except ValueError:
-                    continue
-                if n <= 0:
-                    continue
-                acts.append(WriteAct(name, "bulk", "", (), n))
             # прочие write-инструменты не заземляем (консервативно; голос как есть)
-    return tuple(acts)
+    # #409 R3: bulk-инструменты собираются ОТДЕЛЬНЫМ редьюсером (одно состояние на ход),
+    # затем едут по тому же пути WriteAct — единый источник истины для финализации.
+    return tuple(acts) + _reduce_bulk_acts(window, results)
 
 
 # ─────────────────────────── детектор заземлённости (объективный, по границам слов) ───────────────────────────
@@ -319,7 +367,7 @@ def reply_grounds_result(reply: str, acts) -> bool:
             if act.tool != "add_shopping_items" and not (
                     act.target and _name_mentioned(reply_tokens, act.target)):
                 return False
-        elif act.kind == "bulk":
+        elif act.kind in _BULK_KINDS:
             # #409 R2 (sol+terra): свободный текст модели для bulk-деструктива НЕ судим — любой
             # текстовой критерий здесь давал либо ложный положительный, либо ложный отрицательный
             # (см. комментарий у _BULK_SPECS). Всегда «не заземлено» → финализация ставит
@@ -362,10 +410,14 @@ def _fact(act: WriteAct) -> str:
     """СЕРВЕРНЫЙ факт результата для grounding_note (промпт): статус+количество+тип, БЕЗ имён."""
     if act.kind == "add":
         return f"добавлено {_units(act.count)} в {_ADD_WHERE.get(act.tool, 'список')}"
-    if act.kind == "bulk":
+    if act.kind in _BULK_KINDS:
         bulk = _BULK_SPECS.get(act.tool)
-        # количество — сама суть bulk-результата, потому входит в факт (а не только тип действия)
-        return f"{bulk[2]}: {_bulk_units(act)}" if bulk else "выполнено действие"
+        if not bulk:
+            return "выполнено действие"
+        if act.kind == "bulk":
+            # количество — сама суть bulk-результата, потому входит в факт (не только тип)
+            return f"{bulk[2]}: {_bulk_units(act)}"
+        return bulk[4] if act.kind == "bulk_empty" else bulk[5]
     spec = _TARGET_SPECS.get(act.tool)
     return spec[3] if spec else "выполнено действие"
 
@@ -400,77 +452,19 @@ def _phrase(act: WriteAct) -> str:
         if complete:  # имя списка неотображаемо, но все пункты — назовём пункты
             return f"добавила пункты: {items}"
         return f"добавила {_units(act.count)} в {_ADD_WHERE.get(act.tool, 'чек-лист')}"
-    if act.kind == "bulk":
+    if act.kind in _BULK_KINDS:
         # #409: «убрала весь список покупок - 5 позиций». Дефис, НЕ длинное тире (правило юзеру).
         bulk = _BULK_SPECS.get(act.tool)
-        return f"{bulk[0]} - {_bulk_units(act)}" if bulk else ""
+        if not bulk:
+            return ""
+        if act.kind == "bulk":
+            return f"{bulk[0]} - {_bulk_units(act)}"
+        return bulk[4] if act.kind == "bulk_empty" else bulk[5]
     spec = _TARGET_SPECS.get(act.tool)
     if not spec:
         return ""
     # name-less → активный тёплый глагол БЕЗ «имени» (spec[0]), не пассивный факт (spec[3] — тот для промпта)
     return f"{spec[0]} «{act.target}»" if act.target else spec[0]
-
-
-def collect_bulk_outcomes(messages) -> tuple[BulkOutcome, ...]:
-    """#409 R2: терминальные исходы bulk-инструментов текущего хода, КРОМЕ успеха с эффектом
-    (тот уже покрыт ``collect_successful_writes``/``fallback_reply``). Возвращает "empty" (N=0)
-    и "error" — ровно те случаи, где страховка #393 раньше вообще не включалась.
-
-    ОТКАЗ от подтверждения («Хорошо, не трогаю.») исходом НЕ считается: он не несёт ни
-    success-префикса, ни `error:` → распознаётся как «ничего не произошло» и обрабатывается
-    отдельной веткой `_declined_confirm`. Иначе отказ порождал бы ложное «не получилось»."""
-    msgs = list(messages or [])
-    start = 0
-    for i in range(len(msgs) - 1, -1, -1):
-        if isinstance(msgs[i], HumanMessage):
-            start = i + 1
-            break
-    window = msgs[start:]
-    results: dict = {}
-    for m in window:
-        if isinstance(m, ToolMessage):
-            results[getattr(m, "tool_call_id", None)] = m
-    out: list[BulkOutcome] = []
-    for m in window:
-        for tc in (getattr(m, "tool_calls", None) or []):
-            name = tc.get("name")
-            spec = _BULK_SPECS.get(name)
-            if spec is None:
-                continue
-            tm = results.get(tc.get("id"))
-            if tm is None:
-                continue
-            content = str(getattr(tm, "content", "") or "")
-            art = getattr(tm, "artifact", None) or {}
-            ok = isinstance(art, dict) and art.get("result_kind") == "ok"
-            prefix = spec[1]
-            if ok and content.startswith(prefix):
-                try:
-                    n = int(content[len(prefix):].strip())
-                except ValueError:
-                    continue
-                if n == 0:  # N>0 покрыт успешным актом — здесь только «делать было нечего»
-                    out.append(BulkOutcome(name, "empty", 0))
-            elif content.startswith("error:") or (
-                    isinstance(art, dict) and art.get("result_kind") == "error"):
-                out.append(BulkOutcome(name, "error", 0))
-            # прочее (в т.ч. «Хорошо, не трогаю.» после отказа) — не исход, не трогаем
-    return tuple(out)
-
-
-def bulk_outcome_reply(outcomes) -> str:
-    """Детерминированный ЧЕСТНЫЙ текст для non-success исходов bulk-действия. Пусто, если
-    исходов нет. Без техданных, без длинного тире (правила проекта)."""
-    parts: list[str] = []
-    for o in outcomes:
-        spec = _BULK_SPECS.get(o.tool)
-        if not spec:
-            continue
-        parts.append(spec[4] if o.kind == "empty" else spec[5])
-    if not parts:
-        return ""
-    body = "; ".join(parts)
-    return body[0].upper() + body[1:] + "."
 
 
 def fallback_reply(acts) -> str:
@@ -482,10 +476,7 @@ def fallback_reply(acts) -> str:
 
 
 __all__ = [
-    "BulkOutcome",
     "WriteAct",
-    "bulk_outcome_reply",
-    "collect_bulk_outcomes",
     "collect_successful_writes",
     "reply_grounds_result",
     "grounding_note",

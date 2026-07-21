@@ -356,12 +356,19 @@ def test_grounding_collects_successful_clear_409() -> None:
     assert acts[0].count == 5, "количество обязано браться из результата инструмента"
 
 
-def test_grounding_skips_empty_and_error_409() -> None:
-    """Без ложного успеха: N=0 (нечего было чистить) и error НЕ заземляются."""
-    from sreda.runtime.react_result_report import collect_successful_writes
+def test_no_false_success_on_empty_or_error_409() -> None:
+    """Без ложного успеха. ВАЖНО: в R1 контракт был «N=0/error просто не собираем» — ревьюеры
+    показали, что это НЕ защита, а слепота (страховка не включалась, и галлюцинация «убрала всё»
+    доезжала до юзера). Теперь исходы СОБИРАЮТСЯ, но как non-success: успехом не считаются
+    (kind != "bulk") и в тексте нет «убрала»."""
+    from sreda.runtime.react_result_report import collect_successful_writes, fallback_reply
 
-    assert collect_successful_writes(_messages("ok:cleared:0")) == ()
-    assert collect_successful_writes(_messages("error: internal", result_kind="error")) == ()
+    for raw, kind, expected in (("ok:cleared:0", "ok", "bulk_empty"),
+                                ("error: internal", "error", "bulk_error")):
+        acts = collect_successful_writes(_messages(raw, result_kind=kind))
+        assert [a.kind for a in acts] == [expected]
+        assert acts[0].count == 0, "нулевой эффект не должен нести количество"
+        assert "убрала" not in fallback_reply(acts).lower(), "ложный успех"
 
 
 def test_fallback_reply_names_the_result_409() -> None:
@@ -418,60 +425,112 @@ def test_bulk_reply_is_never_judged_by_free_text_409(reply) -> None:
         f"свободный текст зачтён как отчёт об очистке: {reply!r}"
 
 
-def test_empty_outcome_gets_honest_deterministic_reply_409() -> None:
-    """R1/R2 MAJOR M2 (sol+terra, оба ОТКЛОНИЛИ довод «вне scope»): при ok:cleared:0 набор
-    успешных актов ПУСТ → страховка #393 раньше не включалась вовсе, и «убрала весь список
-    покупок» после пустого списка уходило юзеру. Теперь исход честный и детерминированный."""
-    from sreda.runtime.react_result_report import bulk_outcome_reply, collect_bulk_outcomes
+def _msgs_multi(*outcomes):
+    """Ход с НЕСКОЛЬКИМИ вызовами инструментов: [(tool, content, result_kind), ...]."""
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-    outcomes = collect_bulk_outcomes(_messages("ok:cleared:0"))
-    assert [o.kind for o in outcomes] == ["empty"]
-    reply = bulk_outcome_reply(outcomes)
-    assert "пуст" in reply.lower(), f"пустой список должен читаться как «уже пуст»: {reply!r}"
-    assert "убрала" not in reply.lower(), "ложный успех: нечего было убирать"
+    msgs = [HumanMessage(content="очисти список покупок")]
+    for i, (tool, content, kind) in enumerate(outcomes):
+        cid = f"call_{i}"
+        msgs.append(AIMessage(content="", tool_calls=[{"name": tool, "args": {}, "id": cid}]))
+        msgs.append(ToolMessage(content=content, tool_call_id=cid, artifact={"result_kind": kind}))
+    return msgs
+
+
+def test_empty_outcome_gets_honest_deterministic_reply_409() -> None:
+    """MAJOR M2 (sol+terra R1/R2, оба ОТКЛОНИЛИ довод «вне scope»): при ok:cleared:0 набор актов
+    был ПУСТ → страховка #393 не включалась, и «убрала весь список покупок» после пустого списка
+    уходило юзеру. Теперь исход честный и детерминированный."""
+    from sreda.runtime.react_result_report import collect_successful_writes, fallback_reply
+
+    acts = collect_successful_writes(_messages("ok:cleared:0"))
+    assert [a.kind for a in acts] == ["bulk_empty"]
+    reply = fallback_reply(acts).lower()
+    assert "пуст" in reply and "убрала" not in reply, f"ложный успех: {reply!r}"
 
 
 def test_error_outcome_gets_honest_deterministic_reply_409() -> None:
-    """Тот же класс: после `error:` нельзя отрапортовать успех."""
-    from sreda.runtime.react_result_report import bulk_outcome_reply, collect_bulk_outcomes
+    from sreda.runtime.react_result_report import collect_successful_writes, fallback_reply
 
-    outcomes = collect_bulk_outcomes(_messages("error: internal", result_kind="error"))
-    assert [o.kind for o in outcomes] == ["error"]
-    reply = bulk_outcome_reply(outcomes).lower()
-    assert "не получилось" in reply
-    assert "убрала" not in reply, "ложный успех после ошибки"
+    acts = collect_successful_writes(_messages("error: internal", result_kind="error"))
+    assert [a.kind for a in acts] == ["bulk_error"]
+    reply = fallback_reply(acts).lower()
+    assert "не получилось" in reply and "убрала" not in reply
+
+
+@pytest.mark.parametrize("kind", ["domain_blocked", "unavailable", "withdrawn", "some_future_kind"])
+def test_non_execution_of_any_kind_is_reported_honestly_409(kind) -> None:
+    """R3 MAJOR (terra + адверсарный проход, воспроизведено): ветка ловила только `error:` и
+    result_kind=="error", а ToolMessage недоступности несёт domain_blocked/unavailable → оба
+    коллектора возвращали пусто, квитанции не было, свободный текст не судился → ложное «убрала
+    весь список» доезжало до юзера. Классификация теперь FAIL-SAFE: любой result_kind != "ok",
+    включая БУДУЩИЕ виды (перечислять конкретные — ровно та ошибка, на которой прокололись)."""
+    from sreda.runtime.react_result_report import collect_successful_writes, fallback_reply
+
+    acts = collect_successful_writes(_messages("Инструмент сейчас недоступен", result_kind=kind))
+    assert [a.kind for a in acts] == ["bulk_error"], f"{kind} не классифицирован как неисполнение"
+    assert "не получилось" in fallback_reply(acts).lower()
+
+
+def test_retry_after_error_reports_one_consistent_outcome_409() -> None:
+    """R3 MAJOR (sol+terra+адверсарный, воспроизведено): ReAct допускает ретрай. Ход
+    «error: → ретрай → ok:cleared:5» давал ПРОТИВОРЕЧИВУЮ квитанцию «убрала 5 позиций.
+    Не получилось очистить список покупок.» Редьюсер схлопывает в ОДНО состояние по
+    доказанному эффекту."""
+    from sreda.runtime.react_result_report import collect_successful_writes, fallback_reply
+
+    acts = collect_successful_writes(_msgs_multi(
+        ("clear_shopping_list", "error: internal", "error"),
+        ("clear_shopping_list", "ok:cleared:5", "ok")))
+    assert len(acts) == 1 and acts[0].kind == "bulk" and acts[0].count == 5
+    reply = fallback_reply(acts).lower()
+    assert "не получилось" not in reply, f"противоречивая квитанция: {reply!r}"
+
+
+def test_two_successful_clears_report_total_removed_409() -> None:
+    """Пробел, найденный МУТАЦИОННОЙ пробой (сумма → last-wins выживала): при двух успешных
+    очистках за ход квитанция обязана называть ВСЁ реально убранное, а не последнее число —
+    иначе юзеру сообщат меньше, чем удалено."""
+    from sreda.runtime.react_result_report import collect_successful_writes, fallback_reply
+
+    acts = collect_successful_writes(_msgs_multi(
+        ("clear_shopping_list", "ok:cleared:3", "ok"),
+        ("clear_shopping_list", "ok:cleared:2", "ok")))
+    assert len(acts) == 1 and acts[0].count == 5, \
+        f"ожидалась СУММА убранного (3+2), получено {[(a.kind, a.count) for a in acts]}"
+    assert "5" in fallback_reply(acts)
+
+
+def test_repeat_after_success_does_not_add_false_empty_409() -> None:
+    """Тот же класс: «ok:cleared:5 → повтор ok:cleared:0» не должен дописывать «и так был пуст»."""
+    from sreda.runtime.react_result_report import collect_successful_writes, fallback_reply
+
+    acts = collect_successful_writes(_msgs_multi(
+        ("clear_shopping_list", "ok:cleared:5", "ok"),
+        ("clear_shopping_list", "ok:cleared:0", "ok")))
+    assert len(acts) == 1 and acts[0].kind == "bulk" and acts[0].count == 5
+    assert "пуст" not in fallback_reply(acts).lower()
 
 
 def test_declined_confirm_is_not_an_outcome_409() -> None:
-    """Отказ от подтверждения («Хорошо, не трогаю.») НЕ должен читаться как исход — иначе юзер
-    получил бы «не получилось очистить» там, где он сам отказался."""
-    from sreda.runtime.react_result_report import collect_bulk_outcomes, collect_successful_writes
+    """Отказ от подтверждения («Хорошо, не трогаю.») НЕ исход — иначе юзер получил бы
+    «не получилось очистить» на собственное «нет»."""
+    from sreda.runtime.react_result_report import collect_successful_writes
 
-    msgs = _messages("Хорошо, не трогаю.")
-    assert collect_bulk_outcomes(msgs) == ()
-    assert collect_successful_writes(msgs) == ()
+    assert collect_successful_writes(_messages("Хорошо, не трогаю.")) == ()
 
 
-def test_successful_clear_is_not_double_reported_409() -> None:
-    """N>0 покрыт успешным актом (fallback_reply) — в non-success исходы он попадать НЕ должен,
-    иначе ход отчитается дважды."""
-    from sreda.runtime.react_result_report import collect_bulk_outcomes
-
-    assert collect_bulk_outcomes(_messages("ok:cleared:5")) == ()
-
-
-def test_bare_tool_name_scrubbed_from_live_reply_409() -> None:
-    """R1/R2 MINOR (sol+terra, оба: «на ЖИВОМ ReAct-пути голое имя не ловится»): `_postformat`
-    не использует ни `_TOOL_NAMES_SET` (легаси), ни `_KNOWN_TOOL_NAMES` (снимает лишь `name(...)`).
-    Жёсткое правило проекта: пользователь не видит никаких технических данных."""
+def test_confirm_text_is_not_damaged_by_scrubber_409() -> None:
+    """R3 MAJOR (sol + адверсарный проход, воспроизведено): глобальный вырезатель имён
+    инструментов из R2 портил ДОВЕРЕННЫЙ текст — «удалю рецепт «list_tasks»» превращалось в
+    «удалю рецепт «»», подтверждение удаления теряло имя цели; плюс порча URL. Вырезатель
+    откачен целиком (лечил MINOR ценой MAJOR в safety-диалоге)."""
     from sreda.runtime.react_loop import _postformat
 
-    for raw in ("clear_shopping_list убрала весь список покупок - 5 позиций",
-                "Вызвала clear_shopping_list(), готово",
-                "remove_shopping_items убрала молоко"):
-        out = _postformat(raw)
-        assert "clear_shopping_list" not in out and "remove_shopping_items" not in out, \
-            f"имя инструмента утекло пользователю: {out!r}"
+    out = _postformat("Я сейчас удалю рецепт «list_tasks». Нужно твоё подтверждение.")
+    assert "list_tasks" in out, "подтверждение удаления потеряло имя цели"
+    assert "https://github.com/user/repo/add_task" in _postformat(
+        "Ссылка: https://github.com/user/repo/add_task"), "URL повреждён вырезателем"
 
 
 def test_not_exposed_to_legacy_path_without_confirm_409(db_session) -> None:

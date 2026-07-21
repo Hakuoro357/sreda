@@ -4700,31 +4700,18 @@ def _redact_identity(text: str) -> str:
 # (универсально, любой путь ответа). + длинное тире → дефис (правило «без «—» в отправляемых никогда»).
 _OKV2_LEAK_RE = re.compile(r"\(?\s*okv2:[a-zа-яё_]*(?::\{[^}]*\})?[^\s)]*\s*\)?", re.IGNORECASE)
 
-# #409 R1/R2 (sol+terra MINOR, оба: «на ЖИВОМ ReAct-пути голое имя инструмента не ловится»).
-# `_KNOWN_TOOL_NAMES` (llm.py) снимает лишь синтаксис вызова `name(...)`, а `_TOOL_NAMES_SET`
-# (handlers.py) живёт на легаси-пути — `_postformat` не использует ни то, ни другое. Потому здесь
-# снимаем ГОЛОЕ имя инструмента как отдельный токен: жёсткое правило проекта — пользователь не
-# видит НИКАКИХ технических данных. Имена латиницей в snake_case, границы слова → ложных
-# срабатываний на русском контенте нет. Источник имён — общий реестр, не третий ручной список.
-_TOOL_NAME_LEAK_RE_CACHE: list = []  # ленивая сборка: families импортируется в этом модуле
-                                     # только внутри функций (во избежание цикла импортов)
-
-
-def _tool_name_leak_re():
-    if not _TOOL_NAME_LEAK_RE_CACHE:
-        from sreda.services.tool_schemas.families import TOOL_OP_CLASS
-        names = sorted((re.escape(n) for n in TOOL_OP_CLASS), key=len, reverse=True)
-        _TOOL_NAME_LEAK_RE_CACHE.append(re.compile(
-            r"(?<![0-9A-Za-z_])(?:" + "|".join(names) + r")(?![0-9A-Za-z_])"))
-    return _TOOL_NAME_LEAK_RE_CACHE[0]
-
-
+# #409 R3: глобальный вырезатель ГОЛЫХ имён инструментов ОТКАЧЕН (был добавлен в R2 под MINOR
+# «имя инструмента может утечь юзеру»). Причина отката — он вносил MAJOR-регресс, воспроизведённый
+# адверсарным проходом: `_postformat` применяется и к ДОВЕРЕННОМУ тексту подтверждения, поэтому
+# «удалю рецепт «list_tasks»» превращалось в «удалю рецепт «»» — деструктивный confirm терял имя
+# цели; плюс порча URL (`.../add_task` → `.../`), регистрозависимость (`CLEAR_SHOPPING_LIST` не
+# снимался) и техххвост (`remove_shopping_items(item_ids=[…])` → `(item_ids=[…])`). Лечение MINOR
+# ценой MAJOR в safety-диалоге — плохой размен, к тому же вырезатель влиял на ответы ВСЕХ
+# инструментов, далеко за scope #409. Узкое решение исходной утечки — отдельный issue.
 def _strip_tech_leak(text: str) -> str:
     t = _OKV2_LEAK_RE.sub("", text or "")
-    t = _tool_name_leak_re().sub("", t)   # #409: голое имя инструмента юзеру не показываем
     t = re.sub(r"[—–―]", "-", t)          # длинное/среднее тире → обычный дефис
-    t = re.sub(r"\(\s*\)", "", t)         # осиротевшие скобки после снятия имени вызова
-    return re.sub(r"[ \t]{2,}", " ", t).strip()
+    return re.sub(r"[ \t]{2,}", " ", t)
 
 
 def _postformat(text: str) -> str:
@@ -5736,15 +5723,12 @@ async def handle_turn(
         if _post_tool_report_enabled():
             try:
                 from sreda.runtime.react_result_report import (
-                    bulk_outcome_reply,
-                    collect_bulk_outcomes,
                     collect_successful_writes,
                     fallback_reply,
                     reply_grounds_result,
                     reply_has_tech_leak,
                 )
-                _msgs393 = result.get("messages") or []
-                _writes393 = collect_successful_writes(_msgs393)
+                _writes393 = collect_successful_writes(result.get("messages") or [])
                 if _writes393:
                     _fb393 = fallback_reply(_writes393)
                     if _fb393:
@@ -5757,21 +5741,10 @@ async def handle_turn(
                             # подмена ЧИСТОЙ страховкой, если реплика НЕ называет результат ИЛИ несёт
                             # машинную утечку (okv2/id=/ref=/«—» — Codex terra R3).
                             text = _fb393
-                # #409 R2 (Codex sol+terra MAJOR M2, оба отклонили довод «вне scope»): non-success
-                # ТЕРМИНАЛЬНЫЕ исходы bulk-деструктива. До этого при ok:cleared:0 / error набор
-                # _writes393 был ПУСТ (контракт #393 — только доказанный эффект) → страховка не
-                # включалась вовсе, и реплика «убрала весь список покупок» после пустого списка или
-                # ошибки уходила юзеру как есть. Теперь такие исходы получают ЧЕСТНЫЙ детерминированный
-                # текст. Отказ от подтверждения сюда НЕ попадает (коллектор его не классифицирует) —
-                # у него свой путь _declined_reply.
-                _bulk409 = collect_bulk_outcomes(_msgs393)
-                if _bulk409:
-                    _bulk_txt409 = bulk_outcome_reply(_bulk409)
-                    if _bulk_txt409:
-                        # смешанный ход: сохраняем уже собранный отчёт (отказ/успехи других write)
-                        # и ДОПИСЫВАЕМ честный исход очистки, а не затираем его.
-                        text = (f"{text} {_bulk_txt409}"
-                                if (_declined_confirm or _writes393) else _bulk_txt409)
+                # #409 R3: ВТОРАЯ ветка (отдельный сбор bulk-исходов) УДАЛЕНА. Она была источником
+                # сразу трёх MAJOR — противоречивая квитанция при ретрае, затирание отчёта о
+                # НЕ-bulk записи, неклассифицированное неисполнение. Теперь bulk-исход схлопывается
+                # редьюсером в ОДИН WriteAct и едет по этому же единственному пути.
             except Exception:  # noqa: BLE001 — заземление best-effort, ход пользователя не роняем
                 logger.warning("react_loop: post-tool report (#393) failed", exc_info=True)
         reply = _Reply(_postformat(text) or "Готово.")
