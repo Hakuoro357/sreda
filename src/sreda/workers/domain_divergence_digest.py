@@ -58,6 +58,10 @@ logger = logging.getLogger("sreda.domain_divergence")
 DEFAULT_STATE_FILE = "/var/lib/sreda/domain-divergence-state.json"
 FALLBACK_STATE_FILE = "/tmp/sreda-domain-divergence-state-fallback.json"
 REPORT_WINDOW = timedelta(days=7)
+# сколько помним, что тенант БЫЛ в гейте #376: пока его ходы могут попасть в окно
+# отчёта, плюс сутки запаса на дрожание каденса (CR R3 sol MAJOR — стык ISO-недель)
+GATE_HISTORY_TTL = REPORT_WINDOW + timedelta(days=1)
+_ALL_TENANTS_KEY = "*"
 FAILURE_BACKOFF = timedelta(minutes=30)
 ALERT_AFTER_CONSECUTIVE_FAILURES = 3
 # сколько формулировок-лидеров показываем на случай расхождения
@@ -298,12 +302,26 @@ def gather_week_counts(session: Session, *, now: datetime,
     any_divergence_outside_preview = False
 
     for rid, tenant_id, raw in rows:
+        # CR R3 (sol+terra MAJOR): строка ПОПАЛА под LIKE '"disambig"', значит претендует
+        # на наш блок. Тихо ронять её нельзя — иначе разъезд схемы выглядит как «механизм
+        # не срабатывал». Молча пропускаем ТОЛЬКО две штатные формы: блока нет вовсе
+        # (совпадение LIKE по другому месту JSON) и явный ran=False (гейт не отработал).
         try:
             rdj = json.loads(raw or "{}")
         except (TypeError, ValueError):
+            malformed += 1
             continue
-        dis = rdj.get("disambig") if isinstance(rdj, dict) else None
-        if not isinstance(dis, dict) or dis.get("ran") is not True:
+        if not isinstance(rdj, dict) or "disambig" not in rdj:
+            continue
+        dis = rdj["disambig"]
+        if not isinstance(dis, dict):
+            malformed += 1
+            continue
+        ran = dis.get("ran")
+        if ran is False:
+            continue
+        if ran is not True:
+            malformed += 1
             continue
         turns += 1
         if dis.get("error") is True:
@@ -397,8 +415,13 @@ def format_report(counts: WeekCounts, *, now: datetime,
             out.append(f"(скан упёрся в потолок {MAX_ROWS} ходов - неделя показана частично)")
 
     if counts.turns_with_disambig == 0:
-        lines.append("механизм дизамбигуации за неделю не срабатывал (0 ходов): "
-                     "гейт снят или task-ходов на канарейке не было.")
+        if counts.malformed:
+            # CR R3: «не срабатывал» и «строки не той формы» — разные диагнозы
+            lines.append("ходов с дизамбигуацией не насчитано, но в трейсе есть строки "
+                         "не той формы - похоже, схема блока разъехалась.")
+        else:
+            lines.append("механизм дизамбигуации за неделю не срабатывал (0 ходов): "
+                         "гейт снят или task-ходов на канарейке не было.")
         _health(lines)
         return "\n".join(lines)
 
@@ -448,6 +471,17 @@ def _section(lines: list[str], title: str, cases: list[DivergenceCase], top: int
         lines.append(f"   ещё видов в этой группе: {hidden} (реже)")
 
 
+def _parse_ts(raw: object) -> datetime | None:
+    """ISO-строка из state → aware-datetime; мусор → None (state не должен ронять отчёт)."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        ts = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+
+
 def _week_key(now: datetime) -> str:
     """Ключ ISO-недели: каденс «раз в неделю» = смена календарной недели UTC
     (стабильнее интервала — не плывёт от пропущенных тиков, как и суточный #139)."""
@@ -455,23 +489,44 @@ def _week_key(now: datetime) -> str:
     return f"{iso[0]}-W{iso[1]:02d}"
 
 
-def _merge_scope(current: tuple[str, list[str]],
-                 prev_mode: object, prev_tenants: object) -> tuple[str, list[str]]:
-    """Объединить область скана текущего гейта с гейтом ПРОШЛОГО прогона.
+def _update_gate_history(history: object, current: tuple[str, list[str]],
+                         now: datetime) -> dict[str, str]:
+    """Журнал «когда этот тенант последний раз был в гейте #376» → ``{ключ: iso-время}``.
 
     CR R2 sol MAJOR: окно отчёта охватывает прошедшие 7 дней, поэтому сегодняшняя
-    конфигурация — не источник истины за весь этот период. Смена канарейки (или снятие
-    гейта) посреди недели иначе молча выкидывала бы валидные расхождения прежнего
-    тенанта. Объединение self-healing: в state лежит только гейт последнего прогона,
-    накапливать историю не нужно — прогоны идут раз в неделю, ровно по ширине окна.
+    конфигурация — не источник истины за весь период; смена канарейки посреди недели
+    иначе молча теряла бы расхождения прежнего тенанта.
+    CR R3 sol MAJOR: хранить «гейт ПРОШЛОГО прогона» было мало — на стыке ISO-недель
+    (поздний воскресный прогон и ранний понедельничный) прежний тенант забывался уже
+    через час, хотя окна почти совпадали. Журнал с отметками времени переживает такие
+    стыки и при этом НЕ растёт вечно: запись живёт, пока может попасть в окно отчёта.
+
+    Ключ ``*`` — режим «всем»; он тоже живёт по TTL, а не навсегда.
     """
+    out: dict[str, str] = {}
+    cutoff = now - GATE_HISTORY_TTL
+    if isinstance(history, dict):
+        for key, ts in history.items():
+            if not isinstance(key, str) or not isinstance(ts, str):
+                continue
+            parsed = _parse_ts(ts)
+            if parsed is not None and parsed >= cutoff:
+                out[key] = ts
     mode, tenants = current
-    if mode == "all" or prev_mode == "all":
+    stamp = now.isoformat()
+    if mode == "all":
+        out[_ALL_TENANTS_KEY] = stamp
+    for tenant in tenants:
+        out[tenant] = stamp
+    return out
+
+
+def _scope_from_history(history: dict[str, str]) -> tuple[str, list[str]]:
+    """Журнал гейтов → область скана. «Всем» поглощает список."""
+    if _ALL_TENANTS_KEY in history:
         return ("all", [])
-    merged = set(tenants)
-    if isinstance(prev_tenants, list):
-        merged |= {str(t) for t in prev_tenants if isinstance(t, str)}
-    return ("list", sorted(merged)) if merged else ("none", [])
+    tenants = sorted(k for k in history if k != _ALL_TENANTS_KEY)
+    return ("list", tenants) if tenants else ("none", [])
 
 
 def _gather_with_session(now: datetime,
@@ -498,9 +553,8 @@ class DomainDivergenceDigestWorker:
         if not self._should_run(now, state):
             return 0
         week = _week_key(now)
-        current_scope = _scan_scope()
-        scope = _merge_scope(current_scope, state.get("last_scan_mode"),
-                             state.get("last_scan_tenants"))
+        history = _update_gate_history(state.get("gate_history"), _scan_scope(), now)
+        scope = _scope_from_history(history)
         try:
             # скан недели + расшифровка примеров — в поток: job_runner не должен
             # замирать на время запроса (раз в неделю, но выборка до MAX_ROWS)
@@ -526,9 +580,10 @@ class DomainDivergenceDigestWorker:
                     logger.exception("domain_divergence: alert delivery failed")
             return 0
         state["last_run_week"] = week
-        # гейт ЭТОГО прогона — чтобы следующая неделя знала, что было в начале окна
-        state["last_scan_mode"] = current_scope[0]
-        state["last_scan_tenants"] = current_scope[1]
+        # журнал гейтов — чтобы следующие прогоны знали, что было в начале их окна
+        state["gate_history"] = history
+        state.pop("last_scan_mode", None)      # схема до CR R3 — чистим
+        state.pop("last_scan_tenants", None)
         state.pop("last_failure_at", None)
         state["failure_count"] = 0
         if not self._write_state(state):
@@ -550,15 +605,7 @@ class DomainDivergenceDigestWorker:
             return False
         return True
 
-    @staticmethod
-    def _parse_ts(raw: object) -> datetime | None:
-        if not isinstance(raw, str):
-            return None
-        try:
-            ts = datetime.fromisoformat(raw)
-        except ValueError:
-            return None
-        return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+    _parse_ts = staticmethod(_parse_ts)
 
     def _read_state(self) -> dict:
         # основной файл может быть ЧИТАЕМ, но устаревшим (записи шли в запасной) —

@@ -362,13 +362,54 @@ def test_week_of_only_malformed_rows_does_not_claim_agreement(session):
     assert "не той формы (пропущены): 4" in text
 
 
-def test_ran_flag_must_be_true_bool(session):
-    """Строка с ran не-True не засчитывается ходом дизамбигуации."""
+def test_broken_candidate_rows_counted_as_malformed(session):
+    """CR R3 (sol+terra MAJOR): строка, попавшая под фильтр «есть disambig», но с не-bool
+    ran / не-dict блоком / битым JSON, раньше отбрасывалась ТИХО — и неделя из таких
+    строк рапортовала «механизм не срабатывал», пряча разъезд схемы."""
     _trace(session, disambig={"ran": 1, "kind": "add", "applied": False,
                               "static_domains": [], "freddie_domains": ["b"]})
+    _trace(session, disambig={"kind": "add"})            # ran отсутствует
+    _trace(session, disambig="не словарь")               # блок не той природы
+    session.add(ReactTurnTrace(                          # JSON не парсится
+        id="rtt410_broken", tenant_id=TENANT, turn_key="tk410_broken",
+        status="done", outcome="ok",
+        routing_decision_json='{"disambig": {oops',
+        created_at=NOW - timedelta(days=1)))
     session.commit()
 
-    assert gather_week_counts(session, now=NOW).turns_with_disambig == 0
+    c = gather_week_counts(session, now=NOW)
+    text = format_report(c, now=NOW)
+
+    assert c.turns_with_disambig == 0
+    assert c.malformed == 4
+    assert "не срабатывал" not in text, "это не тишина механизма, а битые данные"
+    assert "схема блока разъехалась" in text
+    assert "не той формы (пропущены): 4" in text
+
+
+def test_ran_false_is_normal_silence_not_malformed(session):
+    """Явный ran=False — штатная форма (гейт не отработал на этом ходе), не битая."""
+    _trace(session, disambig={"ran": False})
+    session.commit()
+
+    c = gather_week_counts(session, now=NOW)
+
+    assert c.turns_with_disambig == 0 and c.malformed == 0
+    assert "не срабатывал" in format_report(c, now=NOW).lower()
+
+
+def test_row_without_disambig_block_is_ignored_silently(session):
+    """Совпадение фильтра по другому месту JSON — не наш ход и не битая строка."""
+    session.add(ReactTurnTrace(
+        id="rtt410_other", tenant_id=TENANT, turn_key="tk410_other",
+        status="done", outcome="ok",
+        routing_decision_json='{"note": "слово disambig внутри текста"}',
+        created_at=NOW - timedelta(days=1)))
+    session.commit()
+
+    c = gather_week_counts(session, now=NOW)
+
+    assert c.turns_with_disambig == 0 and c.malformed == 0
 
 
 def test_scan_narrowed_to_disambig_tenants(session):
@@ -418,39 +459,60 @@ def test_scope_resolution_from_settings(monkeypatch):
     assert _real_scan_scope() == ("all", []), "режим «всем» отличается от «никому»"
 
 
-def test_scope_union_survives_canary_change_mid_week():
+def test_gate_history_survives_canary_change_and_expires():
     """CR R2 sol MAJOR: окно охватывает 7 прошедших дней, поэтому сегодняшний гейт не
     источник истины за весь период — смена канарейки внутри недели не должна терять
-    расхождения прежнего тенанта."""
-    assert dd._merge_scope(("list", ["t_new"]), "list", ["t_old"]) == \
-        ("list", ["t_new", "t_old"])
-    # гейт сняли совсем, но неделя ещё содержит ходы прежнего тенанта
-    assert dd._merge_scope(("none", []), "list", ["t_old"]) == ("list", ["t_old"])
-    # «всем» с любой стороны поглощает
-    assert dd._merge_scope(("list", ["t1"]), "all", []) == ("all", [])
-    assert dd._merge_scope(("all", []), "list", ["t1"]) == ("all", [])
-    # ничего не было и нет → сканировать нечего
-    assert dd._merge_scope(("none", []), None, None) == ("none", [])
+    расхождения прежнего тенанта. И журнал не растёт вечно: запись живёт, пока её ходы
+    ещё могут попасть в окно отчёта."""
+    h0 = dd._update_gate_history(None, ("list", ["t_old"]), NOW)
+    assert dd._scope_from_history(h0) == ("list", ["t_old"])
+
+    # канарейку сменили: обе записи живы, пока окно их накрывает
+    h1 = dd._update_gate_history(h0, ("list", ["t_new"]), NOW + timedelta(days=1))
+    assert dd._scope_from_history(h1) == ("list", ["t_new", "t_old"])
+
+    # гейт сняли совсем — прежний тенант всё ещё в окне
+    h2 = dd._update_gate_history(h1, ("none", []), NOW + timedelta(days=2))
+    assert dd._scope_from_history(h2) == ("list", ["t_new", "t_old"])
+
+    # прошло больше TTL — старьё выпало, сканировать нечего
+    h3 = dd._update_gate_history(h2, ("none", []), NOW + timedelta(days=30))
+    assert dd._scope_from_history(h3) == ("none", [])
+
+    # «всем» поглощает список и тоже живёт по TTL
+    h4 = dd._update_gate_history(h1, ("all", []), NOW + timedelta(days=1))
+    assert dd._scope_from_history(h4) == ("all", [])
+    assert dd._scope_from_history(
+        dd._update_gate_history(h4, ("none", []), NOW + timedelta(days=30))) == ("none", [])
 
 
-def test_worker_records_gate_and_merges_next_run(tmp_path, monkeypatch):
-    """Гейт прогона ложится в state и участвует в объединении на следующей неделе."""
+def test_gate_history_ignores_garbage_state():
+    """Битый state не должен ронять отчёт."""
+    assert dd._update_gate_history("не словарь", ("list", ["t1"]), NOW).keys() == {"t1"}
+    assert dd._update_gate_history({"t_bad": 42, 7: "x"}, ("none", []), NOW) == {}
+
+
+def test_worker_remembers_gate_across_iso_week_boundary(tmp_path, monkeypatch):
+    """CR R3 sol MAJOR: поздний воскресный прогон и ранний понедельничный разделены
+    часом, но ISO-неделя уже сменилась. Прежний тенант обязан пережить этот стык —
+    окна почти совпадают, и его расхождения всё ещё в отчётном периоде."""
     import asyncio
-    import json as _json
     state_path = tmp_path / "state.json"
     w = DomainDivergenceDigestWorker(state_file=str(state_path))
     seen: list = []
     monkeypatch.setattr(dd, "send_admin_alert", lambda *a, **kw: None)
-    monkeypatch.setattr(dd, "_scan_scope", lambda: ("list", ["t_old"]))
     monkeypatch.setattr(dd, "_gather_with_session", lambda now, scope=None: (
         seen.append(scope) or dd.WeekCounts(0, 0, 0, 0, 0)))
 
-    asyncio.run(w.process_pending(now=NOW))
-    assert _json.loads(state_path.read_text(encoding="utf-8"))["last_scan_tenants"] == ["t_old"]
+    sunday = datetime(2026, 7, 19, 23, 0, tzinfo=timezone.utc)   # ISO-неделя 29
+    monday = datetime(2026, 7, 20, 0, 10, tzinfo=timezone.utc)   # ISO-неделя 30
+    monkeypatch.setattr(dd, "_scan_scope", lambda: ("list", ["t_old"]))
+    asyncio.run(w.process_pending(now=sunday))
+    assert seen[-1] == ("list", ["t_old"])
 
     monkeypatch.setattr(dd, "_scan_scope", lambda: ("list", ["t_new"]))
-    asyncio.run(w.process_pending(now=NOW + timedelta(days=7)))
-    assert seen[-1] == ("list", ["t_new", "t_old"])
+    asyncio.run(w.process_pending(now=monday))
+    assert seen[-1] == ("list", ["t_new", "t_old"]), "прежний тенант забыт на стыке недель"
 
 
 def test_sampled_frequencies_are_labelled(session, monkeypatch):
