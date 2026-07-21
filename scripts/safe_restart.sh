@@ -11,11 +11,11 @@
 #        - проверка heartbeat по каждому каналу telegram:<bot_key>
 #        - НИКОГДА не setWebhook (setWebhook блокирует getUpdates 409 Conflict)
 #   4. MAX webhook reset (когда подключим)
-#   5. Verify + ГЕЙТ по времени старта служб (#408)
+#   5. Verify + ГЕЙТ активации служб (#408)
 #   6. Smoke-test
 #
 # ГАРАНТИЯ #408: «успех» = дошли до строки `DONE: safe_restart завершён успешно`
-# И все службы стартовали позже начала прогона. Любой обрыв (в т.ч. SIGHUP при
+# И systemd переактивировал ВСЕ службы прогона (новый InvocationID + active). Любой обрыв (в т.ч. SIGHUP при
 # разрыве SSH-сессии деплоя) = ненулевой код возврата + алерт админу.
 # Вызывающая сторона ОБЯЗАНА проверять код возврата, а не `systemctl is-active`.
 #
@@ -26,7 +26,7 @@
 #   3 — поллер не стартанул
 #   4 — webhook URL не пуст (будет 409 Conflict)
 #   5 — поллер не активен после рестарта
-#   7 — ГЕЙТ не пройден: служба работает на СТАРОМ коде (деплой не доехал)
+#   7 — ГЕЙТ не пройден: служба на СТАРОМ коде или упала (деплой не доехал)
 #  90 — прогон оборван до DONE (сеть/сигнал/убитая сессия)
 # 129/143/130 — оборван сигналом HUP/TERM/INT
 #
@@ -43,10 +43,24 @@
 
 set -euo pipefail
 
-# Пути прод-дефолтами. Переопределяются только через окружение — нужно тестам
-# (tests/test_safe_restart_gate.sh гоняет скрипт со stub-ами systemctl/curl).
-# Прод-безопасно: скрипт и так запускается под root, а sudo по умолчанию чистит
-# окружение (env_reset) — снаружи эти переменные не подставить.
+# Пути: прод-дефолты, переопределяемые только для тестов.
+# ⚠ Под root ЛЮБОЙ SAFE_RESTART_*-override ОТВЕРГАЕТСЯ (R1 sol+terra): иначе
+# `sudo -E`, правка sudoers или обёртка-автоматизация могли бы направить
+# root-вывод в произвольный файл (SAFE_RESTART_LOG) или запустить произвольную
+# программу от имени sreda (SAFE_RESTART_VENV_PYTHON). Тесты гоняют скрипт
+# НЕ под root, поэтому не страдают. Полагаться на sudo env_reset нельзя — это
+# конфигурируемое поведение, а не гарантия.
+if [ "$(id -u)" -eq 0 ]; then
+    for _v in SAFE_RESTART_ENV_FILE SAFE_RESTART_LOG SAFE_RESTART_VENV_PYTHON \
+              SAFE_RESTART_TG_CONNECT_TIMEOUT SAFE_RESTART_TG_MAX_TIME; do
+        if [ -n "${!_v:-}" ]; then
+            echo "FATAL: ${_v} задан под root — override'ы разрешены только вне root (тесты)." >&2
+            exit 1
+        fi
+    done
+    unset _v
+fi
+
 ENV_FILE="${SAFE_RESTART_ENV_FILE:-/etc/sreda/.env}"
 LOG="${SAFE_RESTART_LOG:-/var/log/sreda/safe_restart.log}"
 VENV_PYTHON="${SAFE_RESTART_VENV_PYTHON:-/opt/sreda/.venv/bin/python}"
@@ -65,9 +79,9 @@ log() { echo "$(ts) $*" | tee -a "$LOG"; }
 # ЗЕЛЁНЫЕ. Итог: фиксы #401/#405 не жили у пользователей ~15 часов.
 #
 # Три меры (по порядку важности):
-#   1. ГЕЙТ ПО ВРЕМЕНИ СТАРТА (phase 5b) — главный. Каждый юнит, который прогон
-#      обязан был перезапустить, ОБЯЗАН иметь время старта позже старта прогона.
-#      Ловит ровно этот класс: «служба active, но процесс старый».
+#   1. ГЕЙТ АКТИВАЦИИ (phase 5b) — главный. Каждый юнит прогона обязан получить
+#      НОВЫЙ systemd InvocationID и быть active. Ловит ровно этот класс:
+#      «служба active, но процесс старый».
 #   2. Внешние curl — с таймаутом и НЕ фатальные. Long-poll reset вспомогателен:
 #      сеть до TG не должна блокировать рестарт поллеров.
 #   3. Нет финального DONE = ненулевой код + громкий алерт админу (trap на EXIT),
@@ -77,15 +91,20 @@ log() { echo "$(ts) $*" | tee -a "$LOG"; }
 # деплой-сессии (~120s), чтобы скрипт успевал доработать и отчитаться САМ.
 TG_CONNECT_TIMEOUT="${SAFE_RESTART_TG_CONNECT_TIMEOUT:-5}"
 TG_MAX_TIME="${SAFE_RESTART_TG_MAX_TIME:-15}"
+# Валидация: строго положительные целые ≤600. Особенно важен запрет НУЛЯ —
+# `curl --max-time 0` означает «без таймаута», т.е. молча вернул бы ровно тот
+# баг, который эта правка чинит (R1 sol+terra).
+for _t in TG_CONNECT_TIMEOUT TG_MAX_TIME; do
+    if ! printf '%s' "${!_t}" | grep -Eq '^[1-9][0-9]{0,2}$' || [ "${!_t}" -gt 600 ]; then
+        echo "FATAL: ${_t}='${!_t}' невалиден (ожидается целое 1..600)." >&2
+        exit 1
+    fi
+done
+unset _t
 
-# Точка отсчёта гейта. Монотоника (мкс от загрузки) — тот же клок, что у
-# systemd *TimestampMonotonic: сравнение целых, без парсинга локале-зависимых
-# строк и без чувствительности к прыжкам NTP. Усечение (не округление) — чтобы
-# отсечка не оказалась «позже» реального старта прогона.
-GATE_START_MONOTONIC_US=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
 GATE_START_HUMAN=$(ts)
-
 SAFE_RESTART_COMPLETED=0
+FAILURE_ALERTED=0
 
 # Алерт админу через СУЩЕСТВУЮЩИЙ дуал-канал (#395: Telegram основной + MAX дубль).
 # Best-effort: сам никогда не роняет скрипт (мы уже на аварийном пути) и ограничен
@@ -131,6 +150,13 @@ on_exit() {
     log "FAILED: safe_restart ОБОРВАН до DONE (код ${rc}) — ДЕПЛОЙ НЕ ЗАСЧИТАН."
     log "        Службы могли остаться на СТАРОМ коде (uvicorn/job-runner/поллеры)."
     log "        Проверь время старта служб и перезапусти вручную."
+    # Точка отказа уже отправила подробный алерт (например гейт) — не дублируем:
+    # у alert_admin_async нет дедупликации, оператор получил бы два сообщения
+    # и ждал бы лишний таймаут доставки (R1 sol+terra).
+    if [ "$FAILURE_ALERTED" = "1" ]; then
+        log "        (алерт по этой причине уже отправлен выше)"
+        exit "$rc"
+    fi
     alert_admin "🔴 P0 Среда: safe_restart ОБОРВАН — деплой не доехал
 
 Прогон стартовал: ${GATE_START_HUMAN}
@@ -180,6 +206,57 @@ if [ -n "$TG_TOKEN_HOME" ]; then
 else
     log "SREDA_HOME_BOT_TOKEN не задан — только бот sreda."
 fi
+
+# ============ #408: единый список юнитов прогона + снимок инвокаций ============
+# ЕДИНЫЙ резолв юнита (R1 sol): один и тот же ответ используют phase 3b (что
+# рестартовать) и гейт (что проверять). Раньше они расходились — 3b выбирал по
+# enabled/active с legacy-фолбэком, а гейт по одному `systemctl cat` → юнит,
+# установленный но не включённый, давал ложный КРАСНЫЙ.
+#
+# InvocationID вместо времени старта (R1 sol и terra предложили независимо):
+# systemd выдаёт НОВЫЙ InvocationID на КАЖДУЮ активацию. Сравнение «до/после»
+# прямо доказывает факт новой активации и снимает все вопросы к часам:
+# разрядность awk (mawk насыщает %d на INT_MAX), CLOCK_BOOTTIME(/proc/uptime)
+# против CLOCK_MONOTONIC(systemd), сотые доли секунды как окно ложного зелёного,
+# NTP, suspend, перезагрузка. Проверено на проде: systemd 255, ID заполнен.
+
+resolve_poller_unit() {
+    local bk="$1"
+    local tmpl="sreda-telegram-poller@${bk}.service"
+    local legacy="sreda-telegram-poller.service"
+    if systemctl cat "$tmpl" >/dev/null 2>&1 \
+       && { systemctl is-enabled "$tmpl" >/dev/null 2>&1 || systemctl is-active "$tmpl" >/dev/null 2>&1; }; then
+        printf '%s' "$tmpl"; return 0
+    fi
+    # Pre-cutover фолбэк: остался только старый non-template юнит.
+    if [ "$bk" = "sreda" ] && systemctl cat "$legacy" >/dev/null 2>&1 \
+       && { systemctl is-enabled "$legacy" >/dev/null 2>&1 || systemctl is-active "$legacy" >/dev/null 2>&1; }; then
+        printf '%s' "$legacy"; return 0
+    fi
+    return 1
+}
+
+# Имя переменной-слота под InvocationID юнита (systemd-имена содержат @ . -).
+unit_var() { printf 'INVOC_%s' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
+
+GATE_UNITS="sreda-uvicorn.service sreda-job-runner.service"
+for bot_key in $BOT_KEYS; do
+    if poller_unit=$(resolve_poller_unit "$bot_key"); then
+        eval "POLLER_UNIT_${bot_key}=\$poller_unit"
+        GATE_UNITS="$GATE_UNITS $poller_unit"
+    else
+        log "FATAL: [${bot_key}] токен настроен, но поллер-юнит не установлен/не включён — inbound мёртв"
+        exit 3
+    fi
+done
+
+# Снимок InvocationID ДО любых рестартов — база сравнения для гейта.
+for unit in $GATE_UNITS; do
+    _iv=$(systemctl show -p InvocationID --value "$unit" 2>/dev/null || echo "")
+    eval "$(unit_var "$unit")_PRE=\$_iv"
+done
+unset _iv
+log "гейт #408: под контролем юниты — ${GATE_UNITS}"
 
 # ============ Phase 1: restart uvicorn + job-runner ============
 log "phase 1: restart sreda-uvicorn + sreda-job-runner"
@@ -270,54 +347,20 @@ done
 sleep 2  # дать TG обработать deleteWebhook для всех ботов
 
 for bot_key in $BOT_KEYS; do
-    unit="sreda-telegram-poller@${bot_key}.service"
+    # Юнит уже разрешён ЕДИНЫМ резолвером выше (template или legacy) — здесь
+    # никакой повторной логики выбора, иначе гейт и рестарт снова разъедутся.
+    eval "unit=\$POLLER_UNIT_${bot_key}"
 
-    # Проверяем что юнит существует и был enabled/active до рестарта.
-    # ВАЖНО: `systemctl cat` резолвит TEMPLATE-инстанс (например
-    # sreda-telegram-poller@sreda.service) через его @.service-файл.
-    # `list-unit-files <instance>` НЕ матчит имя инстанса (только сам
-    # template-файл) → раньше установленные инстансы ошибочно считались
-    # «не установлен» и поллеры НЕ рестартовались при каждом прогоне.
-    if ! systemctl cat "$unit" >/dev/null 2>&1; then
-        log "  phase 3b [${bot_key}]: юнит ${unit} не установлен — пропускаем"
-        continue
-    fi
-
-    # Рестартуем только если юнит enabled ИЛИ уже был active
-    if systemctl is-enabled "$unit" >/dev/null 2>&1 \
-       || systemctl is-active "$unit" >/dev/null 2>&1; then
-        log "  phase 3b [${bot_key}]: restart ${unit}"
-        systemctl reset-failed "$unit" 2>/dev/null || true
-        systemctl restart "$unit"
-        sleep 2
-        if systemctl is-active "$unit" >/dev/null 2>&1; then
-            log "    → ${unit} активен"
-        else
-            log "FATAL: ${unit} не стартанул"
-            systemctl status "$unit" --no-pager | tee -a "$LOG"
-            exit 3
-        fi
+    log "  phase 3b [${bot_key}]: restart ${unit}"
+    systemctl reset-failed "$unit" 2>/dev/null || true
+    systemctl restart "$unit"
+    sleep 2
+    if systemctl is-active "$unit" >/dev/null 2>&1; then
+        log "    → ${unit} активен"
     else
-        log "  phase 3b [${bot_key}]: ${unit} не enabled и не active — пропускаем"
-
-        # Fallback: если есть только старый non-template юнит (pre-cutover),
-        # рестарт его для совместимости.
-        if [ "$bot_key" = "sreda" ]; then
-            if systemctl is-enabled sreda-telegram-poller.service >/dev/null 2>&1 \
-               || systemctl is-active sreda-telegram-poller.service >/dev/null 2>&1; then
-                log "  phase 3b [legacy]: restart sreda-telegram-poller.service (pre-cutover fallback)"
-                systemctl reset-failed sreda-telegram-poller 2>/dev/null || true
-                systemctl restart sreda-telegram-poller
-                sleep 2
-                if systemctl is-active sreda-telegram-poller >/dev/null 2>&1; then
-                    log "    → sreda-telegram-poller (legacy) активен"
-                else
-                    log "FATAL: sreda-telegram-poller (legacy) не стартанул"
-                    systemctl status sreda-telegram-poller --no-pager | tee -a "$LOG"
-                    exit 3
-                fi
-            fi
-        fi
+        log "FATAL: ${unit} не стартанул"
+        systemctl status "$unit" --no-pager | tee -a "$LOG"
+        exit 3
     fi
 done
 
@@ -345,9 +388,21 @@ if [ -n "$MAX_TOKEN" ]; then
             fi
 
             log "phase 4a: deleteWebhook (MAX @ ${MAX_BASE})"
-            max_del=$(curl -sS $CA_OPT -X DELETE "${MAX_BASE}/subscriptions" \
-                          -H "Authorization: ${MAX_TOKEN}" 2>&1 | head -c 200 || echo "skip")
-            log "  → $max_del"
+            # #408 (R1 sol+terra): тот же bounded/non-fatal шаблон, что и для TG.
+            # Раньше этот curl был БЕЗ таймаута — последняя оставшаяся точка,
+            # где внешняя сеть могла подвесить прогон (уже после рестарта
+            # поллеров, но ДО гейта и DONE) и съесть бюджет SSH-сессии.
+            max_rc=0
+            max_del=$(curl -sS --connect-timeout "$TG_CONNECT_TIMEOUT" --max-time "$TG_MAX_TIME" \
+                          $CA_OPT -X DELETE "${MAX_BASE}/subscriptions" \
+                          -H "Authorization: ${MAX_TOKEN}" 2>&1) || max_rc=$?
+            max_del=$(printf '%s' "$max_del" | head -c 200) || true
+            if [ "$max_rc" -eq 0 ]; then
+                log "  → $max_del"
+            else
+                log "  ⚠ MAX deleteWebhook не удался (curl rc=${max_rc}) — ПРОДОЛЖАЕМ"
+                log "    (детали: ${max_del})"
+            fi
 
             sleep 2
 
@@ -442,65 +497,64 @@ for bot_key in $BOT_KEYS; do
     exit 5
 done
 
-# ============ Phase 5b: ГЕЙТ по времени старта служб (#408) ============
+# ============ Phase 5b: ГЕЙТ активации служб (#408) ============
 # ГЛАВНАЯ проверка недоката, ради неё вся правка. `systemctl is-active` = active
 # и верный `git rev-parse HEAD` на диске НЕ доказывают, что процесс перезапустился:
 # 2026-07-20 поллеры остались на коде от 18:02, а деплои 19:17 и 21:32 были
 # отрапортованы успешными именно по этим двум зелёным признакам.
 #
-# Инвариант: КАЖДЫЙ юнит, который прогон обязан был перезапустить, стартовал
-# ПОЗЖЕ старта прогона. Старт раньше = работает старый процесс = деплой провален.
-#
-# Гейт стоит ДО phase 6: на старом коде смоук бы прошёл (PASS) и добавил ложной
-# уверенности — сначала доказываем, что код вообще активирован.
-log "phase 5b: гейт — все службы стартовали в ЭТОМ прогоне?"
-
-# Ожидаемый набор строим из КОНФИГУРАЦИИ (а не из того, что успели рестартнуть),
-# чтобы «phase 3b молча пропустил поллер» тоже ловилось.
-GATE_UNITS="sreda-uvicorn sreda-job-runner"
-for bot_key in $BOT_KEYS; do
-    unit="sreda-telegram-poller@${bot_key}.service"
-    if systemctl cat "$unit" >/dev/null 2>&1; then
-        GATE_UNITS="$GATE_UNITS $unit"
-    elif [ "$bot_key" = "sreda" ] && systemctl cat sreda-telegram-poller.service >/dev/null 2>&1; then
-        GATE_UNITS="$GATE_UNITS sreda-telegram-poller.service"
-    else
-        log "FATAL: [${bot_key}] токен настроен, но юнит поллера не установлен — inbound мёртв"
-        exit 7
-    fi
-done
+# Инвариант — ДВА условия, оба обязательны:
+#   1. InvocationID ИЗМЕНИЛСЯ против снимка, снятого до всех рестартов
+#      → systemd провёл НОВУЮ активацию (а не «юнит просто числится active»);
+#   2. ActiveState = active ПРЯМО СЕЙЧАС
+#      → служба не стартовала и не упала следом. Одного ID мало: systemd
+#        сохраняет ID/время последней активации и после перехода в failed,
+#        поэтому проверка только по ID дала бы ложный зелёный (R1 sol).
+log "phase 5b: гейт — все службы реально переактивированы?"
 
 gate_ok=true
 for unit in $GATE_UNITS; do
-    enter_us=$(systemctl show -p ActiveEnterTimestampMonotonic --value "$unit" 2>/dev/null || echo "")
-    enter_human=$(systemctl show -p ActiveEnterTimestamp --value "$unit" 2>/dev/null || echo "?")
-    if ! printf '%s' "$enter_us" | grep -Eq '^[0-9]+$' || [ "$enter_us" -eq 0 ]; then
-        log "  ✗ ${unit}: времени старта нет (юнит не активен) — деплой не доехал"
+    eval "pre=\${$(unit_var "$unit")_PRE:-}"
+    post=$(systemctl show -p InvocationID --value "$unit" 2>/dev/null || echo "")
+    state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || echo "")
+    human=$(systemctl show -p ActiveEnterTimestamp --value "$unit" 2>/dev/null || echo "?")
+
+    if [ -z "$post" ]; then
+        log "  ✗ ${unit}: InvocationID пуст — активации не было (состояние: ${state:-неизвестно})"
         gate_ok=false
         continue
     fi
-    if [ "$enter_us" -lt "$GATE_START_MONOTONIC_US" ]; then
-        log "  ✗ ${unit}: СТАРТОВАЛ РАНЬШЕ прогона (${enter_human}) — процесс СТАРЫЙ, новый код НЕ активирован"
+    if [ "$post" = "$pre" ]; then
+        log "  ✗ ${unit}: InvocationID НЕ изменился — РЕСТАРТА НЕ БЫЛО, работает СТАРЫЙ процесс (запущен ${human})"
         gate_ok=false
-    else
-        log "  ✓ ${unit}: перезапущен в этом прогоне (${enter_human})"
+        continue
     fi
+    if [ "$state" != "active" ]; then
+        log "  ✗ ${unit}: активация была, но состояние сейчас '${state}' — служба упала после старта"
+        gate_ok=false
+        continue
+    fi
+    log "  ✓ ${unit}: переактивирован в этом прогоне (${human})"
 done
 
 if [ "$gate_ok" = "false" ]; then
-    log "FATAL: ГЕЙТ НЕ ПРОЙДЕН — часть служб работает на СТАРОМ коде. ДЕПЛОЙ НЕ ЗАСЧИТАН."
+    log "FATAL: ГЕЙТ НЕ ПРОЙДЕН — часть служб работает на СТАРОМ коде или упала. ДЕПЛОЙ НЕ ЗАСЧИТАН."
     log "       Это тот самый класс отказа, из-за которого #401/#405 не жили ~15 часов."
+    FAILURE_ALERTED=1
     alert_admin "🔴 P0 Среда: деплой НЕ доехал — службы на старом коде
 
 Прогон стартовал: ${GATE_START_HUMAN}
-Гейт по времени старта не пройден: часть служб не перезапустилась,
-хотя systemctl is-active показывает active.
+Хост: $(hostname)
+
+Гейт активации не пройден: часть служб НЕ переактивирована (systemd не выдал
+новый InvocationID) либо упала сразу после старта — при этом systemctl is-active
+может показывать active.
 
 Юниты прогона: ${GATE_UNITS}
-Лог (детали по каждому юниту): ${LOG}"
+Построчно (какой именно юнит виноват) — в логе: ${LOG}"
     exit 7
 fi
-log "  ✓ гейт пройден: все службы перезапущены этим прогоном"
+log "  ✓ гейт пройден: все службы (${GATE_UNITS}) переактивированы этим прогоном"
 
 # ============ Phase 6: onboarding smoke (отчёт, НЕ гейт) ============
 # Мера B пост-мортема vex-assistant#331 (#334): после рестарта гоняем сквозной
@@ -527,8 +581,12 @@ fi
 
 # #408: единственная точка, где прогон признаётся успешным. Всё, что не дошло
 # сюда, ловит trap on_exit → ненулевой код + алерт админу.
-SAFE_RESTART_COMPLETED=1
+# ПОРЯДОК ВАЖЕН (R1 sol+terra): сначала УСПЕШНО записать DONE, только потом
+# поднять флаг. Наоборот — сигнал (или сбой самого tee) в этом окне прошёл бы
+# через on_exit как «успех»: ни FAILED, ни алерта, при том что durable-строки
+# DONE в логе нет.
 log "DONE: safe_restart завершён успешно"
+SAFE_RESTART_COMPLETED=1
 echo
 echo "Можно отправить тестовое сообщение боту — должно дойти в течение 1-2 секунд."
 
