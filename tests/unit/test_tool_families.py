@@ -666,7 +666,9 @@ def test_manifest_exact_tool_set_per_family(
     )
 
 
-def test_manifest_total_size_is_59() -> None:
+def test_manifest_total_size_pinned() -> None:
+    # Имя без числа (#409 R1, terra MINOR): прежнее `..._is_59` разъезжалось с
+    # фактическим пином при каждом добавлении инструмента и вводило в заблуждение.
     # 8+4+6+5+4+11+11+3+1+4+1+3 = 61. #143 Phase B добавил
     # list_checklist_items (checklists 8→9, итог 55→56). #210 добавил
     # update_recipe (recipes 5→6) и update_checklist_item (checklists 9→10),

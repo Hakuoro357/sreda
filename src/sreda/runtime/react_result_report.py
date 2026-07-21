@@ -144,10 +144,14 @@ _TARGET_SPECS: dict[str, tuple[str, str, str, str]] = {
 #   * count у target захардкожен в 1 — здесь количество и есть суть результата («убрала N позиций»);
 #   * заземлённость у target проверяется по ИМЕНИ цели, а у bulk имени нет — проверяем по числу
 #     (иначе `not act.target` всегда давал бы «не заземлено» → живой голос подменялся бы ВСЕГДА).
-_BULK_SPECS: dict[str, tuple[str, str, str, tuple[str, str, str]]] = {
+# Пятое поле — ЯКОРЬ действия: слово, которое обязано прозвучать в реплике вдобавок к числу
+# (#409 R1, sol+terra MAJOR, независимо оба: одного числа МАЛО — «напомню через 5 минут» после
+# ok:cleared:5 проходило как «отчёт об очистке»). Якорь сверяется ТЕМ ЖЕ токен/stem-механизмом
+# (_name_mentioned), что и имена в add/target — не новый языковой детектор.
+_BULK_SPECS: dict[str, tuple[str, str, str, tuple[str, str, str], str]] = {
     "clear_shopping_list": (
         "убрала весь список покупок", "ok:cleared:", "очищен список покупок",
-        ("позиция", "позиции", "позиций"),
+        ("позиция", "позиции", "позиций"), "покупки",
     ),
 }
 
@@ -223,7 +227,7 @@ def collect_successful_writes(messages) -> tuple[WriteAct, ...]:
                 # #409: эффект ДОКАЗАН количеством из результата. N=0 («список уже был пуст») —
                 # no-op: НЕ заземляем, иначе страховка отрапортовала бы ложный успех («убрала
                 # весь список покупок») там, где ничего не убрано. Битый хвост → тоже не заземляем.
-                _verb, prefix, _type, _units_ = _BULK_SPECS[name]
+                _verb, prefix, _type, _units_, _anchor = _BULK_SPECS[name]
                 if not content.startswith(prefix):
                     continue
                 try:
@@ -293,11 +297,16 @@ def reply_grounds_result(reply: str, acts) -> bool:
                     act.target and _name_mentioned(reply_tokens, act.target)):
                 return False
         elif act.kind == "bulk":
-            # #409: у bulk-акта имени цели нет by design — верифицируем по КОЛИЧЕСТВУ (объективно,
-            # без языковых паттернов: число либо названо, либо нет). «Готово.» / «приняла к
-            # сведению» числа не несут → подмена страховкой, ровно тот класс #393, что чиним.
-            # Голос, назвавший N, сохраняется как есть (правило #121).
+            # #409: у bulk-акта имени цели нет by design — верифицируем по КОЛИЧЕСТВУ + ЯКОРЮ
+            # действия. Одного числа мало (R1 sol+terra MAJOR): в смешанном ходе «напомню через
+            # 5 минут» после ok:cleared:5 проходило бы как отчёт об очистке. Требуем ОБА признака:
+            # число И слово-якорь («покупки») по тому же stem-матчу, что и имена в add/target.
+            # «Готово.» / «приняла к сведению» не несут ни того, ни другого → подмена страховкой
+            # (ровно класс #393). Голос, назвавший и то и другое, сохраняется (правило #121).
+            bulk = _BULK_SPECS.get(act.tool)
             if str(act.count) not in reply_tokens:
+                return False
+            if bulk and not _name_mentioned(reply_tokens, bulk[4]):
                 return False
         elif not (act.target and _name_mentioned(reply_tokens, act.target)):
             return False

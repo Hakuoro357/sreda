@@ -392,6 +392,59 @@ def test_reply_naming_the_count_is_grounded_409() -> None:
     assert reply_grounds_result("Убрала весь список покупок - 5 позиций.", acts) is True
 
 
+def test_unrelated_number_is_not_grounding_409() -> None:
+    """R1 (Codex sol+terra MAJOR, независимо оба): одного ЧИСЛА мало. В смешанном ходе реплика
+    про другое действие с тем же числом («напомню через 5 минут») не должна засчитываться как
+    отчёт об очистке — иначе страховка #393 молчит там, где очистка вообще не названа."""
+    from sreda.runtime.react_result_report import collect_successful_writes, reply_grounds_result
+
+    acts = collect_successful_writes(_messages("ok:cleared:5"))
+    for reply in ("Напоминание поставила на 5 минут.",
+                  "Через 5 минут напомню проверить холодильник.",
+                  "Готово, 5."):
+        assert reply_grounds_result(reply, acts) is False, \
+            f"постороннее число зачлось как отчёт об очистке: {reply!r}"
+
+
+def test_anchor_without_count_is_not_grounding_409() -> None:
+    """Обратная сторона: якорь без числа тоже не заземление (иначе «а что в покупках?» сойдёт
+    за отчёт). Нужны ОБА признака."""
+    from sreda.runtime.react_result_report import collect_successful_writes, reply_grounds_result
+
+    acts = collect_successful_writes(_messages("ok:cleared:5"))
+    assert reply_grounds_result("Убрала всё из списка покупок.", acts) is False
+
+
+def test_tool_name_in_leak_guards_409() -> None:
+    """R1 (sol MINOR) + жёсткое правило проекта «никаких технических данных пользователю»:
+    имя инструмента обязано вычищаться из текста ответа, если модель его выплюнет."""
+    from sreda.runtime.handlers import _TOOL_NAMES_SET
+    from sreda.services.llm import _KNOWN_TOOL_NAMES
+
+    assert "clear_shopping_list" in _TOOL_NAMES_SET
+    assert "clear_shopping_list" in _KNOWN_TOOL_NAMES
+
+
+def test_not_exposed_to_legacy_path_without_confirm_409() -> None:
+    """R1 (Codex sol+terra CRITICAL, независимо оба): у ЛЕГАСИ-пути нет механизма подтверждения
+    (`_invoke_one_tool` зовёт tool.invoke напрямую, без _confirm_wrap/interrupt). ReAct-only
+    деструктив там = массовая мутация БЕЗ «да» при откате флага/новом тенанте. Гейт обязан быть
+    по РЕЕСТРУ REACT_ONLY_TOOLS, а не по одному имени — иначе следующий такой инструмент снова
+    просочится."""
+    import inspect
+
+    from sreda.runtime import handlers
+    from sreda.services.tool_schemas.families import REACT_ONLY_TOOLS
+
+    src = inspect.getsource(handlers)
+    assert "REACT_ONLY_TOOLS - _legacy_grandfathered" in src, \
+        "легаси-фильтр не гейтится реестром ReAct-only — новый деструктив просочится"
+    # grandfather фиксирован явно и НЕ содержит нового инструмента
+    grandfathered = frozenset({"create_memory_category", "update_checklist_item", "update_recipe"})
+    assert "clear_shopping_list" in (REACT_ONLY_TOOLS - grandfathered), \
+        "clear_shopping_list обязан попадать в исключаемый набор легаси-пути"
+
+
 def test_grounding_note_carries_server_facts_409() -> None:
     """Часть 1 (#393): в промпт уходят ТОЛЬКО серверные факты (статус+количество+тип), без имён."""
     from sreda.runtime.react_result_report import collect_successful_writes, grounding_note

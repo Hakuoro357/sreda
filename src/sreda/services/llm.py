@@ -502,6 +502,7 @@ _KNOWN_TOOL_NAMES = (
     "list_shopping", "add_shopping_items", "remove_shopping_items",
     "mark_shopping_bought", "clear_bought_shopping",
     "update_shopping_item", "update_shopping_items_category",
+    "clear_shopping_list",  # #409 (R1 sol MINOR: скраббер сырого вызова в тексте ответа)
     # Housewife recipes
     "search_recipes", "get_recipe", "save_recipe", "save_recipes_batch",
     "delete_recipe", "update_recipe",  # #210

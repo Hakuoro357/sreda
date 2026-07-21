@@ -3092,7 +3092,25 @@ async def _chat_preflight(
     # #213 Срез A: get_checklist — ReAct-only контур; замороженному legacy-пути
     # он не экспонируется НИ ПРИ КАКОМ флаге (у пути нет спека/парсера по канону
     # #210, эмиссия дала бы ToolOutputContractViolation).
-    tools = [t for t in tools if t.name != "get_checklist"]
+    #
+    # #409 R1 (Codex sol+terra, CRITICAL, независимо оба): гейт был по ОДНОМУ ИМЕНИ и потому
+    # пропустил новый ReAct-only ДЕСТРУКТИВ (clear_shopping_list). У легаси-пути нет не только
+    # спека/парсера, но и МЕХАНИЗМА ПОДТВЕРЖДЕНИЯ: _invoke_one_tool зовёт tool.invoke напрямую,
+    # без _confirm_wrap/interrupt. Экспозиция деструктива здесь = массовая мутация БЕЗ «да».
+    # Потому гейт теперь по РЕЕСТРУ REACT_ONLY_TOOLS — новый ReAct-only инструмент безопасен
+    # ПО УМОЛЧАНИЮ, а не «если автор вспомнил про этот фильтр».
+    #
+    # Grandfather: create_memory_category/update_checklist_item/update_recipe экспонировались
+    # легаси ДО #409. Их поведение здесь НЕ меняем (это вне scope #409) — снятие grandfather'а
+    # требует отдельного решения владельца. Список фиксирован ЯВНО, чтобы новые ReAct-only
+    # инструменты в него не попадали автоматически.
+    from sreda.services.tool_schemas.families import REACT_ONLY_TOOLS
+
+    _legacy_grandfathered = frozenset({
+        "create_memory_category", "update_checklist_item", "update_recipe",
+    })
+    _legacy_excluded = REACT_ONLY_TOOLS - _legacy_grandfathered
+    tools = [t for t in tools if t.name not in _legacy_excluded]
     tools_by_name = {t.name: t for t in tools}
 
     # Issue #68 — snapshot OpenAI-style tool schemas для llm-trace replay.
@@ -4050,6 +4068,7 @@ _TOOL_NAMES_SET: frozenset[str] = frozenset({
     "list_shopping", "add_shopping_items", "remove_shopping_items",
     "mark_shopping_bought", "update_shopping_item",
     "update_shopping_items_category", "clear_bought_shopping",
+    "clear_shopping_list",  # #409 (R1 sol MINOR: имя инструмента не должно утечь юзеру)
     "search_recipes", "save_recipe", "save_recipes_batch",
     "delete_recipe", "update_recipe",  # #210
     "add_family_members", "update_family_member", "remove_family_member",

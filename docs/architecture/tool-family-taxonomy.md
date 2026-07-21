@@ -38,7 +38,7 @@ relying on the model to infer it from descriptions.
 | `web` | ВЕБ | 3 | РЕЦЕПТЫ, КАЛЕНДАРЬ ЮЗЕРА, ДЕНЕЖНЫЕ ОПЕРАЦИИ |
 
 Total: 61 manifest entries (`len(TOOL_FAMILY_MANIFEST)`, пин-тест
-`test_manifest_total_size_is_59`). The future `get_recipe_any_source`
+`test_manifest_total_size_pinned`). The future `get_recipe_any_source`
 (architecture-plan TODO-2) will bump this when the runtime
 function ships — currently NOT in `TOOL_FAMILY_MANIFEST` per Codex
 Sub-A4 recipes R1 MAJOR #6.
