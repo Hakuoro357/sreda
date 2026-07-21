@@ -232,9 +232,11 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
         _signals["disambig_kind"] = disambig_kind    # #376: subtract | add | None
         _signals["disambig_domains"] = disambig_domains
     if read_intent_domains is not None:
-        # #399: та же дисциплина — поле появляется ТОЛЬКО под своим флагом. Пишем
-        # ПРИМЕНЁННОЕ (после пересечения с route), т.е. что реально открылось.
-        _signals["read_intent"] = sorted(read_intent)
+        # #399: та же дисциплина — поле появляется ТОЛЬКО под своим флагом.
+        # CR R1 sol MINOR: пишем то, что РЕАЛЬНО осталось открыто (пересечение с итоговым
+        # allowed_read) — #376-subtract ниже мог вычесть раздел, и поле «signal сказал
+        # checklists» противоречило бы фактической политике.
+        _signals["read_intent"] = sorted(read_intent & allowed_read)
 
     return {
         "v": POLICY_VERSION_B2,
@@ -244,3 +246,22 @@ def compute_unified_policy(text, route, classified=None, *, base_web=True,
         "confirm_write": True,                    # ярус (б): write вне allowed_write → кандидат+confirm (B2b)
         "signals": _signals,
     }
+
+
+def read_intent_residual_miss(text, route, policy) -> bool:
+    """#399: ОСТАТОЧНЫЙ ПРОМАХ — роутер поднял checklists, юзер ЯВНО просит показать,
+    а чтение так и не открылось. Ровно тот хвост ложных отказов, который фикс мог бы
+    замаскировать: явный баг закрылся, а непойманные детектором формулировки стали бы
+    невидимы. Замер — обязательная часть поставки #399, не «потом».
+
+    CR R1 sol MINOR: формула живёт ЗДЕСЬ (продакшн), а не дублируется в тесте — иначе
+    дрейф проводки в react_loop остался бы зелёным. Чистая функция: и ход, и тест
+    считают ОДНО И ТО ЖЕ.
+
+    Болтовня сюда не попадает: «как дела» роутится в checklists, но запросом чтения не
+    является (`is_read_request`) → не промах, а корректный отказ. Утверждения/цитаты —
+    тоже не промах."""
+    from sreda.runtime.react_signals import is_read_request
+    return bool("checklists" in set(route.all_domains)
+                and "checklists" not in set(policy.get("allowed_read") or ())
+                and is_read_request(text or ""))

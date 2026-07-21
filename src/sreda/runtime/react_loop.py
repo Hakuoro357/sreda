@@ -2499,9 +2499,11 @@ _re376_inner_punct = re.compile(r"[,;:.!?…—–\r\n]|\s-\s")  # L2-R3 sol: \n
 # v2-R1 sol MAJOR: замки проверяли ФОРМУ (items+имя существует), но не сам ЗАПРОС на чтение —
 # «мой список кино очень длинный» (утверждение) / «не показывай список кино» (отрицание)
 # проходили бы → сервер читал бы список невпопад. Требуем явный read-маркер И отсутствие «не».
-_re376_read_marker = re.compile(
-    r"\b(покажи|открой|что|какие|глянь|скажи|прочитай|выведи|есть ли)\b")  # v2-R2 sol: инфинитив «показать» («я хотел показать…») — не запрос; только императив/вопрос  # v2-R2 terra: посмотр\w* ловил декларатив «я посмотрел…» (ход отметки)
-_re376_negation = re.compile(r"\bне\b")
+# #399 CR R1: определения ПЕРЕЕХАЛИ в react_signals (общий детектор `is_read_request`) —
+# #399-сигнал обязан стоять на ТОЙ ЖЕ калибровке, а не заводить вторую. Имена сохранены:
+# те же объекты, поведение #376 байт-в-байт (вход сюда уже lower(), IGNORECASE не влияет).
+from sreda.runtime.react_signals import READ_REQUEST_MARKER_RE as _re376_read_marker
+from sreda.runtime.react_signals import READ_REQUEST_NEGATION_RE as _re376_negation
 
 
 def _prebuilt_checklist_read(tools: list, list_ref: str):
@@ -5636,16 +5638,14 @@ async def handle_turn(
                     # В трейс/лог идут ТОЛЬКО вердикт детектора и разделы — без текста юзера (ПД).
                     _ri399_meta: dict = {}
                     if _ri399_on:
+                        from sreda.runtime.react_policy import read_intent_residual_miss
                         from sreda.runtime.react_preflight import (
                             classify_checklist_query as _cq399f,
                         )
-                        _lc399 = (user_text or "").lower()
                         _ri399_opened = "checklists" in _upol["allowed_read"]
-                        _ri399_residual = bool(
-                            "checklists" in _route285.all_domains
-                            and not _ri399_opened
-                            and _re376_read_marker.search(_lc399)
-                            and not _re376_negation.search(_lc399))
+                        # CR R1 sol MINOR: формула — из продакшн-функции (та же, что в тесте)
+                        _ri399_residual = read_intent_residual_miss(
+                            user_text, _route285, _upol)
                         _cq399 = _cq399f(user_text)
                         _ri399_meta = {
                             "signal": sorted(_ri399 or ()),

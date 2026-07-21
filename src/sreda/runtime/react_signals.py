@@ -425,6 +425,46 @@ def text_mentions_time(text: str) -> bool:
     return bool(_TIME_RE.search(_DURATION_STRIP_RE.sub(" ", text or "")))
 
 
+# ── #376/#399: рамка ЯВНОГО ЗАПРОСА ЧТЕНИЯ (общая; НЕ новые паттерны) ──
+# Родина — react_loop (#376 v2 слой-2, где эти замки уже откалиброваны живым замером).
+# Вынесено сюда как ОБЩИЙ детектор, чтобы #399-сигнал переиспользовал ТУ ЖЕ калибровку,
+# а не заводил вторую (react_loop импортирует эти же объекты под прежними именами —
+# поведение #376 байт-в-байт). IGNORECASE добавлен безопасно: #376 подаёт уже lower().
+# Инфинитив «показать» СОЗНАТЕЛЬНО не маркер (#376 v2-R2 sol): «я хотел показать список
+# кино» — не запрос. Цена — «можешь показать список X» не откроется (fail-open в текущее
+# поведение); такие ходы видны в замере остаточных промахов.
+READ_REQUEST_MARKER_RE = re.compile(
+    r"\b(покажи|открой|что|какие|глянь|скажи|прочитай|выведи|есть ли)\b", re.IGNORECASE)
+READ_REQUEST_NEGATION_RE = re.compile(r"\bне\b", re.IGNORECASE)
+
+
+def is_read_request(text: str) -> bool:
+    """Ход — ЯВНЫЙ ЗАПРОС ЧТЕНИЯ, а не утверждение/цитата/пересказ/отрицание.
+
+    CR R1 (sol+terra MAJOR, оба независимо): детектор #213 проверяет ФОРМУ («есть раздел-
+    слово и имя списка»), но НЕ сам факт просьбы. Поэтому «мой список кино очень длинный»,
+    «я посмотрел список кино», «не показывай список кино», «команда "покажи список кино"
+    не работает», «мама сказала: покажи список кино» давали items/high — и открыли бы
+    чтение личных данных на утверждении, отрицании и цитате (проверено замером).
+
+    Два переиспользованных замка, ноль новых языковых паттернов:
+      1) маркер запроса + отрицание — из #376 v2 (выше);
+      2) `_framed` — общий guard мета-рамки/кавычек/косвенной речи из B1 (#285), тот же,
+         что защищает write-команды от «команда "удали X" не работает».
+    Over-suppress безопасен: промах → сигнала нет → текущее поведение (web-only)."""
+    t = text or ""
+    if READ_REQUEST_NEGATION_RE.search(t):
+        return False
+    ms = list(READ_REQUEST_MARKER_RE.finditer(t))
+    if not ms:
+        return False
+    # ВСЕ маркеры должны быть вне рамки, не «хотя бы один». Иначе мета-вопрос
+    # «ЧТО значит фраза покажи список кино» проходит по ПЕРВОМУ маркеру «что»
+    # (перед ним пусто → рамки нет), хотя ход явно не просьба показать.
+    # Строже = безопаснее: лишнее подавление → текущее поведение (web-only).
+    return all(not _framed(t, m.start(), m.end()) for m in ms)
+
+
 def checklist_read_intent(text: str) -> frozenset[str]:
     """#399: детерминированный сигнал «человек просит ПОКАЗАТЬ чек-лист» → {checklists} | ∅.
 
@@ -456,9 +496,14 @@ def checklist_read_intent(text: str) -> frozenset[str]:
         cq = classify_checklist_query(text or "")
     except Exception:  # noqa: BLE001 — сигнал на горячем пути не роняет ход
         return frozenset()
-    if cq is not None and cq.confidence == "high":
-        return frozenset({"checklists"})
-    return frozenset()
+    if cq is None or cq.confidence != "high":
+        return frozenset()
+    # CR R1 sol+terra MAJOR: детектор #213 — про ФОРМУ, не про ПРОСЬБУ. Требуем ещё и
+    # рамку явного запроса (см. is_read_request), иначе утверждение/отрицание/цитата
+    # открывают чтение личных списков.
+    if not is_read_request(text or ""):
+        return frozenset()
+    return frozenset({"checklists"})
 
 
 def read_cue_domains(text: str) -> frozenset[str]:

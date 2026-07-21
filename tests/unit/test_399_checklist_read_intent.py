@@ -31,8 +31,23 @@ SHOW_CASES = [
     "покажи список сериалов",
     "а покажи список кино",
     "покажи пожалуйста список кино",
-    "можешь показать список кино",
     "покажи список идей",
+]
+# CR R1 (sol+terra MAJOR): ФОРМА «раздел-слово + имя» ≠ ПРОСЬБА показать. Детектор #213
+# даёт items/high на всех этих фразах — без рамки запроса они открывали бы чтение личных
+# списков на утверждении, отрицании, цитате и пересказе (подтверждено замером до фикса).
+NOT_A_REQUEST_CASES = [
+    "мой список кино очень длинный",            # утверждение
+    "список кино уже полный",
+    "я посмотрел список кино",
+    "я хотел показать список кино",             # инфинитив, не императив
+    "вчера я показывал список кино другу",
+    "не показывай список кино",                 # отрицание
+    'команда "покажи список кино" не работает',  # мета-рамка
+    "мама сказала: покажи список кино",         # реплика говорящего
+    "он написал «покажи список кино»",          # цитата
+    "покажи список кино, сказал он",            # атрибуция ПОСЛЕ
+    "что значит фраза покажи список кино",      # мета-вопрос
 ]
 # ── route-мина: route_domains даёт checklists, но это НЕ запрос чтения ──
 MINE_CASES = [
@@ -68,6 +83,28 @@ class TestSignal:
     def test_write_turn_is_not_read_intent(self, text):
         """Write-ход детектор сам отсекает (None) — сигнал чтения не выдаём."""
         assert checklist_read_intent(text) == frozenset()
+
+    @pytest.mark.parametrize("text", NOT_A_REQUEST_CASES)
+    def test_statement_quote_negation_do_not_open_read(self, text):
+        """CR R1 sol+terra MAJOR: утверждение/отрицание/цитата/пересказ — НЕ запрос."""
+        from sreda.runtime.react_preflight import classify_checklist_query
+        cq = classify_checklist_query(text)
+        assert cq is not None and cq.confidence == "high", (
+            "предпосылка дефекта: детектор #213 считает форму уверенной")
+        assert checklist_read_intent(text) == frozenset()
+
+    @pytest.mark.parametrize("text", NOT_A_REQUEST_CASES)
+    def test_statement_quote_negation_do_not_change_policy(self, text):
+        """И на уровне политики #399 не добавляет НИЧЕГО на не-запросах.
+
+        Проверяем именно ДЕЛЬТУ фичи, а не «checklists закрыт»: часть этих фраз
+        («мой список кино очень длинный») открывает read-кюс `мой\\s+список` и БЕЗ
+        #399 — это пред-существующее поведение, не в scope этой задачи."""
+        route = route_domains(text)
+        base = compute_unified_policy(text, route)
+        with_signal = compute_unified_policy(
+            text, route, read_intent_domains=checklist_read_intent(text))
+        assert with_signal["allowed_read"] == base["allowed_read"], with_signal
 
     @pytest.mark.parametrize("text", ["покажи список покупок", "что в списке покупок"])
     def test_shopping_is_not_checklists(self, text):

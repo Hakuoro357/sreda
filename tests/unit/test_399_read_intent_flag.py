@@ -6,11 +6,11 @@
 """
 from __future__ import annotations
 
-import re
+
 
 import pytest
 
-from sreda.runtime.react_policy import compute_unified_policy
+from sreda.runtime.react_policy import compute_unified_policy, read_intent_residual_miss
 from sreda.runtime.react_preflight import classify_checklist_query, route_domains
 from sreda.runtime.react_signals import checklist_read_intent
 
@@ -83,20 +83,14 @@ class TestFlagOffIsIdentical:
         assert "checklists" not in pol["allowed_read"]
 
 
-# ── замер остаточных промахов: та же формула, что в react_loop (_ri399_residual) ──
-_READ_MARKER = re.compile(
-    r"\b(покажи|открой|что|какие|глянь|скажи|прочитай|выведи|есть ли)\b")
-_NEGATION = re.compile(r"\bне\b")
-
-
+# ── замер остаточных промахов ──
+# CR R1 sol MINOR: НЕ копируем формулу/регексы из продакшна (копия осталась бы зелёной
+# при дрейфе проводки) — зовём ТУ ЖЕ функцию, что и react_loop.
 def _residual_miss(text: str) -> bool:
     route = route_domains(text)
     pol = compute_unified_policy(text, route,
                                  read_intent_domains=checklist_read_intent(text))
-    lc = text.lower()
-    return bool("checklists" in route.all_domains
-                and "checklists" not in pol["allowed_read"]
-                and _READ_MARKER.search(lc) and not _NEGATION.search(lc))
+    return read_intent_residual_miss(text, route, pol)
 
 
 class TestResidualMissMetric:
