@@ -311,8 +311,11 @@ def gather_week_counts(session: Session, *, now: datetime,
         except (TypeError, ValueError):
             malformed += 1
             continue
-        if not isinstance(rdj, dict) or "disambig" not in rdj:
+        if not isinstance(rdj, dict):
+            malformed += 1      # CR R4 sol: top-level не словарь — тоже разъезд схемы
             continue
+        if "disambig" not in rdj:
+            continue            # штатно: фильтр совпал по другому месту JSON
         dis = rdj["disambig"]
         if not isinstance(dis, dict):
             malformed += 1
@@ -489,19 +492,18 @@ def _week_key(now: datetime) -> str:
     return f"{iso[0]}-W{iso[1]:02d}"
 
 
-def _update_gate_history(history: object, current: tuple[str, list[str]],
-                         now: datetime) -> dict[str, str]:
-    """Журнал «когда этот тенант последний раз был в гейте #376» → ``{ключ: iso-время}``.
+def _gate_keys(scope: tuple[str, list[str]]) -> set[str]:
+    """Область скана → множество ключей гейта (``*`` = режим «всем»)."""
+    mode, tenants = scope
+    return {_ALL_TENANTS_KEY} if mode == "all" else set(tenants)
 
-    CR R2 sol MAJOR: окно отчёта охватывает прошедшие 7 дней, поэтому сегодняшняя
-    конфигурация — не источник истины за весь период; смена канарейки посреди недели
-    иначе молча теряла бы расхождения прежнего тенанта.
-    CR R3 sol MAJOR: хранить «гейт ПРОШЛОГО прогона» было мало — на стыке ISO-недель
-    (поздний воскресный прогон и ранний понедельничный) прежний тенант забывался уже
-    через час, хотя окна почти совпадали. Журнал с отметками времени переживает такие
-    стыки и при этом НЕ растёт вечно: запись живёт, пока может попасть в окно отчёта.
 
-    Ключ ``*`` — режим «всем»; он тоже живёт по TTL, а не навсегда.
+def _prune_gate_history(history: object, now: datetime) -> dict[str, str]:
+    """Журнал ВЫБЫВШИХ из гейта ``{ключ: когда выбыл}``, очищенный по TTL.
+
+    Запись живёт ровно пока ходы этого тенанта ещё могут попасть в окно отчёта,
+    поэтому журнал не растёт вечно. Мусор в state игнорируется — state не должен
+    ронять отчёт.
     """
     out: dict[str, str] = {}
     cutoff = now - GATE_HISTORY_TTL
@@ -512,21 +514,37 @@ def _update_gate_history(history: object, current: tuple[str, list[str]],
             parsed = _parse_ts(ts)
             if parsed is not None and parsed >= cutoff:
                 out[key] = ts
-    mode, tenants = current
-    stamp = now.isoformat()
-    if mode == "all":
-        out[_ALL_TENANTS_KEY] = stamp
-    for tenant in tenants:
-        out[tenant] = stamp
     return out
 
 
-def _scope_from_history(history: dict[str, str]) -> tuple[str, list[str]]:
-    """Журнал гейтов → область скана. «Всем» поглощает список."""
-    if _ALL_TENANTS_KEY in history:
+def _record_departures(history: dict[str, str], prev_keys: set[str],
+                       current: tuple[str, list[str]], now: datetime) -> dict[str, str]:
+    """Отметить тех, кто ТОЛЬКО ЧТО выбыл из гейта, временем выбытия.
+
+    CR R2 sol: окно отчёта охватывает прошедшие 7 дней, поэтому сегодняшний гейт — не
+    источник истины за весь период; смена канарейки посреди недели иначе теряла бы
+    расхождения прежнего тенанта.
+    CR R3 sol: «гейт прошлого ПРОГОНА» не переживал стык ISO-недель.
+    CR R4 (sol+terra): отметки нужны по факту ИЗМЕНЕНИЯ гейта, а не в момент отправки
+    отчёта — иначе смены между отчётами (A→B→C) не наблюдаются вовсе и трассы B
+    выпадают из следующего окна. Действующие члены гейта в журнал НЕ пишутся: они и
+    так входят в область скана напрямую, поэтому их запись не может «протухнуть».
+    """
+    out = dict(history)
+    stamp = now.isoformat()
+    for key in prev_keys - _gate_keys(current):
+        out[key] = stamp
+    return out
+
+
+def _effective_scope(current: tuple[str, list[str]],
+                     history: dict[str, str]) -> tuple[str, list[str]]:
+    """Действующий гейт + недавно выбывшие → что сканировать. «Всем» поглощает список."""
+    mode, tenants = current
+    if mode == "all" or _ALL_TENANTS_KEY in history:
         return ("all", [])
-    tenants = sorted(k for k in history if k != _ALL_TENANTS_KEY)
-    return ("list", tenants) if tenants else ("none", [])
+    merged = set(tenants) | {k for k in history if k != _ALL_TENANTS_KEY}
+    return ("list", sorted(merged)) if merged else ("none", [])
 
 
 def _gather_with_session(now: datetime,
@@ -550,11 +568,23 @@ class DomainDivergenceDigestWorker:
 
         now = now or datetime.now(timezone.utc)
         state = self._read_state()
+        # CR R4 (sol+terra MAJOR): за гейтом следим на КАЖДОМ тике, а не только когда
+        # решили отправлять отчёт. Иначе смены канарейки между недельными отчётами
+        # (A → B → C) не наблюдаются вовсе, и трассы B выпадают из следующего окна.
+        # Пишем state ТОЛЬКО при фактическом изменении гейта — тик идёт раз в секунды.
+        current = _scan_scope()
+        history = _prune_gate_history(state.get("gate_history"), now)
+        prev_keys = {str(k) for k in (state.get("gate_snapshot") or [])}
+        cur_keys = _gate_keys(current)
+        if prev_keys != cur_keys or history != (state.get("gate_history") or {}):
+            history = _record_departures(history, prev_keys, current, now)
+            state["gate_history"] = history
+            state["gate_snapshot"] = sorted(cur_keys)
+            self._write_state(state)
         if not self._should_run(now, state):
             return 0
         week = _week_key(now)
-        history = _update_gate_history(state.get("gate_history"), _scan_scope(), now)
-        scope = _scope_from_history(history)
+        scope = _effective_scope(current, history)
         try:
             # скан недели + расшифровка примеров — в поток: job_runner не должен
             # замирать на время запроса (раз в неделю, но выборка до MAX_ROWS)
@@ -580,9 +610,7 @@ class DomainDivergenceDigestWorker:
                     logger.exception("domain_divergence: alert delivery failed")
             return 0
         state["last_run_week"] = week
-        # журнал гейтов — чтобы следующие прогоны знали, что было в начале их окна
-        state["gate_history"] = history
-        state.pop("last_scan_mode", None)      # схема до CR R3 — чистим
+        state.pop("last_scan_mode", None)      # схема до CR R3/R4 — чистим
         state.pop("last_scan_tenants", None)
         state.pop("last_failure_at", None)
         state["failure_count"] = 0

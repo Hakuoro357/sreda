@@ -412,6 +412,22 @@ def test_row_without_disambig_block_is_ignored_silently(session):
     assert c.turns_with_disambig == 0 and c.malformed == 0
 
 
+def test_top_level_non_dict_json_is_malformed(session):
+    """CR R4 sol MAJOR: корень JSON не словарь (например список) — это разъезд схемы,
+    а не «словарь без блока»; молча пропускать нельзя."""
+    session.add(ReactTurnTrace(
+        id="rtt410_list", tenant_id=TENANT, turn_key="tk410_list",
+        status="done", outcome="ok",
+        routing_decision_json='[{"disambig": {"ran": true}}]',
+        created_at=NOW - timedelta(days=1)))
+    session.commit()
+
+    c = gather_week_counts(session, now=NOW)
+
+    assert c.malformed == 1 and c.turns_with_disambig == 0
+    assert "не срабатывал" not in format_report(c, now=NOW)
+
+
 def test_scan_narrowed_to_disambig_tenants(session):
     """CR R1 terra MAJOR: при явном allowlist #376 недельный запрос сужается по тенанту,
     а не сканирует весь трейс окна по всем тенантам."""
@@ -464,32 +480,32 @@ def test_gate_history_survives_canary_change_and_expires():
     источник истины за весь период — смена канарейки внутри недели не должна терять
     расхождения прежнего тенанта. И журнал не растёт вечно: запись живёт, пока её ходы
     ещё могут попасть в окно отчёта."""
-    h0 = dd._update_gate_history(None, ("list", ["t_old"]), NOW)
-    assert dd._scope_from_history(h0) == ("list", ["t_old"])
+    # действующий гейт входит в область скана напрямую, журнал выбывших пуст
+    assert dd._effective_scope(("list", ["t_old"]), {}) == ("list", ["t_old"])
 
-    # канарейку сменили: обе записи живы, пока окно их накрывает
-    h1 = dd._update_gate_history(h0, ("list", ["t_new"]), NOW + timedelta(days=1))
-    assert dd._scope_from_history(h1) == ("list", ["t_new", "t_old"])
+    # канарейку сменили: выбывший отмечен временем выбытия и остаётся в области
+    h1 = dd._record_departures({}, {"t_old"}, ("list", ["t_new"]), NOW)
+    assert dd._effective_scope(("list", ["t_new"]), h1) == ("list", ["t_new", "t_old"])
 
-    # гейт сняли совсем — прежний тенант всё ещё в окне
-    h2 = dd._update_gate_history(h1, ("none", []), NOW + timedelta(days=2))
-    assert dd._scope_from_history(h2) == ("list", ["t_new", "t_old"])
+    # гейт сняли совсем — прежние тенанты всё ещё в окне
+    h2 = dd._record_departures(h1, {"t_new"}, ("none", []), NOW + timedelta(days=1))
+    assert dd._effective_scope(("none", []), h2) == ("list", ["t_new", "t_old"])
 
     # прошло больше TTL — старьё выпало, сканировать нечего
-    h3 = dd._update_gate_history(h2, ("none", []), NOW + timedelta(days=30))
-    assert dd._scope_from_history(h3) == ("none", [])
+    h3 = dd._prune_gate_history(h2, NOW + timedelta(days=30))
+    assert dd._effective_scope(("none", []), h3) == ("none", [])
 
-    # «всем» поглощает список и тоже живёт по TTL
-    h4 = dd._update_gate_history(h1, ("all", []), NOW + timedelta(days=1))
-    assert dd._scope_from_history(h4) == ("all", [])
-    assert dd._scope_from_history(
-        dd._update_gate_history(h4, ("none", []), NOW + timedelta(days=30))) == ("none", [])
+    # «всем» поглощает список — и как действующий режим, и как недавно выбывший
+    assert dd._effective_scope(("all", []), h1) == ("all", [])
+    h4 = dd._record_departures({}, {"*"}, ("list", ["t1"]), NOW)
+    assert dd._effective_scope(("list", ["t1"]), h4) == ("all", [])
 
 
 def test_gate_history_ignores_garbage_state():
     """Битый state не должен ронять отчёт."""
-    assert dd._update_gate_history("не словарь", ("list", ["t1"]), NOW).keys() == {"t1"}
-    assert dd._update_gate_history({"t_bad": 42, 7: "x"}, ("none", []), NOW) == {}
+    assert dd._prune_gate_history("не словарь", NOW) == {}
+    assert dd._prune_gate_history({"t_bad": 42, 7: "x", "t_ok": NOW.isoformat()}, NOW) \
+        == {"t_ok": NOW.isoformat()}
 
 
 def test_worker_remembers_gate_across_iso_week_boundary(tmp_path, monkeypatch):
@@ -513,6 +529,51 @@ def test_worker_remembers_gate_across_iso_week_boundary(tmp_path, monkeypatch):
     monkeypatch.setattr(dd, "_scan_scope", lambda: ("list", ["t_new"]))
     asyncio.run(w.process_pending(now=monday))
     assert seen[-1] == ("list", ["t_new", "t_old"]), "прежний тенант забыт на стыке недель"
+
+
+def test_gate_changes_between_reports_are_observed(tmp_path, monkeypatch):
+    """CR R4 (sol+terra MAJOR): гейт менялся A → B → C МЕЖДУ недельными отчётами.
+    Если журнал обновляется только в момент отправки, промежуточный B не наблюдается
+    вовсе и его расхождения выпадают из окна следующего отчёта."""
+    import asyncio
+    w = DomainDivergenceDigestWorker(state_file=str(tmp_path / "state.json"))
+    seen: list = []
+    monkeypatch.setattr(dd, "send_admin_alert", lambda *a, **kw: None)
+    monkeypatch.setattr(dd, "_gather_with_session", lambda now, scope=None: (
+        seen.append(scope) or dd.WeekCounts(0, 0, 0, 0, 0)))
+
+    monkeypatch.setattr(dd, "_scan_scope", lambda: ("list", ["A"]))
+    assert asyncio.run(w.process_pending(now=NOW)) == 1        # отчёт недели 30
+    # вторник: гейт сменили на B — отчёта нет, но смену обязаны заметить
+    monkeypatch.setattr(dd, "_scan_scope", lambda: ("list", ["B"]))
+    assert asyncio.run(w.process_pending(now=NOW + timedelta(days=1))) == 0
+    # четверг: сменили на C — снова без отчёта
+    monkeypatch.setattr(dd, "_scan_scope", lambda: ("list", ["C"]))
+    assert asyncio.run(w.process_pending(now=NOW + timedelta(days=3))) == 0
+    # следующий понедельник: в области скана обязаны быть ВСЕ три
+    assert asyncio.run(w.process_pending(now=NOW + timedelta(days=7))) == 1
+
+    assert seen[-1] == ("list", ["A", "B", "C"]), f"промежуточный гейт потерян: {seen[-1]}"
+
+
+def test_state_not_rewritten_when_gate_unchanged(tmp_path, monkeypatch):
+    """Тик идёт раз в секунды — state пишем ТОЛЬКО при фактическом изменении гейта."""
+    import asyncio
+    w = DomainDivergenceDigestWorker(state_file=str(tmp_path / "state.json"))
+    writes: list = []
+    real_write = w._write_state
+    monkeypatch.setattr(w, "_write_state",
+                        lambda st: (writes.append(1), real_write(st))[1])
+    monkeypatch.setattr(dd, "send_admin_alert", lambda *a, **kw: None)
+    monkeypatch.setattr(dd, "_scan_scope", lambda: ("list", ["A"]))
+    monkeypatch.setattr(dd, "_gather_with_session",
+                        lambda now, scope=None: dd.WeekCounts(0, 0, 0, 0, 0))
+
+    asyncio.run(w.process_pending(now=NOW))          # первый тик: снимок + отчёт
+    before = len(writes)
+    for i in range(1, 6):                            # тики той же недели, гейт тот же
+        assert asyncio.run(w.process_pending(now=NOW + timedelta(hours=i))) == 0
+    assert len(writes) == before, "state переписывался на тиках без изменений гейта"
 
 
 def test_sampled_frequencies_are_labelled(session, monkeypatch):
