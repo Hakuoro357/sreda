@@ -26,9 +26,19 @@
 #   3 — поллер не стартанул
 #   4 — webhook URL не пуст (будет 409 Conflict)
 #   5 — поллер не активен после рестарта
-#   7 — ГЕЙТ не пройден: служба на СТАРОМ коде или упала (деплой не доехал)
-#  90 — прогон оборван до DONE (сеть/сигнал/убитая сессия)
-# 129/143/130 — оборван сигналом HUP/TERM/INT
+#   7 — ДОКАЗАНО не доехало: служба на СТАРОМ коде или упала → откат УМЕСТЕН
+#   8 — НЕ СМОГЛИ ПРОВЕРИТЬ активацию (systemd не ответил) → код МОГ доехать,
+#       слепой откат ОПАСЕН; нужен живой оператор
+#   9 — гейт ПРОЙДЕН (деплой доехал), но прогон оборван позже (смоук/хвост)
+#       → откат НЕ нужен
+#  90 — прогон оборван ДО гейта (сеть/сигнал/убитая сессия) → не доехало
+# 129/143/130 — оборван сигналом HUP/TERM/INT до гейта
+#
+# 🔴 КОНТРАКТ ДЛЯ ВЫЗЫВАЮЩЕЙ СТОРОНЫ (deploy_private_features.sh и любой другой
+# автоматики): `reset --hard` допустим ТОЛЬКО на кодах, означающих доказанный
+# недокат — 7, 90, 129, 143, 130 (и ранние 1..5). На 8 и 9 откат ЗАПРЕЩЁН:
+# 8 = «не смогли проверить» (откат здорового прода хуже исходного бага),
+# 9 = «доехало, не доиграл хвост». На них — громко звать оператора.
 #
 # Webhook-режим УДАЛЁН. После инцидента 2026-04-30 прод работает ТОЛЬКО
 # через long-poll. Функция restore_webhook.py требует явного
@@ -102,9 +112,14 @@ for _t in TG_CONNECT_TIMEOUT TG_MAX_TIME; do
 done
 unset _t
 
+# Общий лимит онбординг-смоука (R2 B4). Не override-ится: смоук — хвост прогона,
+# а не настраиваемый параметр деплоя.
+SMOKE_TIMEOUT=180
+
 GATE_START_HUMAN=$(ts)
 SAFE_RESTART_COMPLETED=0
 FAILURE_ALERTED=0
+GATE_PASSED=0
 
 # Алерт админу через СУЩЕСТВУЮЩИЙ дуал-канал (#395: Telegram основной + MAX дубль).
 # Best-effort: сам никогда не роняет скрипт (мы уже на аварийном пути) и ограничен
@@ -147,16 +162,37 @@ on_exit() {
     fi
     # Оборвались молча и с нулевым кодом — это НЕ успех.
     [ "$rc" -eq 0 ] && rc=90
-    log "FAILED: safe_restart ОБОРВАН до DONE (код ${rc}) — ДЕПЛОЙ НЕ ЗАСЧИТАН."
-    log "        Службы могли остаться на СТАРОМ коде (uvicorn/job-runner/поллеры)."
-    log "        Проверь время старта служб и перезапусти вручную."
-    # Точка отказа уже отправила подробный алерт (например гейт) — не дублируем:
-    # у alert_admin_async нет дедупликации, оператор получил бы два сообщения
-    # и ждал бы лишний таймаут доставки (R1 sol+terra).
+
+    # Точка отказа уже всё объяснила и отправила свой алерт (гейт/перепроверка) —
+    # не дублируем: у alert_admin_async нет дедупликации, оператор получил бы два
+    # сообщения и ждал бы лишний таймаут доставки (R1 sol+terra).
     if [ "$FAILURE_ALERTED" = "1" ]; then
-        log "        (алерт по этой причине уже отправлен выше)"
+        log "FAILED: safe_restart завершился с кодом ${rc} (причина — выше)."
         exit "$rc"
     fi
+
+    # R2 B4: обрыв ПОСЛЕ пройденного гейта — это НЕ провал деплоя. Активация всех
+    # служб уже ДОКАЗАНА (новый InvocationID + active); не доиграл только хвост
+    # (смоук — он и так «отчёт, не гейт»). Рапортовать это как «не засчитан»
+    # значило бы спровоцировать откат УЖЕ ДОЕХАВШЕГО кода.
+    if [ "${GATE_PASSED:-0}" = "1" ]; then
+        log "ВНИМАНИЕ: прогон оборван ПОСЛЕ гейта (код ${rc}) — но ДЕПЛОЙ ДОЕХАЛ."
+        log "        Активация всех служб доказана гейтом; не доиграл хвост (смоук)."
+        log "        ОТКАТ НЕ НУЖЕН. Код возврата 9."
+        alert_admin "🟡 P2 Среда: деплой доехал, но прогон не доиграл
+
+Прогон стартовал: ${GATE_START_HUMAN}
+Хост: $(hostname)
+
+Гейт активации ПРОЙДЕН — новый код работает, откат НЕ нужен.
+Прогон оборвался позже (код ${rc}), на смоуке/хвосте: результаты смоука
+могли не записаться. Лог: ${LOG}"
+        exit 9
+    fi
+
+    log "FAILED: safe_restart ОБОРВАН до гейта (код ${rc}) — ДЕПЛОЙ НЕ ЗАСЧИТАН."
+    log "        Службы могли остаться на СТАРОМ коде (uvicorn/job-runner/поллеры)."
+    log "        Проверь активацию служб и перезапусти вручную."
     alert_admin "🔴 P0 Среда: safe_restart ОБОРВАН — деплой не доехал
 
 Прогон стартовал: ${GATE_START_HUMAN}
@@ -333,14 +369,18 @@ for bot_key in $BOT_KEYS; do
     # присваиванием (проверено). Обрезку вынесли из пайпа с curl — иначе
     # SIGPIPE от `head` на длинном ответе даёт 141 и тот же молчаливый выход.
     del_rc=0
+    # ⚠ БЕЗ `2>&1` (R2 D2): stderr curl'а НЕЛЬЗЯ писать в лог — он режима 0644,
+    # а часть ошибок curl (напр. класс «couldn't resolve host», rc=3/6) печатает
+    # URL ЦЕЛИКОМ, вместе с токеном бота в пути. Логируем только rc и тело ответа
+    # (в теле токена нет).
     del_resp=$(curl -sS --connect-timeout "$TG_CONNECT_TIMEOUT" --max-time "$TG_MAX_TIME" \
-                    -X POST "https://api.telegram.org/bot${bot_token}/deleteWebhook" 2>&1) || del_rc=$?
+                    -X POST "https://api.telegram.org/bot${bot_token}/deleteWebhook" 2>/dev/null) || del_rc=$?
     del_resp=$(printf '%s' "$del_resp" | head -c 200) || true
+    eval "DELRC_${bot_key}=\$del_rc"
     if [ "$del_rc" -eq 0 ]; then
         log "    → $del_resp"
     else
         log "    ⚠ deleteWebhook не удался (curl rc=${del_rc}) — ПРОДОЛЖАЕМ к рестарту поллеров"
-        log "      (детали: ${del_resp})"
     fi
 done
 
@@ -393,15 +433,15 @@ if [ -n "$MAX_TOKEN" ]; then
             # где внешняя сеть могла подвесить прогон (уже после рестарта
             # поллеров, но ДО гейта и DONE) и съесть бюджет SSH-сессии.
             max_rc=0
+            # stderr не логируем — см. пояснение у TG-вызова (R2 D2).
             max_del=$(curl -sS --connect-timeout "$TG_CONNECT_TIMEOUT" --max-time "$TG_MAX_TIME" \
                           $CA_OPT -X DELETE "${MAX_BASE}/subscriptions" \
-                          -H "Authorization: ${MAX_TOKEN}" 2>&1) || max_rc=$?
+                          -H "Authorization: ${MAX_TOKEN}" 2>/dev/null) || max_rc=$?
             max_del=$(printf '%s' "$max_del" | head -c 200) || true
             if [ "$max_rc" -eq 0 ]; then
                 log "  → $max_del"
             else
                 log "  ⚠ MAX deleteWebhook не удался (curl rc=${max_rc}) — ПРОДОЛЖАЕМ"
-                log "    (детали: ${max_del})"
             fi
 
             sleep 2
@@ -443,17 +483,25 @@ for bot_key in $BOT_KEYS; do
     # #408: таймаут + не фатально по СЕТИ (прогон 2026-07-20 13:26 умер молча
     # именно здесь — тот же untimed curl).
     info_rc=0
+    # stderr не логируем — токен в URL (R2 D2).
     info=$(curl -sS --connect-timeout "$TG_CONNECT_TIMEOUT" --max-time "$TG_MAX_TIME" \
-                "https://api.telegram.org/bot${bot_token}/getWebhookInfo" 2>&1) || info_rc=$?
+                "https://api.telegram.org/bot${bot_token}/getWebhookInfo" 2>/dev/null) || info_rc=$?
     info=$(printf '%s' "$info" | head -c 400) || true
 
     if [ "$info_rc" -ne 0 ]; then
-        # Сеть до TG недоступна — проверить нечего, но это НЕ повод валить деплой:
-        # реальную гарантию дают проверка активности поллеров ниже и гейт 5b.
-        # Непустой webhook всё равно был бы пойман: поллер словил бы 409 и выпал
-        # из active (exit 3), а это ловит проверка ниже.
+        # Сеть до TG недоступна — проверить нечего. Деплой из-за этого НЕ валим
+        # (best-effort по рамке), но обоснование честное:
+        # ⚠ ПРЕЖНЕЕ обоснование («непустой webhook поймает проверка активности
+        # поллера ниже») НЕВЕРНО — 409 прилетел бы поллеру уже ПОСЛЕ DONE, и этот
+        # прогон его не увидит (R2 D). Настоящая страховка — внешняя, вне этого
+        # скрипта: /etc/cron.d/sreda-monitor гоняет probe_telegram_poller_alive
+        # каждые 5 минут и поднимет тревогу, если inbound встал.
         log "  ⚠ [${bot_key}] getWebhookInfo недоступен (curl rc=${info_rc}) — проверку webhook пропускаем"
-        log "    (детали: ${info})"
+        eval "_drc=\${DELRC_${bot_key}:-0}"
+        if [ "${_drc}" -ne 0 ]; then
+            log "  ⚠⚠ [${bot_key}] ОБА обращения к Telegram провалились (deleteWebhook rc=${_drc}, getWebhookInfo rc=${info_rc})."
+            log "      long-poll состояние бота в этом прогоне НЕ подтверждено — если бот молчит, смотри монитор поллера."
+        fi
         continue
     fi
 
@@ -476,24 +524,20 @@ fi
 # Токен присутствует → поллер ОБЯЗАН быть активен.
 # «Не установлен» для бота с токеном — FATAL: inbound мёртв.
 for bot_key in $BOT_KEYS; do
-    unit="sreda-telegram-poller@${bot_key}.service"
-    legacy_unit="sreda-telegram-poller.service"
+    # R2 A3: НИКАКОГО повторного резолва — берём тот же юнит, что резолвер выбрал
+    # для рестарта. Дубль хардкода `sreda-telegram-poller@<key>` + legacy-фолбэк
+    # здесь и был источником расхождения, из-за которого гейт и рестарт смотрели
+    # на разные юниты.
+    eval "unit=\$POLLER_UNIT_${bot_key}"
 
-    # Проверяем templated юнит
     if systemctl is-active "$unit" >/dev/null 2>&1; then
         log "  ✓ ${unit} active"
         continue
     fi
 
-    # Fallback: проверяем legacy юнит для sreda
-    if [ "$bot_key" = "sreda" ] && systemctl is-active "$legacy_unit" >/dev/null 2>&1; then
-        log "  ✓ ${legacy_unit} (legacy) active"
-        continue
-    fi
-
     # Токен настроен → поллер обязан быть активен.
-    # Отсутствие или неактивность юнита = FATAL (inbound мёртв для этого бота).
-    log "FATAL: поллер для ${bot_key} не активен после рестарта (токен настроен, поллер обязателен)"
+    # Неактивность = FATAL (inbound мёртв для этого бота).
+    log "FATAL: поллер ${unit} не активен после рестарта (токен настроен, поллер обязателен)"
     exit 5
 done
 
@@ -512,33 +556,50 @@ done
 #        поэтому проверка только по ID дала бы ложный зелёный (R1 sol).
 log "phase 5b: гейт — все службы реально переактивированы?"
 
-gate_ok=true
+# R2 B1 — РАЗДЕЛЕНИЕ ИСХОДОВ (критично для вызывающей стороны):
+#   «ДОКАЗАНО не доехало»  (ID не сменился / служба не active) → exit 7,
+#       откат вызывающей стороны УМЕСТЕН.
+#   «НЕ СМОГЛИ ПРОВЕРИТЬ» (systemd не ответил, пустой снимок)  → exit 8,
+#       откат ОПАСЕН: код мог прекрасно доехать, а мы просто не смогли это
+#       подтвердить. Слепой `reset --hard` на транзиентном сбое systemctl
+#       откатил бы ЗДОРОВЫЙ прод — это хуже исходного бага.
+gate_stale=""
+gate_unverified=""
+
 for unit in $GATE_UNITS; do
     eval "pre=\${$(unit_var "$unit")_PRE:-}"
     post=$(systemctl show -p InvocationID --value "$unit" 2>/dev/null || echo "")
     state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || echo "")
     human=$(systemctl show -p ActiveEnterTimestamp --value "$unit" 2>/dev/null || echo "?")
 
-    if [ -z "$post" ]; then
-        log "  ✗ ${unit}: InvocationID пуст — активации не было (состояние: ${state:-неизвестно})"
-        gate_ok=false
+    # R2 A1: пустой снимок ДО — сравнивать НЕ С ЧЕМ. Раньше это молча проходило
+    # (сравнение `post != pre` при пустом pre всегда истинно) → fail-OPEN.
+    if [ -z "$pre" ]; then
+        log "  ? ${unit}: снимок InvocationID ДО рестарта пуст — смену подтвердить НЕЧЕМ"
+        gate_unverified="$gate_unverified $unit"
+        continue
+    fi
+    if [ -z "$post" ] || [ -z "$state" ]; then
+        log "  ? ${unit}: systemd не ответил (InvocationID/ActiveState пусты) — ПРОВЕРИТЬ НЕ СМОГЛИ"
+        gate_unverified="$gate_unverified $unit"
         continue
     fi
     if [ "$post" = "$pre" ]; then
         log "  ✗ ${unit}: InvocationID НЕ изменился — РЕСТАРТА НЕ БЫЛО, работает СТАРЫЙ процесс (запущен ${human})"
-        gate_ok=false
+        gate_stale="$gate_stale $unit"
         continue
     fi
     if [ "$state" != "active" ]; then
         log "  ✗ ${unit}: активация была, но состояние сейчас '${state}' — служба упала после старта"
-        gate_ok=false
+        gate_stale="$gate_stale $unit"
         continue
     fi
     log "  ✓ ${unit}: переактивирован в этом прогоне (${human})"
 done
 
-if [ "$gate_ok" = "false" ]; then
-    log "FATAL: ГЕЙТ НЕ ПРОЙДЕН — часть служб работает на СТАРОМ коде или упала. ДЕПЛОЙ НЕ ЗАСЧИТАН."
+if [ -n "$gate_stale" ]; then
+    log "FATAL: ГЕЙТ НЕ ПРОЙДЕН (ДОКАЗАНО) — ДЕПЛОЙ НЕ ДОЕХАЛ."
+    log "       Виновные юниты:${gate_stale}"
     log "       Это тот самый класс отказа, из-за которого #401/#405 не жили ~15 часов."
     FAILURE_ALERTED=1
     alert_admin "🔴 P0 Среда: деплой НЕ доехал — службы на старом коде
@@ -546,14 +607,35 @@ if [ "$gate_ok" = "false" ]; then
 Прогон стартовал: ${GATE_START_HUMAN}
 Хост: $(hostname)
 
-Гейт активации не пройден: часть служб НЕ переактивирована (systemd не выдал
-новый InvocationID) либо упала сразу после старта — при этом systemctl is-active
-может показывать active.
+НЕ переактивированы (или упали сразу после старта):${gate_stale}
 
-Юниты прогона: ${GATE_UNITS}
-Построчно (какой именно юнит виноват) — в логе: ${LOG}"
+systemd не выдал новый InvocationID для этих юнитов — значит процесс СТАРЫЙ,
+хотя systemctl is-active может показывать active.
+Лог: ${LOG}"
     exit 7
 fi
+
+if [ -n "$gate_unverified" ]; then
+    log "FATAL: НЕ СМОГЛИ ПРОВЕРИТЬ активацию — systemd не ответил."
+    log "       Юниты без вердикта:${gate_unverified}"
+    log "       ЭТО НЕ ДОКАЗАТЕЛЬСТВО НЕДОКАТА: код мог доехать нормально."
+    log "       Откатывать вслепую ОПАСНО — нужен живой оператор (см. код возврата 8)."
+    FAILURE_ALERTED=1
+    alert_admin "🟠 P1 Среда: не удалось ПРОВЕРИТЬ деплой (не путать с провалом)
+
+Прогон стартовал: ${GATE_START_HUMAN}
+Хост: $(hostname)
+
+Без вердикта:${gate_unverified}
+systemd не ответил на запрос InvocationID/ActiveState.
+
+Код МОГ доехать — автоматический откат по этому поводу НЕ делается.
+Проверь службы руками: systemctl status <юнит>
+Лог: ${LOG}"
+    exit 8
+fi
+
+GATE_PASSED=1
 log "  ✓ гейт пройден: все службы (${GATE_UNITS}) переактивированы этим прогоном"
 
 # ============ Phase 6: onboarding smoke (отчёт, НЕ гейт) ============
@@ -567,17 +649,46 @@ if [ -f "$SMOKE" ]; then
     for bot_key in $BOT_KEYS; do
         log "phase 6 [${bot_key}]: онбординг-smoke"
         smoke_rc=0
-        sudo -u sreda "$VENV_PYTHON" "$SMOKE" --bot-key "$bot_key" 2>&1 | tee -a "$LOG" || smoke_rc=$?
+        # R2 B4: общий wall-clock лимит. Внутри onboard_smoke.py лимиты только
+        # пооперационные — суммарно смоук мог перевалить за бюджет деплой-сессии
+        # (в инциденте её убило на ~140с), и обрыв случился бы уже ПОСЛЕ гейта.
+        timeout "$SMOKE_TIMEOUT" sudo -u sreda "$VENV_PYTHON" "$SMOKE" --bot-key "$bot_key" 2>&1 | tee -a "$LOG" || smoke_rc=$?
         case "$smoke_rc" in
             0) log "  ✓ [${bot_key}] онбординг-smoke PASS" ;;
             1) log "  ✗ [${bot_key}] онбординг-smoke FAIL — онбординг СЛОМАН, разберись прежде чем считать деплой успешным" ;;
             2) log "  ⚠ [${bot_key}] онбординг-smoke ABORT/остаток — нужно ручное внимание (см. вывод выше)" ;;
+            124) log "  ⚠ [${bot_key}] онбординг-smoke не уложился в ${SMOKE_TIMEOUT}s — прерван (деплой уже доказан гейтом)" ;;
             *) log "  ⚠ [${bot_key}] онбординг-smoke неожиданный код ${smoke_rc}" ;;
         esac
     done
 else
     log "phase 6: ${SMOKE} не найден — онбординг-smoke пропущен"
 fi
+
+# ============ R2 A2: перепроверка после смоука ============
+# Гейт мог «протухнуть»: служба способна упасть уже после него (в т.ч. под
+# нагрузкой смоука). Недоказуемое (systemd не ответил) здесь НЕ валит прогон —
+# активация уже доказана гейтом; валит только доказанное падение.
+for unit in $GATE_UNITS; do
+    state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || echo "")
+    if [ -z "$state" ]; then
+        log "  ⚠ ${unit}: состояние после смоука проверить не удалось — пропускаем (активация уже доказана)"
+        continue
+    fi
+    if [ "$state" != "active" ]; then
+        log "FATAL: ${unit} упал ПОСЛЕ пройденного гейта (состояние '${state}') — прод нездоров."
+        FAILURE_ALERTED=1
+        alert_admin "🔴 P0 Среда: служба упала сразу после деплоя
+
+Прогон стартовал: ${GATE_START_HUMAN}
+Хост: $(hostname)
+
+${unit} прошёл гейт активации, но к концу прогона состояние '${state}'.
+Код доехал, но служба не держится — смотри: systemctl status ${unit}
+Лог: ${LOG}"
+        exit 7
+    fi
+done
 
 # #408: единственная точка, где прогон признаётся успешным. Всё, что не дошло
 # сюда, ловит trap on_exit → ненулевой код + алерт админу.

@@ -27,7 +27,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-TARGET="$REPO_ROOT/scripts/safe_restart.sh"
+# SR_TARGET — прогнать сьют против ДРУГОЙ копии скрипта (мутационное тестирование)
+TARGET="${SR_TARGET:-$REPO_ROOT/scripts/safe_restart.sh}"
 
 PASS=0
 FAIL=0
@@ -52,7 +53,7 @@ setup_ws() {
     # Стартовое состояние: все юниты уже active со СВОИМ InvocationID
     # (как на живом боксе до деплоя).
     for u in sreda-uvicorn.service sreda-job-runner.service \
-             sreda-telegram-poller@sreda.service sreda-telegram-poller@sreda_home.service; do
+             sreda-telegram-poller@sreda.service sreda-telegram-poller@sreda_home.service              sreda-telegram-poller.service; do
         kk=$(printf '%s' "$u" | tr -c 'A-Za-z0-9' '_')
         echo "pre-$kk" > "$STATE/inv_$kk"
         echo "active"  > "$STATE/state_$kk"
@@ -74,6 +75,7 @@ case "$cmd" in
       echo "$u" >> "$STATE/restarts"
       # frozen = юнит НЕ переактивируется (та самая подделка из инцидента:
       # systemctl отрапортовал успех, но процесс остался прежний)
+      [ -f "$STATE/noinvafter_$kk" ] && touch "$STATE/noinv_$kk"
       [ -f "$STATE/frozen_$kk" ] && continue
       n=$(( $(cat "$STATE/invseq") + 1 )); echo "$n" > "$STATE/invseq"
       echo "inv-$n-$kk" > "$STATE/inv_$kk"
@@ -93,7 +95,11 @@ case "$cmd" in
     done
     kk=$(k "$(norm "$unit")")
     case "$prop" in
-      InvocationID)         [ -f "$STATE/inv_$kk" ]   && cat "$STATE/inv_$kk"   || echo "";;
+      InvocationID)
+        # noinv_* — systemd «не отвечает» по юниту: фикстура fail-closed
+        if [ -f "$STATE/noinv_$kk" ]; then echo ""
+        elif [ -f "$STATE/inv_$kk" ]; then cat "$STATE/inv_$kk"
+        else echo ""; fi;;
       ActiveState)          [ -f "$STATE/state_$kk" ] && cat "$STATE/state_$kk" || echo "inactive";;
       ActiveEnterTimestamp) echo "Tue 2026-07-21 00:00:00 UTC";;
       *) echo "";;
@@ -104,6 +110,7 @@ case "$cmd" in
     [ -f "$STATE/absent_$(k "$u")" ] && exit 1
     case "$u" in
       sreda-uvicorn.service|sreda-job-runner.service|sreda-telegram-poller@*.service) exit 0;;
+      sreda-telegram-poller.service) exit 0;;
       *) exit 1;;
     esac
     ;;
@@ -165,6 +172,25 @@ STUB
 echo "test-host"
 STUB
 
+    # tee-стаб: как настоящий, но по флагу падает ИМЕННО на строке DONE —
+    # так проверяется порядок «сначала записать DONE, потом поднять флаг».
+    cat > "$BIN/tee" <<'STUB'
+#!/usr/bin/env bash
+file=""
+while [ $# -gt 0 ]; do
+  case "$1" in -a) shift;; *) file="$1"; shift;; esac
+done
+data=$(cat)
+if [ "${SR_TEE_FAIL_ON_DONE:-0}" = "1" ]; then
+  case "$data" in *"DONE: safe_restart"*) exit 1;; esac
+fi
+printf '%s
+' "$data"
+[ -n "$file" ] && printf '%s
+' "$data" >> "$file"
+exit 0
+STUB
+
     mkdir -p "$WS/venv/bin"
     # Алерт идёт как `python -c <код>`; phase 6 запускает onboard_smoke.py.
     # Без различения смоук засчитывался бы за алерт.
@@ -174,6 +200,11 @@ if [ "${1:-}" = "-c" ]; then
     cat > "$SR_TEST_STATE/alert_body"
     echo "alerted" >> "$SR_TEST_STATE/alerts"
 else
+    # фикстура A2: служба падает уже ПОСЛЕ пройденного гейта
+    if [ -n "${SR_CRASH_DURING_SMOKE:-}" ]; then
+        kk=$(printf '%s' "$SR_CRASH_DURING_SMOKE" | tr -c 'A-Za-z0-9' '_')
+        echo "failed" > "$SR_TEST_STATE/state_$kk"
+    fi
     echo "[smoke stub] PASS"
 fi
 exit 0
@@ -299,8 +330,16 @@ OLD="$WS/safe_restart_old.sh"
 GOT_OLD=0
 if [ -n "${SR_OLD_SCRIPT:-}" ] && [ -f "$SR_OLD_SCRIPT" ]; then
     cp "$SR_OLD_SCRIPT" "$OLD" && GOT_OLD=1
-elif git -C "$REPO_ROOT" show origin/main:scripts/safe_restart.sh > "$OLD" 2>/dev/null; then
+elif git -C "$REPO_ROOT" show "${SR_OLD_SHA:-74adbfbff62f88edfc53f31f340336a98af70ae6}:scripts/safe_restart.sh" > "$OLD" 2>/dev/null; then
     GOT_OLD=1
+fi
+# ЗАЩИТА ОТ ТАВТОЛОГИИ (R2 C2): базлайн раньше брался из origin/main — после
+# мержа это стал бы ИСПРАВЛЕННЫЙ скрипт, и тест «доказывал» бы инцидент на самом
+# фиксе. Поэтому базлайн пиним на SHA дофиксового коммита и убеждаемся, что в нём
+# нет InvocationID.
+if [ "$GOT_OLD" -eq 1 ] && grep -q "InvocationID" "$OLD"; then
+    bad "базлайн T5 действительно дофиксовый" "в базлайне есть InvocationID — взят ФИКС, тест стал бы тавтологией"
+    GOT_OLD=0
 fi
 if [ "$GOT_OLD" -eq 1 ]; then
     sed -i \
@@ -326,7 +365,9 @@ STUB
     ! logged "DONE: safe_restart завершён успешно" \
         && ok "дофиксовая версия: DONE отсутствует (молчаливый обрыв)" \
         || bad "дофиксовая версия: DONE отсутствует"
-    echo "         (справка: оборвалась с кодом $RC, без единой строки об ошибке)"
+    # RC строго 129: иначе мгновенная смерть по ДРУГОЙ причине (например
+    # нечитаемый env после подмены путей) проглатывалась бы как «инцидент».
+    [ "$RC" -eq 129 ]         && ok "дофиксовая версия: умерла именно от SIGHUP (RC=129)"         || bad "дофиксовая версия: RC=129" "получили RC=$RC — базлайн умер не от сигнала"
 else
     bad "дофиксовая версия недоступна" "передай SR_OLD_SCRIPT=<путь> (git show origin/main:scripts/safe_restart.sh)"
 fi
@@ -374,6 +415,105 @@ for badval in 0 abc 9999; do
     rc=$?
     [ "$rc" -eq 1 ] && ok "TG_MAX_TIME='${badval}' отвергнут" || bad "TG_MAX_TIME='${badval}' отвергнут" "rc=$rc"
 done
+teardown_ws
+
+# ---------------------------------------------------------------- T10
+# Мутация M4 (sol MAJOR): если гейт и рестарт резолвят юнит РАЗНЫМИ путями,
+# legacy-сценарий разъедется — рестартнём legacy, а проверим template.
+echo "T10: legacy-сценарий — гейт и рестарт смотрят на ОДИН юнит"
+setup_ws
+touch "$STATE/absent_sreda_telegram_poller_sreda_service"   # template не установлен
+echo "active" > "$STATE/state_sreda_telegram_poller_service" # legacy живой
+run_script
+[ "$RC" -eq 0 ] && ok "exit 0 (гейт согласован с рестартом)" || bad "exit 0" "RC=$RC; $(tail -3 "$LOGF")"
+restarted "sreda-telegram-poller.service" && ok "перезапущен именно legacy-юнит" || bad "перезапущен именно legacy-юнит"
+logged "DONE: safe_restart завершён успешно" && ok "есть DONE" || bad "есть DONE"
+teardown_ws
+
+# ---------------------------------------------------------------- T11
+# Мутация M2: fail-closed на пустом InvocationID. Пустой ответ systemd НЕ должен
+# молча проходить — но и не должен выдаваться за доказанный недокат (код 8, не 7).
+echo "T11: systemd не отвечает по юниту → «не смогли проверить» (8), а не тишина"
+setup_ws
+touch "$STATE/noinv_sreda_job_runner_service"
+run_script
+[ "$RC" -eq 8 ] && ok "пустой снимок ДО → exit 8" || bad "пустой снимок ДО → exit 8" "RC=$RC"
+logged "смену подтвердить НЕЧЕМ" && ok "названо как непроверяемое (пустой снимок ДО)" || bad "названо как непроверяемое (пустой снимок ДО)"
+logged "Откатывать вслепую ОПАСНО" && ok "явно предупреждает против отката" || bad "явно предупреждает против отката"
+! logged "DONE: safe_restart завершён успешно" && ok "DONE отсутствует" || bad "DONE отсутствует"
+teardown_ws
+
+# Истинный путь M2: снимок ДО есть, а ПОСЛЕ systemd молчит.
+setup_ws
+touch "$STATE/noinvafter_sreda_job_runner_service"
+run_script
+[ "$RC" -eq 8 ] && ok "пропал ответ ПОСЛЕ рестарта → exit 8" || bad "пропал ответ ПОСЛЕ рестарта → exit 8" "RC=$RC"
+logged "ПРОВЕРИТЬ НЕ СМОГЛИ" && ok "названо как непроверяемое (нет ответа ПОСЛЕ)" || bad "названо как непроверяемое (нет ответа ПОСЛЕ)"
+! logged "DONE: safe_restart завершён успешно" && ok "DONE отсутствует" || bad "DONE отсутствует"
+teardown_ws
+
+# ---------------------------------------------------------------- T12
+# Мутация M7 (terra MAJOR): флаг завершения обязан подниматься ПОСЛЕ записи DONE.
+# Роняем tee ровно на строке DONE: durable-строки нет → прогон не вправе
+# отрапортоваться успехом молча.
+echo "T12: сбой записи DONE не выдаётся за успех"
+setup_ws
+run_script "$TARGET" env SR_TEE_FAIL_ON_DONE=1
+[ "$RC" -ne 0 ] && ok "ненулевой код ($RC)" || bad "ненулевой код" "RC=0 — обрыв выдал себя за успех"
+[ -s "$STATE/alerts" ] && ok "алерт отправлен (обрыв не проигнорирован)" || bad "алерт отправлен"
+teardown_ws
+
+# ---------------------------------------------------------------- T13
+echo "T13: обрыв ПОСЛЕ гейта → «деплой доехал» (код 9), а не «не засчитан»"
+setup_ws
+run_script "$TARGET" env SR_TEE_FAIL_ON_DONE=1
+[ "$RC" -eq 9 ] && ok "exit 9 (доехал, хвост не доиграл)" || bad "exit 9" "RC=$RC"
+logged "ДЕПЛОЙ ДОЕХАЛ" && ok "сказано, что деплой доехал" || bad "сказано, что деплой доехал"
+logged "ОТКАТ НЕ НУЖЕН" && ok "явно сказано, что откат не нужен" || bad "явно сказано, что откат не нужен"
+! logged "ДЕПЛОЙ НЕ ЗАСЧИТАН" && ok "НЕ рапортует «не засчитан»" || bad "НЕ рапортует «не засчитан»"
+teardown_ws
+
+# ---------------------------------------------------------------- T14
+echo "T14: служба упала ПОСЛЕ гейта (во время смоука) → доказанный провал (7)"
+setup_ws
+run_script "$TARGET" env SR_CRASH_DURING_SMOKE=sreda-job-runner.service
+[ "$RC" -eq 7 ] && ok "exit 7" || bad "exit 7" "RC=$RC"
+logged "упал ПОСЛЕ пройденного гейта" && ok "названа причина" || bad "названа причина"
+teardown_ws
+
+# ---------------------------------------------------------------- T15
+# КОНТРАКТ С ВЫЗЫВАЮЩЕЙ СТОРОНОЙ (B1). deploy_private_features.sh зовёт
+# safe_restart голым вызовом под `set -e` и на ЛЮБОЙ ненулевой код делает
+# `git reset --hard` + повторный рестарт. Значит коды обязаны различать
+# «доказанно не доехало» (откат уместен) и «не смогли проверить / доехало»
+# (откат ОПАСЕН: откатили бы ЗДОРОВЫЙ прод).
+echo "T15: коды возврата различают «не доехало» и «не смогли проверить»"
+setup_ws
+freeze sreda-telegram-poller@sreda.service
+run_script; rc_proven=$RC
+teardown_ws
+setup_ws
+touch "$STATE/noinv_sreda_job_runner_service"
+run_script; rc_unverified=$RC
+teardown_ws
+[ "$rc_proven" -eq 7 ] && ok "доказанный недокат → 7 (откат уместен)" || bad "доказанный недокат → 7" "получили $rc_proven"
+[ "$rc_unverified" -eq 8 ] && ok "непроверяемое → 8 (откат запрещён)" || bad "непроверяемое → 8" "получили $rc_unverified"
+[ "$rc_proven" -ne "$rc_unverified" ]     && ok "коды РАЗЛИЧАЮТСЯ (вызывающая сторона может не откатывать здоровый прод)"     || bad "коды различаются" "оба $rc_proven — вызывающая сторона откатит здоровый прод"
+# Контракт задокументирован в самом скрипте — вызывающей стороне есть на что опереться
+grep -q "КОНТРАКТ ДЛЯ ВЫЗЫВАЮЩЕЙ СТОРОНЫ" "$TARGET" && ok "контракт кодов записан в скрипте" || bad "контракт кодов записан в скрипте"
+
+# ---------------------------------------------------------------- T16
+echo "T16: токен бота не утекает в лог (stderr curl не логируется)"
+setup_ws
+run_script "$TARGET" env SR_TG_MODE=fail
+! grep -q "tok-sreda" "$LOGF" && ok "токена нет в логе" || bad "токена нет в логе" "токен найден в $LOGF"
+teardown_ws
+
+# ---------------------------------------------------------------- T17
+echo "T17: оба обращения к Telegram провалились → громкая строка в логе"
+setup_ws
+run_script "$TARGET" env SR_TG_MODE=fail
+logged "ОБА обращения к Telegram провалились" && ok "предупреждение про оба сбоя" || bad "предупреждение про оба сбоя"
 teardown_ws
 
 echo
