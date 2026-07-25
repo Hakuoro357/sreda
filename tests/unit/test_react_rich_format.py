@@ -282,8 +282,12 @@ def test_edit_falls_back_to_plain_on_broken_markdown(status):
 
 
 def test_no_retry_on_network_failure():
-    # таймаут/сеть (status_code=None) — неизвестно, дошло ли; повтор дал бы ДУБЛЬ
-    # сообщения. Такую ошибку пробрасываем наверх, где уже есть свой фолбэк.
+    # таймаут/сеть (status_code=None) — неизвестно, дошло ли; ЕЩЁ ОДИН повтор от нас дал бы
+    # ДУБЛЬ сообщения. Такую ошибку пробрасываем наверх, где уже есть свой фолбэк.
+    # ⚠️ Тест про ХЕЛПЕР, а не про весь тракт: сам TelegramClient._post_request и так делает
+    # до трёх попыток на timeout/5xx (поведение прода ДО этой задачи, для всех тенантов, мы
+    # его не трогаем). Здесь фиксируем только то, что откат по разметке НЕ добавляет к этому
+    # ещё одну попытку. Сужение ретраев клиента — отдельная задача (R1 sol MAJOR#1).
     tg = _FakeTg(fail_first=TelegramDeliveryError("timeout", method="sendMessage"))
     with pytest.raises(TelegramDeliveryError):
         asyncio.run(inbound_mod._tg_send_with_md_fallback(
