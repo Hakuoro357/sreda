@@ -161,6 +161,11 @@ def test_postformat_rich_normalizes_double_asterisk():
     'строка "**/*.py"; другая "**/*.md"',     # маски в кавычках вне кода
     "```\n# **comment**\nx = 1\n```",          # решётка-комментарий в коде (R3 terra)
     "`# not a header`",                        # решётка внутри inline-кода
+    "маска **/node_modules/**",                # recursive-glob в прозе (R4 sol)
+    "шаблон **/{src,test}/**",                 # recursive-glob с группой (R4 sol)
+    "путь **\\node_modules\\**",               # то же с обратными слэшами
+    "```python\n# **comment**\nx = 1",         # НЕЗАКРЫТЫЙ fenced-блок (R4 terra)
+    "смотри `x = **y**",                       # НЕЗАКРЫТЫЙ inline-код
 ])
 def test_postformat_rich_does_not_mangle_non_markup_asterisks(src):
     # R2 sol MAJOR: широкий `\*\*(.+?)\*\*` молча портил бы содержание, и в rich-режиме
