@@ -558,6 +558,21 @@ class Settings(BaseSettings):
             "sreda_react_osa_tenants",
         ),
     )
+    # Канарейка MiMo: тенанты, чей ReAct-цикл крутится на mimo-v2.5-pro ВМЕСТО planner_provider —
+    # по образцу react_osa_tenants выше. Пусто (дефолт) → НИКОМУ → все на planner_provider
+    # (байт-в-байт как сейчас). Планировщик НЕ затронут. ПРИОРИТЕТ: этот список бьёт react_osa_tenants
+    # (см. react_provider в runtime/react_loop.py).
+    # ⚠️ MiMo исторически ТОРМОЗИЛ на больших промптах (2026-04-29: 130+ c, обрыв хода на
+    # 120-секундном таймауте; наш системный промпт ~27 КБ + до 28 КБ схем инструментов). Поэтому
+    # переключатель узкий, пер-тенантный и откатывается сменой env без релиза кода; шире канарейки
+    # раскатывать только после замера на нашем размере промпта.
+    react_mimo_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "SREDA_REACT_MIMO_TENANTS",
+            "sreda_react_mimo_tenants",
+        ),
+    )
     # #184: Оса (gpt-oss-120b @ Groq) как FALLBACK для Фредди (Mercury) в ReAct — при сбое primary
     # (timeout/5xx) ход уходит на Осу. True → fallback включён для всех react-тенантов; False
     # (дефолт) → без fallback (как сейчас). Независим от react_osa_tenants (там Оса как PRIMARY).
@@ -1312,6 +1327,15 @@ class Settings(BaseSettings):
         """#184: тенанты, чей ReAct идёт на «Осе» (gpt-oss-120b @ Groq) вместо planner_provider.
         Пусто (дефолт) → никому → все на planner_provider (Mercury)."""
         raw = self.react_osa_tenants_raw
+        if not raw:
+            return frozenset()
+        return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+    @property
+    def react_mimo_tenants(self) -> frozenset[str]:
+        """Канарейка: тенанты, чей ReAct идёт на mimo-v2.5-pro вместо planner_provider.
+        Пусто (дефолт) → никому → все на planner_provider (Mercury). Бьёт react_osa_tenants."""
+        raw = self.react_mimo_tenants_raw
         if not raw:
             return frozenset()
         return frozenset(item.strip() for item in raw.split(",") if item.strip())

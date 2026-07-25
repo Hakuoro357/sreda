@@ -12,6 +12,7 @@ from sreda.services import llm as llm_mod
 class _Stub:
     def __init__(self, osa: set[str], planner: str) -> None:
         self.react_osa_tenants = frozenset(osa)
+        self.react_mimo_tenants = frozenset()  # канарейка MiMo выключена — «Оса» как раньше
         self.planner_provider = planner
 
 

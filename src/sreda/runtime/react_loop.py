@@ -497,9 +497,19 @@ def confirm_callback_data(action: str, pause_id: str) -> str:
 def react_provider(tenant_id: str) -> str:
     """#184: провайдер LLM для ReAct-цикла тенанта. Тенант в react_osa_tenants → «Оса»
     (groq-gpt-oss-120b @ Groq), иначе planner_provider (Mercury, дефолт). Per-tenant эксперимент;
-    планировщик (plan-execute) НЕ затронут — это оверрайд ТОЛЬКО для ReAct-входа."""
+    планировщик (plan-execute) НЕ затронут — это оверрайд ТОЛЬКО для ReAct-входа.
+
+    ПРИОРИТЕТ оверрайдов (сверху вниз, первый сработавший выигрывает):
+      1. react_mimo_tenants → "mimo-v2.5-pro" (канарейка владельца);
+      2. react_osa_tenants  → "groq-gpt-oss-120b" («Оса», #184);
+      3. planner_provider   → дефолт для всех остальных.
+    Канарейка MiMo намеренно ВЫШЕ «Осы»: она новее и более узкая, и если тенант попал в оба списка,
+    молчаливое перекрытие старым списком было бы неотличимо от «канарейка не включилась».
+    Оба списка пусты по дефолту → поведение байт-в-байт прежнее."""
     from sreda.config.settings import get_settings
     s = get_settings()
+    if tenant_id in s.react_mimo_tenants:
+        return "mimo-v2.5-pro"
     return "groq-gpt-oss-120b" if tenant_id in s.react_osa_tenants else s.planner_provider
 
 
