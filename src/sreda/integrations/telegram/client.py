@@ -121,17 +121,23 @@ class TelegramClient:
         message_id: int,
         text: str,
         reply_markup: dict | None = None,
+        parse_mode: str | None = None,
     ) -> dict:
         """Rewrite an existing message in-place. Used to update a
         reminder message ("🔔 купить молоко") into its acknowledged
         form ("✅ купить молоко") and drop the inline keyboard so the
         buttons can't be tapped twice.
+
+        ``parse_mode`` — как в ``send_message``: None (дефолт) → ключа в payload нет,
+        поведение байт-в-байт прежнее.
         """
         payload: dict = {
             "chat_id": chat_id,
             "message_id": message_id,
             "text": text,
         }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
         return await self._post_json("editMessageText", payload, timeout=5.0)

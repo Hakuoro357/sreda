@@ -573,6 +573,20 @@ class Settings(BaseSettings):
             "sreda_react_mimo_tenants",
         ),
     )
+    # Канарейка «красивого» формата: тенанты, которым ответ ReAct уходит в Telegram РАЗМЕТКОЙ
+    # (жирный заголовок раздела одинарной звёздочкой + эмодзи + пункты построчно) — по образцу
+    # react_mimo_tenants выше. Пусто (дефолт) → НИКОМУ → у всех прежний путь байт-в-байт: промпт
+    # запрещает markdown, `_postformat` его срезает, отправка идёт без parse_mode (ПРАВИЛО #1).
+    # ⚠️ Гейт действует ТОЛЬКО в канале telegram (см. rich_format_enabled в runtime/react_loop.py):
+    # у MAX своя разметка, parse_mode мы туда не шлём — звёздочки уехали бы юзеру как есть, а один
+    # тенант живёт сразу в нескольких каналах. Откат — снятие переменной + рестарт, без релиза кода.
+    react_rich_format_tenants_raw: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "SREDA_REACT_RICH_FORMAT_TENANTS",
+            "sreda_react_rich_format_tenants",
+        ),
+    )
     # #184: Оса (gpt-oss-120b @ Groq) как FALLBACK для Фредди (Mercury) в ReAct — при сбое primary
     # (timeout/5xx) ход уходит на Осу. True → fallback включён для всех react-тенантов; False
     # (дефолт) → без fallback (как сейчас). Независим от react_osa_tenants (там Оса как PRIMARY).
@@ -1336,6 +1350,15 @@ class Settings(BaseSettings):
         """Канарейка: тенанты, чей ReAct идёт на mimo-v2.5-pro вместо planner_provider.
         Пусто (дефолт) → никому → все на planner_provider (Mercury). Бьёт react_osa_tenants."""
         raw = self.react_mimo_tenants_raw
+        if not raw:
+            return frozenset()
+        return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+    @property
+    def react_rich_format_tenants(self) -> frozenset[str]:
+        """Канарейка: тенанты, чей ответ ReAct уходит в Telegram размеченным (Markdown).
+        Пусто (дефолт) → никому → у всех прежний путь без разметки. Только канал telegram."""
+        raw = self.react_rich_format_tenants_raw
         if not raw:
             return frozenset()
         return frozenset(item.strip() for item in raw.split(",") if item.strip())

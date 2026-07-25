@@ -125,6 +125,69 @@ async def _delete_ack_after_reply(
 # #252: первый ак — «Минутку…» (был «Секунду…»; ход часто длиннее секунды).
 _ACK_INITIAL_TEXT = "Минутку…"
 
+# Канарейка «красивого» формата: разметка ответа ReAct в Telegram. v1 («Markdown»), а не
+# MarkdownV2 — v2 требует экранировать полтора десятка символов (.-!()[]{}+=|#~>), т.е. в
+# тексте пользователя (названия фильмов, продуктов) ломалась бы постоянно.
+_REACT_PARSE_MODE = "Markdown"
+
+# Статусы, при которых Telegram ТОЧНО ничего не доставил и виновата, скорее всего, разметка:
+#   400 — HTTP Bad Request («can't parse entities»);
+#   200 — тело `{"ok": false, ...}` (вторая форма отказа Telegram, см. комментарий 2026-04-29
+#         в integrations/telegram/client.py — в т.ч. именно для parse_mode-ошибок).
+# Оба означают «сообщение НЕ ушло» → повтор без разметки безопасен, дубля не будет.
+# Таймаут/сеть (status_code=None) сюда НЕ входят намеренно: там неизвестно, дошло ли, и
+# слепой повтор дал бы юзеру ДВА сообщения.
+_TG_MARKDOWN_REJECT_STATUSES = (200, 400)
+
+
+async def _tg_send_with_md_fallback(
+    client: TelegramClient, *, chat_id: str, text: str,
+    reply_markup: dict | None = None, parse_mode: str | None = None,
+) -> dict:
+    """sendMessage с разметкой и ОБЯЗАТЕЛЬНЫМ откатом на обычный текст.
+
+    Ответ пользователя терять нельзя: лучше некрасиво, чем никак. Telegram отвергает битую
+    разметку (в тексте юзера легко встречается `*` или `_`) — тогда шлём тот же текст без
+    parse_mode. `parse_mode=None` (все, кроме канарейки) → ровно один вызов клиента без
+    ключа parse_mode, поведение байт-в-байт прежнее."""
+    if not parse_mode:
+        return await client.send_message(
+            chat_id=chat_id, text=text, reply_markup=reply_markup)
+    try:
+        return await client.send_message(
+            chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except TelegramDeliveryError as exc:
+        if exc.status_code not in _TG_MARKDOWN_REJECT_STATUSES:
+            raise
+        logger.warning(
+            "react reply: Telegram отверг разметку (sendMessage status=%s) → шлём обычным текстом",
+            exc.status_code,
+        )
+    return await client.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+
+
+async def _tg_edit_with_md_fallback(
+    client: TelegramClient, *, chat_id: str, message_id: int, text: str,
+    reply_markup: dict | None = None, parse_mode: str | None = None,
+) -> dict:
+    """editMessageText с разметкой и тем же обязательным откатом (см. `_tg_send_with_md_fallback`)."""
+    if not parse_mode:
+        return await client.edit_message_text(
+            chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
+    try:
+        return await client.edit_message_text(
+            chat_id=chat_id, message_id=message_id, text=text,
+            reply_markup=reply_markup, parse_mode=parse_mode)
+    except TelegramDeliveryError as exc:
+        if exc.status_code not in _TG_MARKDOWN_REJECT_STATUSES:
+            raise
+        logger.warning(
+            "react reply: Telegram отверг разметку (editMessageText status=%s) → обычным текстом",
+            exc.status_code,
+        )
+    return await client.edit_message_text(
+        chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
+
 
 async def _send_initial_ack(client: TelegramClient, chat_id: str) -> int | None:
     """#252: шлёт начальный ак «Минутку…», возвращает message_id (None при сбое).
@@ -390,19 +453,26 @@ async def _process_approved_turn_locked(
                 # inline_keyboard явно (субагент R2 MINOR), либо новые [Да][Нет] при цепочке.
                 _kb_edit = _kb2 if _kb2 is not None else {"inline_keyboard": []}
                 _orig_mid = (_cb.get("message") or {}).get("message_id")
+                # канарейка разметки: тот же гейт, что дал rich-промпт и rich-постформат
+                _pm2 = (_REACT_PARSE_MODE
+                        if react_loop.rich_format_enabled(onboarding.tenant_id, "telegram")
+                        else None)
                 _done = False
                 if _orig_mid is not None:
                     try:
-                        await telegram_client.edit_message_text(
+                        await _tg_edit_with_md_fallback(
+                            telegram_client,
                             chat_id=str(onboarding.chat_id), message_id=_orig_mid,
-                            text=_reply2, reply_markup=_kb_edit)
+                            text=_reply2, reply_markup=_kb_edit, parse_mode=_pm2)
                         _done = True
                     except Exception:  # noqa: BLE001
                         _done = False
                 if not _done:
                     try:
-                        await telegram_client.send_message(
-                            chat_id=str(onboarding.chat_id), text=_reply2, reply_markup=_kb2)
+                        await _tg_send_with_md_fallback(
+                            telegram_client,
+                            chat_id=str(onboarding.chat_id), text=_reply2,
+                            reply_markup=_kb2, parse_mode=_pm2)
                     except Exception:  # noqa: BLE001
                         pass
                 # #232 шаг B: выжимка истории — DETACHED после доставки resume-ответа (не на новой паузе)
@@ -628,12 +698,18 @@ async def _process_approved_turn_locked(
                     {"text": "Подтверждаю", "callback_data": react_loop.confirm_callback_data("yes", _cid)},
                     {"text": "Отменить", "callback_data": react_loop.confirm_callback_data("no", _cid)}]]}
                     if getattr(_reply, "awaiting_confirm", False) else None)
+                # канарейка разметки: тот же гейт, что дал rich-промпт и rich-постформат
+                _pm = (_REACT_PARSE_MODE
+                       if react_loop.rich_format_enabled(onboarding.tenant_id, "telegram")
+                       else None)
                 _edited = False
                 if _ack_mid is not None:
                     try:
-                        await telegram_client.edit_message_text(
+                        await _tg_edit_with_md_fallback(
+                            telegram_client,
                             chat_id=str(onboarding.chat_id),
                             message_id=_ack_mid, text=_reply, reply_markup=_kb,
+                            parse_mode=_pm,
                         )
                         _edited = True
                     except Exception:  # noqa: BLE001
@@ -647,8 +723,10 @@ async def _process_approved_turn_locked(
                             )
                         except Exception:  # noqa: BLE001
                             pass
-                    await telegram_client.send_message(
+                    await _tg_send_with_md_fallback(
+                        telegram_client,
                         chat_id=str(onboarding.chat_id), text=_reply, reply_markup=_kb,
+                        parse_mode=_pm,
                     )
                 # #232 шаг B: выжимка истории — DETACHED после доставки (своя сессия в фасаде, вне
                 # bg_session/advisory-lock); только финальный ответ (не confirm-пауза). Best-effort.

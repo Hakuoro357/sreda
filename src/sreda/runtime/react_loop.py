@@ -513,6 +513,22 @@ def react_provider(tenant_id: str) -> str:
     return "groq-gpt-oss-120b" if tenant_id in s.react_osa_tenants else s.planner_provider
 
 
+def rich_format_enabled(tenant_id: str, channel: str) -> bool:
+    """Канарейка «красивого» формата: отдаём ли ответ ЭТОГО тенанта размеченным (Markdown).
+
+    ЕДИНЫЙ источник правды для всех трёх слоёв: промпт (`_system_prompt(rich_format=…)`),
+    пост-обработка (`_postformat(rich=…)`) и отправка (`parse_mode` в telegram_inbound).
+    Разъедься они — юзер получит либо голые звёздочки, либо срезанную разметку.
+
+    ТОЛЬКО канал telegram: parse_mode есть в Telegram-клиенте, у MAX своя разметка и мы её не
+    шлём — там звёздочки уехали бы юзеру как есть. Один тенант живёт в нескольких каналах, поэтому
+    канал берём из аргумента, а НЕ из имени тенанта. Пустой список (дефолт) → False всем."""
+    if channel != "telegram":
+        return False
+    from sreda.config.settings import get_settings
+    return tenant_id in get_settings().react_rich_format_tenants
+
+
 _FALLBACK_PROVIDER_KEY = "groq-gpt-oss-120b"  # #184: Оса @ Groq — запас Фредди в ReAct
 
 
@@ -931,10 +947,37 @@ _DATA_DISCIPLINE = (
 )
 
 
-def _system_prompt(today_str: str, persona_overlay: str = "") -> str:
+def _system_prompt(today_str: str, persona_overlay: str = "",
+                   rich_format: bool = False) -> str:
     # Кэш-дружелюбно (#«кеш везде»): стабильный префикс (одинаков у ВСЕХ) — выше;
     # динамика — в ХВОСТЕ: persona-preset overlay (по юзеру, 2 варианта) + today (по дню).
     _overlay = (persona_overlay or "").strip()
+    # Канарейка «красивого» формата: правила вёрстки внутри <style> — ДВА взаимоисключающих
+    # варианта, а не хвост-добавка: приписанное в конец разрешение разметки противоречило бы
+    # запрету выше по промпту, и модель слушалась бы то одного, то другого. Флаг стабилен на
+    # тенанта в рантайме → префикс кеша у канарейки тоже стабилен (как флаг-зависимый few-shot ниже).
+    _format_rules = (
+        "ФОРМАТ (разметка Telegram): заголовок раздела — ОДИНАРНЫМИ звёздочками и с уместным "
+        "эмодзи; двойные ** НИКОГДА (Telegram их не понимает). Пункты — КАЖДЫЙ С НОВОЙ СТРОКИ "
+        "(маркер «• » либо нумерация «1.», «2.», …), между разделами — пустая строка. "
+        "Заголовки «#» и таблицы не используй. Одиночные * и _ внутри обычного текста не "
+        "оставляй — на них разметка ломается. Пример:\n"
+        "*🎬 Кино к просмотру:*\n"
+        "1. Машина смерти\n"
+        "2. Твин Пикс\n"
+        "Завершающую фразу после списка («рассказала», «вот и всё»; «Готово» — ТОЛЬКО если "
+        "реально что-то изменила инструментом, не на справку) пиши С НОВОЙ СТРОКИ, отдельным "
+        "предложением. Рецепты и пошаговые инструкции — КАЖДЫЙ ингредиент и КАЖДЫЙ шаг с НОВОЙ "
+        "строки. "
+    ) if rich_format else (
+        "Без markdown-звёздочек, заголовков и таблиц. СПИСКИ (напоминания, задачи, покупки, "
+        "меню и т.п.) выводи КАЖДЫЙ ПУНКТ С НОВОЙ СТРОКИ через «— », НЕ в одну строку через "
+        "тире. Если после списка уместна завершающая фраза («рассказала», «вот и всё»; "
+        "«Готово» — ТОЛЬКО если реально что-то изменила инструментом, не на справку) — пиши её "
+        "С НОВОЙ СТРОКИ, отдельным предложением, НЕ приклеивай к последнему пункту и БЕЗ «— ». "
+        "Рецепты и пошаговые инструкции — КАЖДЫЙ ингредиент и КАЖДЫЙ шаг с НОВОЙ строки "
+        "(шаги нумеруй «1.», «2.», …), без звёздочек. "
+    )
     _preset_block = f"<style_preset>\n{_overlay}\n</style_preset>\n\n" if _overlay else ""
     # #213 Срез A / #374: few-shot контраст «конкретный список vs обзор» — в ОБОИХ
     # режимах. При ON — через get_checklist(items/overview); при OFF — через legacy
@@ -1007,13 +1050,7 @@ def _system_prompt(today_str: str, persona_overlay: str = "") -> str:
         "«добавила», «сделала», «создала», «поставила» и т.п. говори ТОЛЬКО если "
         "действительно изменила что-то инструментом; на справку, поиск, погоду или совет так "
         "НЕ говори (в т.ч. НЕ заканчивай словом «Готово») — просто ответь по существу. "
-        "Без markdown-звёздочек, заголовков и таблиц. СПИСКИ (напоминания, задачи, покупки, "
-        "меню и т.п.) выводи КАЖДЫЙ ПУНКТ С НОВОЙ СТРОКИ через «— », НЕ в одну строку через "
-        "тире. Если после списка уместна завершающая фраза («рассказала», «вот и всё»; "
-        "«Готово» — ТОЛЬКО если реально что-то изменила инструментом, не на справку) — пиши её "
-        "С НОВОЙ СТРОКИ, отдельным предложением, НЕ приклеивай к последнему пункту и БЕЗ «— ». "
-        "Рецепты и пошаговые инструкции — КАЖДЫЙ ингредиент и КАЖДЫЙ шаг с НОВОЙ строки "
-        "(шаги нумеруй «1.», «2.», …), без звёздочек. "
+        + _format_rules +
         "Дату и время пиши по-человечески («19 июня, 09:00»). Один вопрос за раз. "
         "Канцелярит под запретом: НИКОГДА «у вас имеется», «являясь…», «согласно вашему "
         "запросу», «информирую вас», «вы можете». "
@@ -3736,7 +3773,9 @@ def _build_graph(llm: Any, all_tools: list, *,
         persona_overlay if persona_overlay is not None
         else _persona_overlay_for(session, tenant_id, user_id)
     )
-    system_prompt = _system_prompt(today_str, persona_overlay=_persona_overlay)
+    # Канарейка разметки: тот же гейт, что у пост-обработки и отправки (единый rich_format_enabled).
+    system_prompt = _system_prompt(today_str, persona_overlay=_persona_overlay,
+                                   rich_format=rich_format_enabled(tenant_id, channel))
     # #175: каноничное имя модели — ТЕМ ЖЕ резолвером, что legacy #151 (planner/llm), чтобы
     # ключ (provider_key, model) совпал с прайс-таблицей llm_pricing → USD на дашборде/бюджете.
     # response_metadata.model_name мог бы дать иную форму → unpriced. Резолвим РАЗ (не на вызов).
@@ -4690,8 +4729,9 @@ def _build_graph(llm: Any, all_tools: list, *,
     return g.compile(checkpointer=_get_checkpointer())  # #193: флаг-зависимый saver
 
 
-def _scrub_ids(text: str) -> str:
+def _scrub_ids(text: str, rich: bool = False) -> str:
     # ref=/id=/rem_/task_/checklist_<hex> + скобочные «(ref …)» не должны утечь пользователю.
+    # `rich` НЕ ослабляет чистку id — меняется только схлопывание пробелов (см. ниже).
     t = text or ""
     t = re.sub(r"\(\s*(?:ref|id)\b[^)]*\)", "", t, flags=re.IGNORECASE)
     t = re.sub(r"\bref\s*[:=]\s*\S+|\bid\s*[:=]\s*\S+", "", t, flags=re.IGNORECASE)
@@ -4699,18 +4739,31 @@ def _scrub_ids(text: str) -> str:
     # слова не трогаем (Codex MINOR — граница длины).
     t = re.sub(r"\b(?:rem|task|checklist|sh)_[0-9a-f]{12,}", "", t)
     t = re.sub(r"\(\s*\)", "", t)
-    t = re.sub(r"\s{2,}", " ", t)
-    t = re.sub(r"\s+([)\].,!?])", r"\1", t)
+    if rich:
+        # `\s{2,}` схлопывает и ПЕРЕВОДЫ СТРОК — в rich-режиме это убивало бы вёрстку
+        # (пустая строка между разделами, пункты построчно). Жмём только пробелы/табы,
+        # а подряд идущие пустые строки сводим к одной.
+        t = re.sub(r"[ \t]{2,}", " ", t)
+        t = re.sub(r"\n{3,}", "\n\n", t)
+        t = re.sub(r"[ \t]+([)\].,!?])", r"\1", t)
+    else:
+        t = re.sub(r"\s{2,}", " ", t)
+        t = re.sub(r"\s+([)\].,!?])", r"\1", t)
     return t.strip()
 
 
-def _strip_md(text: str) -> str:
+def _strip_md(text: str, rich: bool = False) -> str:
     """Снять markdown bold, который Mercury вставляет вопреки промпту (#168): ПАРНЫЙ
     `**жирный**` → содержимое; ведущие '#'-заголовки. ТОЛЬКО парные маркеры (не глобально
     `**`/`__`) — иначе мнём «2**3», «__init__», пути/глобы (R1: Codex high+medium+Kimi+
-    субагент). `__` не трогаем вовсе (Mercury использует `**`)."""
+    субагент). `__` не трогаем вовсе (Mercury использует `**`).
+
+    `rich=True` (канарейка разметки): жирный НЕ срезаем, а НОРМАЛИЗУЕМ `**x**` → `*x*` —
+    Telegram Markdown v1 понимает только одинарную звёздочку, а Mercury по опыту #168 шлёт
+    двойную вопреки промпту; без нормализации Telegram отверг бы разметку и юзер увидел бы
+    голый текст с видимыми `**`. Заголовки `#` снимаем в ОБОИХ режимах: Telegram их не рисует."""
     t = text or ""
-    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)        # парный жирный → содержимое
+    t = re.sub(r"\*\*(.+?)\*\*", r"*\1*" if rich else r"\1", t)
     t = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", t)   # ведущие '#'-заголовки
     return t
 
@@ -4808,11 +4861,18 @@ def _strip_tech_leak(text: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", t)
 
 
-def _postformat(text: str) -> str:
+def _postformat(text: str, *, rich: bool = False) -> str:
     """Единый пост-формат ответа Фредди: снять машинную утечку (okv2/тире) → снять id/ref → снять
     markdown → разбить шаги/списки. Порядок важен: markdown снимаем ДО разбивки шагов.
     #216-гард `_redact_identity` ОТКЛЮЧЁН (ложные срабатывания на бренд в контенте) —
-    от само-раскрытия защищает промпт-правило <identity>."""
+    от само-раскрытия защищает промпт-правило <identity>.
+
+    `rich=True` (канарейка разметки, только Telegram): вёрстку делает МОДЕЛЬ по промпту, поэтому
+    наши косметические слои отключаем — `_format_lists` (кустарная пересборка списков) не зовём
+    вовсе, `_strip_md` переводим в режим нормализации. Слои БЕЗОПАСНОСТИ (`_strip_tech_leak`
+    okv2/тире, `_scrub_ids` id/ref) работают в обоих режимах одинаково."""
+    if rich:
+        return _strip_md(_scrub_ids(_strip_tech_leak(text), rich=True), rich=True)
     return _format_lists(_strip_md(_scrub_ids(_strip_tech_leak(text))))
 
 
@@ -5789,9 +5849,11 @@ async def handle_turn(
         # #192: turn_key из state (resume-путь — локального turn_key нет; fresh — совпадёт).
         _tk_trace = ((snap.values or {}).get("turn_key") if snap and snap.values else None) or _tk_trace
         _tools = _called_tools(result)
+        # Канарейка разметки: ТОТ ЖЕ гейт, что дал rich-промпт выше (единый источник правды).
+        _rich = rich_format_enabled(tenant_id, channel)
         if _has_pause(snap):  # снова пауза → вопрос пользователю (+ confirm + токен для [Да][Нет])
             q, is_confirm, pid = _pending(snap)
-            reply = _Reply(_postformat(q) or "Уточни, пожалуйста.",
+            reply = _Reply(_postformat(q, rich=_rich) or "Уточни, пожалуйста.",
                            awaiting_confirm=is_confirm, confirm_id=pid)
             # #192: pause-ход → awaiting_confirm/pending (conditional; не переоткрывает done)
             _trace.persist_trace_pause(tenant_id=tenant_id, user_id=user_id, turn_key=_tk_trace)
@@ -5840,7 +5902,7 @@ async def handle_turn(
                             text = _fb393
             except Exception:  # noqa: BLE001 — заземление best-effort, ход пользователя не роняем
                 logger.warning("react_loop: post-tool report (#393) failed", exc_info=True)
-        reply = _Reply(_postformat(text) or "Готово.")
+        reply = _Reply(_postformat(text, rich=_rich) or "Готово.")
         # #192: финал → done + структура. ВЕСЬ блок под флагом И guarded (R1 CRITICAL Codex high):
         # collect_tool_calls/HMAC/json НЕ должны выполняться при OFF (спящий прод) и НЕ должны ронять
         # ход при сбое (трейс = отладка, best-effort).
