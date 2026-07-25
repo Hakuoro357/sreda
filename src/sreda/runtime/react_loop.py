@@ -4752,6 +4752,13 @@ def _scrub_ids(text: str, rich: bool = False) -> str:
     return t.strip()
 
 
+# `**жирный**` → `*жирный*` ТОЛЬКО там, где `**` реально похож на маркер разметки:
+# слева от открывающего нет буквы/цифры/звёздочки, справа от закрывающего — тоже, а содержимое
+# не начинается и не кончается пробелом. Это НЕ трогает арифметику «2**3 + 4**5», глобы и код
+# в бэктиках. Без DOTALL — жирный заголовок не переносится через строку.
+_MD_BOLD_RICH_RE = re.compile(r"(?<![\w*])\*\*(?=\S)(.+?)(?<=\S)\*\*(?![\w*])")
+
+
 def _strip_md(text: str, rich: bool = False) -> str:
     """Снять markdown bold, который Mercury вставляет вопреки промпту (#168): ПАРНЫЙ
     `**жирный**` → содержимое; ведущие '#'-заголовки. ТОЛЬКО парные маркеры (не глобально
@@ -4763,7 +4770,14 @@ def _strip_md(text: str, rich: bool = False) -> str:
     двойную вопреки промпту; без нормализации Telegram отверг бы разметку и юзер увидел бы
     голый текст с видимыми `**`. Заголовки `#` снимаем в ОБОИХ режимах: Telegram их не рисует."""
     t = text or ""
-    t = re.sub(r"\*\*(.+?)\*\*", r"*\1*" if rich else r"\1", t)
+    if rich:
+        # Границы жёстче, чем у легаси-ветки (R2 sol MAJOR): открывающий `**` не липнет к
+        # букве/цифре, содержимое не начинается и не кончается пробелом. Иначе «2**3 + 4**5»
+        # и код в бэктиках молча искажались бы — а в rich-режиме искажение ещё и уехало бы
+        # юзеру как валидная разметка (Telegram принял бы одиночные `*`), не подняв откат.
+        t = _MD_BOLD_RICH_RE.sub(r"*\1*", t)
+    else:
+        t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)    # парный жирный → содержимое
     t = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", t)   # ведущие '#'-заголовки
     return t
 
@@ -5306,7 +5320,11 @@ async def handle_turn(
             try:
                 from sreda.runtime.react_preflight import chat_fact_system_prompt
                 from sreda.services.llm import get_chat_llm
-                _chat_prompt = chat_fact_system_prompt(today_str, persona_overlay=_persona_overlay)
+                # канарейка разметки: ТОТ ЖЕ гейт, что у task-промта/пост-обработки/отправки —
+                # иначе у канарейки болтовня уходила бы с parse_mode, но без правил вёрстки
+                _chat_prompt = chat_fact_system_prompt(
+                    today_str, persona_overlay=_persona_overlay,
+                    rich_format=rich_format_enabled(tenant_id, channel))
                 if _deepseek_pk:
                     _deepseek_llm = get_chat_llm(provider=_deepseek_pk)  # None при мисконфиге
             except Exception:  # noqa: BLE001 — сбой build → deepseek None, preflight НЕ выключаем

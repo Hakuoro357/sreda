@@ -103,6 +103,21 @@ def test_rich_prompt_replaces_ban_with_example():
     assert "**" in sp and "НИКОГДА" in sp
 
 
+def test_chat_fact_prompt_default_byte_identical():
+    # chat/fact-промпт по дефолту не тронут (все, кроме канарейки)
+    from sreda.runtime.react_preflight import chat_fact_system_prompt
+    sp = chat_fact_system_prompt("2030-01-01")
+    assert "Формат:" not in sp and "звёздочк" not in sp
+
+
+def test_chat_fact_prompt_rich_gets_format_rule():
+    # R2 sol+terra MINOR: у канарейки болтовня уходит с parse_mode → правило вёрстки нужно
+    # и здесь, иначе модель сыпала бы случайными `*`/`_` в размеченный текст
+    from sreda.runtime.react_preflight import chat_fact_system_prompt
+    sp = chat_fact_system_prompt("2030-01-01", rich_format=True)
+    assert "Формат:" in sp and "двойные **" in sp
+
+
 def test_rich_prompt_stays_short():
     # промпт и так ~27 КБ; блок форматирования не должен его раздувать
     base = react_loop._system_prompt("2030-01-01 (Вторник)")
@@ -131,6 +146,25 @@ def test_postformat_rich_normalizes_double_asterisk():
     # Mercury исторически шлёт `**жирный**` вопреки промпту (#168). Telegram Markdown v1
     # такое не парсит → откат на голый текст И видимые `**`. Нормализуем в одинарные.
     assert react_loop._postformat("**Кино**", rich=True) == "*Кино*"
+    assert react_loop._postformat("**Молочные:** молоко", rich=True) == "*Молочные:* молоко"
+
+
+@pytest.mark.parametrize("src", [
+    "2**3 + 4**5",                 # арифметика, а не разметка
+    "`print(2**3, 4**5)`",         # код в бэктиках
+    "путь **/*.py и **/*.md",      # глоб-шаблоны (содержимое начинается с пробела)
+])
+def test_postformat_rich_does_not_mangle_non_markup_asterisks(src):
+    # R2 sol MAJOR: широкий `\*\*(.+?)\*\*` молча портил бы содержание, и в rich-режиме
+    # искажение уехало бы юзеру как ВАЛИДНАЯ разметка (откат бы не сработал).
+    assert react_loop._postformat(src, rich=True) == src
+
+
+def test_strip_md_legacy_branch_byte_identical():
+    # ГЛАВНЫЙ пин: легаси-ветку (все, кроме канарейки) мы НЕ трогали — включая её
+    # известную грубость на «2**3 + 4**5». Фиксируем как есть, а не как хотелось бы.
+    assert react_loop._strip_md("2**3 + 4**5") == "23 + 45"
+    assert react_loop._strip_md("**Ингредиенты**") == "Ингредиенты"
 
 
 def test_postformat_rich_keeps_blank_line_between_sections():
