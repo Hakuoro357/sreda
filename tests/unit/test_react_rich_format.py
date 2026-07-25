@@ -166,6 +166,8 @@ def test_postformat_rich_normalizes_double_asterisk():
     "путь **\\node_modules\\**",               # то же с обратными слэшами
     "```python\n# **comment**\nx = 1",         # НЕЗАКРЫТЫЙ fenced-блок (R4 terra)
     "смотри `x = **y**",                       # НЕЗАКРЫТЫЙ inline-код
+    "``foo **bar** baz``",                     # span с ДВОЙНЫМ разделителем (R5 sol)
+    "````\nz = **q**\n````",                   # блок с четверным разделителем
 ])
 def test_postformat_rich_does_not_mangle_non_markup_asterisks(src):
     # R2 sol MAJOR: широкий `\*\*(.+?)\*\*` молча портил бы содержание, и в rich-режиме
